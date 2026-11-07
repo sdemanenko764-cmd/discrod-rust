@@ -1,0 +1,47 @@
+name: Build Rustcord
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Сборка rustcord.exe
+        run: cargo build --release
+
+      - name: Сборка установщика
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rustcord-windows
+          path: |
+            dist/RustcordSetup.exe
+            target/release/rustcord.exe
+
+      - name: Публикация в Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Rustcord (сборка ${{ github.run_number }})
+          make_latest: true
+          body: |
+            **RustcordSetup.exe** — установщик (ярлыки, удаление через «Приложения»).
+            **rustcord.exe** — портативная версия, запускается без установки.
+          files: |
+            dist/RustcordSetup.exe
+            target/release/rustcord.exe

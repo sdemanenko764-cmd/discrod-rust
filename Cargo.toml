@@ -1,0 +1,28 @@
+[package]
+name = "rustcord"
+version = "0.2.0"
+edition = "2021"
+description = "Лёгкий нативный клиент Discord на Rust"
+license = "MIT"
+
+[dependencies]
+# Интерфейс: нативное окно + OpenGL, без браузерного движка внутри
+eframe = "0.29"
+# Сеть
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+# Данные
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Индикатор потребления ОЗУ
+memory-stats = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
