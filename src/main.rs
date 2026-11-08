@@ -784,6 +784,7 @@ impl App {
                         last_message: m.id,
                         avatar: Some((m.author_id, m.author_avatar.clone())),
                         group: false,
+                        recipients: vec![(m.author_id, m.author.clone(), m.author_avatar.clone())],
                     },
                 ),
                 None => {}
@@ -870,7 +871,7 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.rail))
+            .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     ui.vertical_centered(|ui| {
@@ -1006,11 +1007,7 @@ impl App {
         egui::SidePanel::left("rail")
             .resizable(false)
             .exact_width(76.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(pal.rail)
-                    .inner_margin(Margin::symmetric(0.0, 10.0)),
-            )
+            .frame(egui::Frame::none().inner_margin(Margin::symmetric(0.0, 10.0)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1061,8 +1058,17 @@ impl App {
         // --- каналы / диалоги ---
         egui::SidePanel::left("side")
             .resizable(false)
-            .exact_width(250.0)
-            .frame(egui::Frame::none().fill(pal.side))
+            .exact_width(258.0)
+            .frame(card(
+                pal.side,
+                pal.radius + 4.0,
+                Margin {
+                    left: 0.0,
+                    right: 8.0,
+                    top: 8.0,
+                    bottom: 8.0,
+                },
+            ))
             .show(ctx, |ui| {
                 let guild = self
                     .sel_guild
@@ -1200,7 +1206,7 @@ impl App {
                             }
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                let mic = if self.self_mute { "🔇" } else { "🎤" };
+                                let mic = Icon::Mic;
                                 let mic_tip = if self.self_mute {
                                     "Включить микрофон"
                                 } else {
@@ -1214,7 +1220,14 @@ impl App {
                                 } else {
                                     "Выключить звук"
                                 };
-                                if voice_button(ui, &pal, "🎧", deaf_tip, self.self_deaf).clicked()
+                                if voice_button(
+                                    ui,
+                                    &pal,
+                                    Icon::Headphones,
+                                    deaf_tip,
+                                    self.self_deaf,
+                                )
+                                .clicked()
                                 {
                                     actions.push(Action::ToggleDeaf);
                                 }
@@ -1227,12 +1240,13 @@ impl App {
                                         pal.danger.gamma_multiply(0.85)
                                     };
                                     ui.painter().rect_filled(rect, 8.0, fill);
-                                    ui.painter().text(
+                                    draw_icon(
+                                        ui.painter(),
+                                        Icon::HangUp,
                                         rect.center(),
-                                        Align2::CENTER_CENTER,
-                                        "✆",
-                                        FontId::proportional(18.0),
+                                        18.0,
                                         Color32::WHITE,
+                                        false,
                                     );
                                     if resp
                                         .on_hover_text("Отключиться")
@@ -1434,12 +1448,21 @@ impl App {
             });
 
         // --- заголовок канала ---
-        let show_members = self.sel_guild.is_some() && self.members_open;
+        let show_members =
+            (self.sel_guild.is_some() || self.sel_channel.is_some()) && self.members_open;
         egui::TopBottomPanel::top("channel_head")
             .frame(
-                egui::Frame::none()
-                    .fill(pal.header)
-                    .inner_margin(Margin::symmetric(18.0, 10.0)),
+                card(
+                    pal.header,
+                    pal.radius + 4.0,
+                    Margin {
+                        left: 0.0,
+                        right: 8.0,
+                        top: 8.0,
+                        bottom: 4.0,
+                    },
+                )
+                .inner_margin(Margin::symmetric(18.0, 10.0)),
             )
             .show_separator_line(false)
             .show(ctx, |ui| {
@@ -1488,7 +1511,7 @@ impl App {
                                 actions.push(Action::CallDm(cid));
                             }
                         }
-                        if self.sel_guild.is_some() {
+                        if self.sel_guild.is_some() || self.sel_channel.is_some() {
                             let tip = if show_members {
                                 "Скрыть участников"
                             } else {
@@ -1507,28 +1530,26 @@ impl App {
                     });
                 });
             });
-        {
-            // тонкая линия под заголовком
-            let y = ctx.available_rect().top();
-            let r = ctx.available_rect();
-            ctx.layer_painter(egui::LayerId::background()).hline(
-                r.left()..=r.right(),
-                y,
-                Stroke::new(1.0, pal.border),
-            );
-        }
 
         // --- участники ---
-        if self.sel_guild.is_some() {
+        if self.sel_guild.is_some() || self.sel_channel.is_some() {
             let gid = self.sel_guild.unwrap_or(0);
             let is_bot = self.pending.as_ref().map_or(false, |a| a.bot);
             egui::SidePanel::right("members")
                 .resizable(false)
-                .exact_width(240.0)
+                .exact_width(248.0)
                 .frame(
-                    egui::Frame::none()
-                        .fill(pal.side)
-                        .inner_margin(Margin::symmetric(8.0, 10.0)),
+                    card(
+                        pal.side,
+                        pal.radius + 4.0,
+                        Margin {
+                            left: 4.0,
+                            right: 8.0,
+                            top: 4.0,
+                            bottom: 8.0,
+                        },
+                    )
+                    .inner_margin(Margin::symmetric(8.0, 10.0)),
                 )
                 .show_animated(ctx, show_members, |ui| {
                     let guild = self.guilds.iter().find(|g| g.id == gid);
@@ -1536,6 +1557,54 @@ impl App {
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
+                            if guild.is_none() {
+                                // личка или группа: собеседники + вы
+                                let dm = self
+                                    .sel_channel
+                                    .and_then(|c| self.dms.iter().find(|d| d.id == c));
+                                let Some(dm) = dm else { return };
+                                let in_call: HashSet<u64> = self
+                                    .voice_members
+                                    .get(&dm.id)
+                                    .map(|l| l.iter().map(|m| m.user_id).collect())
+                                    .unwrap_or_default();
+                                let mut people: Vec<(u64, String, Option<String>)> = vec![(
+                                    self.me_id,
+                                    self.me_name.clone(),
+                                    self.me_avatar.clone(),
+                                )];
+                                people.extend(dm.recipients.iter().cloned());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("УЧАСТНИКИ — {}", people.len()))
+                                        .size(11.5)
+                                        .strong()
+                                        .color(pal.faint),
+                                );
+                                for (id, name, avatar) in &people {
+                                    let tex = match (avatar, load_avatars) {
+                                        (Some(h), true) => {
+                                            let url = discord::avatar_url(*id, h);
+                                            self.media.get(
+                                                ui.ctx(),
+                                                &self.cmd,
+                                                &url,
+                                                &url,
+                                                64,
+                                                false,
+                                            )
+                                        }
+                                        _ => None,
+                                    };
+                                    let status = if in_call.contains(id) { "online" } else { "" };
+                                    let resp =
+                                        member_row(ui, &pal, tex, *id, name, status, None, false);
+                                    if in_call.contains(id) {
+                                        resp.on_hover_text("В звонке");
+                                    }
+                                }
+                                return;
+                            }
                             if is_bot {
                                 ui.label(
                                     RichText::new(
@@ -1629,12 +1698,30 @@ impl App {
         if let (Some(cid), Some((icon, name))) = (self.sel_channel, &title) {
             let typing_text = typing_line(self.typing.get(&cid));
             egui::TopBottomPanel::bottom("composer")
-                .frame(egui::Frame::none().fill(pal.main).inner_margin(Margin {
-                    left: 16.0,
-                    right: 16.0,
-                    top: 0.0,
-                    bottom: 14.0,
-                }))
+                .frame(
+                    card(
+                        pal.main,
+                        pal.radius + 4.0,
+                        Margin {
+                            left: 0.0,
+                            right: 8.0,
+                            top: 0.0,
+                            bottom: 8.0,
+                        },
+                    )
+                    .rounding(Rounding {
+                        nw: 0.0,
+                        ne: 0.0,
+                        sw: pal.radius + 4.0,
+                        se: pal.radius + 4.0,
+                    })
+                    .inner_margin(Margin {
+                        left: 16.0,
+                        right: 16.0,
+                        top: 2.0,
+                        bottom: 12.0,
+                    }),
+                )
                 .show_separator_line(false)
                 .show(ctx, |ui| {
                     let bar = match (&self.editing, &self.reply_to) {
@@ -1766,7 +1853,28 @@ impl App {
         let guild_id = self.sel_guild;
         let toolbar_allowed = self.picker.is_none() && self.pending_delete.is_none();
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.main))
+            .frame(
+                card(
+                    pal.main,
+                    pal.radius + 4.0,
+                    Margin {
+                        left: 0.0,
+                        right: 8.0,
+                        top: 4.0,
+                        bottom: if self.sel_channel.is_some() { 0.0 } else { 8.0 },
+                    },
+                )
+                .rounding(if self.sel_channel.is_some() {
+                    Rounding {
+                        nw: pal.radius + 4.0,
+                        ne: pal.radius + 4.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    }
+                } else {
+                    Rounding::same(pal.radius + 4.0)
+                }),
+            )
             .show(ctx, |ui| {
                 if let Some(tiles) = &stage {
                     let h = (ui.available_height() * 0.55).clamp(240.0, 560.0);
@@ -2270,11 +2378,9 @@ impl App {
                 name = Some(self.me_name.clone());
                 avatar = self.me_avatar.clone();
             } else if let Some(d) = &dm {
-                if let Some((uid, a)) = &d.avatar {
-                    if *uid == m.user_id {
-                        name = name.or_else(|| Some(d.name.clone()));
-                        avatar = avatar.or_else(|| a.clone());
-                    }
+                if let Some((_, n, a)) = d.recipients.iter().find(|(id, _, _)| *id == m.user_id) {
+                    name = name.or_else(|| Some(n.clone()));
+                    avatar = avatar.or_else(|| a.clone());
                 }
             }
             let name = name.unwrap_or_else(|| match vc.guild_id {
@@ -2862,8 +2968,26 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
-        if let Some(bd) = theme::backdrop(self.settings.theme) {
-            paint_backdrop(ctx, &bd, self.settings.animate_background);
+        match theme::backdrop(self.settings.theme) {
+            Some(bd) => paint_backdrop(ctx, &bd, self.settings.animate_background),
+            None => {
+                // спокойный фон с лёгким акцентным свечением в углу
+                let base = if self.pal.light {
+                    mix(self.pal.rail, Color32::BLACK, 0.05)
+                } else {
+                    mix(self.pal.rail, Color32::BLACK, 0.25)
+                };
+                let bd = theme::Backdrop {
+                    base,
+                    glows: [
+                        self.pal.accent.gamma_multiply(0.18),
+                        self.pal.link.gamma_multiply(0.10),
+                        Color32::TRANSPARENT,
+                    ],
+                };
+                let animate = self.screen == Screen::Login && self.settings.animate_background;
+                paint_backdrop(ctx, &bd, animate);
+            }
         }
         self.refresh_memory(ctx);
         match self.screen {
@@ -3583,6 +3707,9 @@ fn rail_item(
         .ctx()
         .animate_bool_with_time(resp.id.with("shape"), selected || hovered, 0.18);
     let rounding = 24.0 - (24.0 - pal.radius.max(12.0)) * t;
+    if selected {
+        glow(ui.painter(), center, 38.0, pal.accent.gamma_multiply(0.35));
+    }
     let painter = ui.painter();
 
     let pill_target = if selected {
@@ -3694,6 +3821,14 @@ fn nav_row(
     if selected {
         ui.painter()
             .rect_filled(rect, r, mix(pal.hover, pal.selected, t));
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                rect.left_top() + vec2(0.0, 7.0),
+                vec2(3.0, rect.height() - 14.0),
+            ),
+            2.0,
+            pal.accent,
+        );
     } else if t > 0.01 {
         ui.painter()
             .rect_filled(rect, r, pal.hover.gamma_multiply(t));
@@ -4202,7 +4337,7 @@ fn voice_member_row(
 fn voice_button(
     ui: &mut egui::Ui,
     pal: &Palette,
-    glyph: &str,
+    icon: Icon,
     tip: &str,
     active: bool,
 ) -> egui::Response {
@@ -4215,12 +4350,13 @@ fn voice_button(
         pal.elevated
     };
     ui.painter().rect_filled(rect, 8.0, fill);
-    ui.painter().text(
+    draw_icon(
+        ui.painter(),
+        icon,
         rect.center(),
-        Align2::CENTER_CENTER,
-        glyph,
-        FontId::proportional(16.0),
+        17.0,
         if active { pal.danger } else { pal.text },
+        active,
     );
     resp.on_hover_text(tip)
         .on_hover_cursor(CursorIcon::PointingHand)
@@ -4321,7 +4457,7 @@ fn draw_stage(
     deaf: bool,
     actions: &mut Vec<Action>,
 ) {
-    let bar_h = 60.0;
+    let bar_h = 86.0;
     let area = Rect::from_min_max(rect.min + vec2(14.0, 12.0), rect.max - vec2(14.0, bar_h));
     let n = tiles.len().max(1);
     let gap = 10.0;
@@ -4403,62 +4539,72 @@ fn draw_stage(
         }
     }
 
-    // панель управления
-    let buttons: [(&str, &str, bool, Color32); 4] = [
+    // панель управления — отдельная «таблетка» под плитками
+    let buttons: [(Icon, &str, bool, bool); 4] = [
         (
-            if mute { "🔇" } else { "🎤" },
+            Icon::Mic,
             if mute {
                 "Включить микрофон"
             } else {
                 "Выключить микрофон"
             },
             mute,
-            pal.danger,
+            false,
         ),
         (
-            "🎧",
+            Icon::Headphones,
             if deaf {
                 "Включить звук"
             } else {
                 "Выключить звук"
             },
             deaf,
-            pal.danger,
+            false,
         ),
-        ("🖥", "Демонстрация экрана — скоро", false, pal.faint),
-        ("✆", "Отключиться", true, pal.danger),
+        (Icon::Screen, "Демонстрация экрана — скоро", false, false),
+        (Icon::HangUp, "Отключиться", false, true),
     ];
-    let bw = 52.0;
-    let total = buttons.len() as f32 * bw + (buttons.len() as f32 - 1.0) * 12.0;
-    let mut x = rect.center().x - total / 2.0;
-    let y = rect.bottom() - bar_h / 2.0 - 4.0;
-    for (i, (glyph, tip, active, color)) in buttons.iter().enumerate() {
-        let r = Rect::from_center_size(pos2(x + bw / 2.0, y), vec2(bw, 44.0));
+    let bw = 56.0;
+    let gap = 10.0;
+    let total = buttons.len() as f32 * bw + (buttons.len() as f32 - 1.0) * gap;
+    let y = rect.bottom() - bar_h / 2.0;
+    let pill = Rect::from_center_size(pos2(rect.center().x, y), vec2(total + 20.0, 58.0));
+    ui.painter().rect_filled(
+        pill,
+        29.0,
+        Color32::from_black_alpha(if pal.light { 30 } else { 90 }),
+    );
+    ui.painter()
+        .rect_stroke(pill, 29.0, Stroke::new(1.0, pal.border));
+    let mut x = pill.left() + 10.0;
+    for (i, (icon, tip, active, danger)) in buttons.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(x, y - 23.0), vec2(bw, 46.0));
         let resp = ui.interact(r, ui.id().with(("stage_btn", i)), Sense::click());
-        let fill = if i == 3 || *active {
-            if resp.hovered() {
-                mix(*color, Color32::WHITE, 0.15)
-            } else {
-                *color
-            }
-        } else if resp.hovered() {
-            pal.hover
+        let h = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+        let fill = if *danger {
+            mix(pal.danger, Color32::WHITE, 0.12 * h)
+        } else if *active {
+            mix(
+                pal.danger.gamma_multiply(0.3),
+                pal.danger.gamma_multiply(0.45),
+                h,
+            )
         } else {
-            pal.elevated
+            mix(pal.elevated, pal.hover, h)
         };
-        ui.painter().rect_filled(r, 22.0, fill);
-        let fg = if i == 3 || *active {
+        ui.painter().rect_filled(r, 23.0, fill);
+        let fg = if *danger {
             Color32::WHITE
+        } else if *active {
+            pal.danger
+        } else if i == 2 {
+            pal.faint
         } else {
             pal.text
         };
-        ui.painter().text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            *glyph,
-            FontId::proportional(18.0),
-            fg,
-        );
+        draw_icon(ui.painter(), *icon, r.center(), 20.0, fg, *active);
         let resp = resp
             .on_hover_text(*tip)
             .on_hover_cursor(CursorIcon::PointingHand);
@@ -4470,6 +4616,105 @@ fn draw_stage(
                 _ => {}
             }
         }
-        x += bw + 12.0;
+        x += bw + gap;
+    }
+}
+
+/// Панель-«карточка» с отступом от краёв окна.
+fn card(fill: Color32, radius: f32, outer: Margin) -> egui::Frame {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(radius)
+        .outer_margin(outer)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Icon {
+    Mic,
+    Headphones,
+    Screen,
+    HangUp,
+}
+
+fn arc(center: egui::Pos2, r: f32, from: f32, to: f32) -> Vec<egui::Pos2> {
+    (0..=20)
+        .map(|i| {
+            let a = from + (to - from) * i as f32 / 20.0;
+            center + vec2(a.cos(), a.sin()) * r
+        })
+        .collect()
+}
+
+/// Простые векторные иконки (одинаково чёткие при любом масштабе).
+fn draw_icon(
+    p: &egui::Painter,
+    icon: Icon,
+    c: egui::Pos2,
+    size: f32,
+    color: Color32,
+    crossed: bool,
+) {
+    use std::f32::consts::PI;
+    let s = size;
+    let w = (s * 0.11).max(1.6);
+    let stroke = Stroke::new(w, color);
+    match icon {
+        Icon::Mic => {
+            let body = Rect::from_center_size(c - vec2(0.0, s * 0.14), vec2(s * 0.36, s * 0.56));
+            p.rect_filled(body, s * 0.18, color);
+            p.add(egui::Shape::line(
+                arc(c - vec2(0.0, s * 0.08), s * 0.32, 0.0, PI),
+                stroke,
+            ));
+            p.line_segment([c + vec2(0.0, s * 0.24), c + vec2(0.0, s * 0.42)], stroke);
+            p.line_segment(
+                [c + vec2(-s * 0.16, s * 0.42), c + vec2(s * 0.16, s * 0.42)],
+                stroke,
+            );
+        }
+        Icon::Headphones => {
+            p.add(egui::Shape::line(
+                arc(c + vec2(0.0, s * 0.06), s * 0.38, PI, 2.0 * PI),
+                stroke,
+            ));
+            for dx in [-1.0f32, 1.0] {
+                let ear = Rect::from_center_size(
+                    c + vec2(dx * s * 0.34, s * 0.16),
+                    vec2(s * 0.2, s * 0.34),
+                );
+                p.rect_filled(ear, s * 0.07, color);
+            }
+        }
+        Icon::Screen => {
+            let r = Rect::from_center_size(c - vec2(0.0, s * 0.08), vec2(s * 0.82, s * 0.56));
+            p.rect_stroke(r, s * 0.08, stroke);
+            p.line_segment([c + vec2(0.0, s * 0.2), c + vec2(0.0, s * 0.36)], stroke);
+            p.line_segment(
+                [c + vec2(-s * 0.2, s * 0.38), c + vec2(s * 0.2, s * 0.38)],
+                stroke,
+            );
+        }
+        Icon::HangUp => {
+            // трубка, лежащая «рогами» вниз
+            let thick = Stroke::new(s * 0.2, color);
+            p.add(egui::Shape::line(
+                arc(c + vec2(0.0, s * 0.36), s * 0.5, -PI * 0.82, -PI * 0.18),
+                thick,
+            ));
+            for dx in [-1.0f32, 1.0] {
+                let end = Rect::from_center_size(
+                    c + vec2(dx * s * 0.36, s * 0.12),
+                    vec2(s * 0.26, s * 0.2),
+                );
+                p.rect_filled(end, s * 0.06, color);
+            }
+        }
+    }
+    if crossed {
+        let d = s * 0.42;
+        p.line_segment(
+            [c + vec2(-d, -d), c + vec2(d, d)],
+            Stroke::new(w * 1.3, color),
+        );
     }
 }

@@ -124,6 +124,8 @@ pub struct Dm {
     /// (id собеседника, хэш аватарки) — только для личных диалогов 1 на 1.
     pub avatar: Option<(u64, Option<String>)>,
     pub group: bool,
+    /// Собеседники: (id, имя, хэш аватарки).
+    pub recipients: Vec<(u64, String, Option<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -567,6 +569,8 @@ struct RawCall {
     channel_id: String,
     #[serde(default)]
     ringing: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    voice_states: Vec<RawVoiceState>,
 }
 
 #[derive(Deserialize)]
@@ -1216,6 +1220,7 @@ fn convert_dm(c: &RawChannel, users: &HashMap<String, (String, Option<String>)>)
         last_message: c.last_message_id.as_deref().map(sid).unwrap_or(0),
         avatar,
         group,
+        recipients: people,
     }
 }
 
@@ -2215,6 +2220,16 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
         "CALL_CREATE" | "CALL_UPDATE" => {
             let c: RawCall = serde_json::from_str(d)?;
             let me = ME.load(std::sync::atomic::Ordering::Relaxed);
+            // кто уже сидит в звонке
+            for v in &c.voice_states {
+                if let Some(member) = v.member() {
+                    sink.send(Event::VoiceState {
+                        guild_id: None,
+                        member,
+                        left: false,
+                    });
+                }
+            }
             sink.send(Event::CallRing {
                 channel_id: sid(&c.channel_id),
                 ringing: c.ringing.iter().any(|id| sid(id) == me),
