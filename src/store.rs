@@ -38,3 +38,33 @@ pub fn clear() {
         let _ = fs::remove_file(p);
     }
 }
+
+fn log_path() -> Option<PathBuf> {
+    Some(path()?.with_file_name("log.txt"))
+}
+
+pub fn log_path_display() -> String {
+    log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "недоступен".into())
+}
+
+/// Дописывает строку в лог (%APPDATA%\Rustcord\log.txt). Лог не растёт больше ~1 МБ.
+/// Токен в лог никогда не пишется.
+pub fn log(line: &str) {
+    use std::io::Write;
+    let Some(p) = log_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if fs::metadata(&p)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        let _ = fs::remove_file(&p);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(f, "[{now}] {line}");
+    }
+}

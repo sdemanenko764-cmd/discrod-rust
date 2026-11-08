@@ -136,7 +136,9 @@ pub enum Event {
 
 #[derive(Deserialize)]
 struct RawUser {
+    #[serde(default)]
     id: String,
+    #[serde(default)]
     username: String,
     #[serde(default)]
     global_name: Option<String>,
@@ -153,18 +155,19 @@ impl RawUser {
 
 #[derive(Deserialize)]
 struct RawChannel {
+    #[serde(default)]
     id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     kind: u8,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    position: Option<i32>,
+    position: Option<i64>,
     #[serde(default)]
     parent_id: Option<String>,
     #[serde(default)]
     guild_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     recipients: Vec<RawUser>,
     #[serde(default)]
     recipient_ids: Vec<String>,
@@ -185,7 +188,7 @@ struct RawGuild {
     name: Option<String>,
     #[serde(default)]
     properties: Option<RawGuildProps>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     channels: Vec<RawChannel>,
     #[serde(default)]
     unavailable: Option<bool>,
@@ -194,12 +197,28 @@ struct RawGuild {
 #[derive(Deserialize)]
 struct RawReady {
     user: RawUser,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     guilds: Vec<RawGuild>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     private_channels: Vec<RawChannel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     users: Vec<RawUser>,
+}
+
+/// Список, в котором неподходящие элементы молча пропускаются, а не ломают весь разбор.
+/// Discord иногда присылает поля другого вида — из-за одного странного канала
+/// не должен отваливаться вход целиком.
+fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(d)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -341,7 +360,10 @@ fn convert_channel(c: &RawChannel) -> Channel {
         id: sid(&c.id),
         name: c.name.clone().unwrap_or_default(),
         kind: c.kind,
-        position: c.position.unwrap_or(0),
+        position: c
+            .position
+            .unwrap_or(0)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         parent: c.parent_id.as_deref().map(sid),
     }
 }
@@ -548,27 +570,51 @@ async fn send_message(
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 enum End {
-    Reconnect,
+    Reconnect(String),
     Fatal(String),
 }
 
+/// После стольких неудачных попыток подряд при ПЕРВОМ входе — показываем ошибку,
+/// а не крутим «Подключение…» бесконечно.
+const MAX_LOGIN_ATTEMPTS: u32 = 3;
+
 async fn gateway_loop(auth: Auth, sink: Sink) {
     let mut delay: u64 = 1;
-    let mut first = true;
+    let mut ever_ready = false;
+    let mut failures: u32 = 0;
     loop {
-        sink.send(Event::Status(if first {
-            Status::Connecting
-        } else {
+        sink.send(Event::Status(if ever_ready || failures > 0 {
             Status::Reconnecting
+        } else {
+            Status::Connecting
         }));
-        first = false;
-        match session(&auth, &sink, &mut delay).await {
+        let mut got_ready = false;
+        let reason = match session(&auth, &sink, &mut got_ready).await {
             Ok(End::Fatal(msg)) => {
+                crate::store::log(&format!("ФАТАЛЬНО: {msg}"));
                 sink.send(Event::Fatal(msg));
                 return;
             }
-            Ok(End::Reconnect) => {}
-            Err(e) => eprintln!("gateway: {e}"),
+            Ok(End::Reconnect(r)) => r,
+            Err(e) => format!("ошибка соединения: {e}"),
+        };
+        crate::store::log(&format!("gateway: {reason}"));
+        if got_ready {
+            ever_ready = true;
+            failures = 0;
+            delay = 1;
+        } else {
+            failures += 1;
+        }
+        if !ever_ready {
+            if failures >= MAX_LOGIN_ATTEMPTS {
+                sink.send(Event::Fatal(format!(
+                    "Не удалось войти: {reason}.\nЛог: {}",
+                    crate::store::log_path_display()
+                )));
+                return;
+            }
+            sink.send(Event::Error(format!("Попытка {failures}: {reason}")));
         }
         tokio::time::sleep(Duration::from_secs(delay)).await;
         delay = (delay * 2).min(30);
@@ -595,19 +641,31 @@ fn heartbeat(seq: Option<u64>) -> String {
 }
 
 fn close_end(frame: Option<CloseFrame<'_>>) -> End {
-    let code = frame.map(|f| u16::from(f.code)).unwrap_or(1000);
+    let (code, text) = frame
+        .map(|f| (u16::from(f.code), f.reason.to_string()))
+        .unwrap_or((1000, String::new()));
+    crate::store::log(&format!("gateway закрыт: код {code} {text}"));
     match code {
-        4004 => End::Fatal("Токен недействителен. Проверьте его и войдите снова.".into()),
-        4013 => End::Fatal("Discord отклонил набор intents бота.".into()),
+        4004 => End::Fatal(
+            "Discord не принял токен (код 4004).\n\
+             • Токен бота — поставьте галочку «Это токен бота».\n\
+             • Токен аккаунта — галочку уберите.\n\
+             • Если меняли пароль или сбрасывали токен — нужен новый токен."
+                .into(),
+        ),
+        4013 => End::Fatal("Discord отклонил набор intents бота (код 4013).".into()),
         4014 => End::Fatal(
-            "У бота не включён Message Content Intent. Включите его в Discord Developer Portal → Bot.".into(),
+            "У бота не включён Message Content Intent (код 4014). \
+             Включите его: Discord Developer Portal → ваше приложение → Bot."
+                .into(),
         ),
         4010..=4012 => End::Fatal(format!("Discord закрыл соединение (код {code}).")),
-        _ => End::Reconnect,
+        _ if text.is_empty() => End::Reconnect(format!("Discord закрыл соединение (код {code})")),
+        _ => End::Reconnect(format!("Discord закрыл соединение (код {code}: {text})")),
     }
 }
 
-async fn session(auth: &Auth, sink: &Sink, delay: &mut u64) -> Result<End, BoxErr> {
+async fn session(auth: &Auth, sink: &Sink, got_ready: &mut bool) -> Result<End, BoxErr> {
     let (ws, _) = tokio_tungstenite::connect_async(GATEWAY).await?;
     let (mut write, mut read) = ws.split();
 
@@ -624,7 +682,11 @@ async fn session(auth: &Auth, sink: &Sink, delay: &mut u64) -> Result<End, BoxEr
             Some(Ok(WsMsg::Close(f))) => return Ok(close_end(f)),
             Some(Ok(_)) => {}
             Some(Err(e)) => return Err(e.into()),
-            None => return Ok(End::Reconnect),
+            None => {
+                return Ok(End::Reconnect(
+                    "соединение оборвалось до приветствия".into(),
+                ))
+            }
         }
     };
 
@@ -635,13 +697,18 @@ async fn session(auth: &Auth, sink: &Sink, delay: &mut u64) -> Result<End, BoxEr
     let mut hb = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     let mut seq: Option<u64> = None;
     let mut acked = true;
+    let ready_timeout = tokio::time::sleep(Duration::from_secs(40));
+    tokio::pin!(ready_timeout);
 
     // 3. Основной цикл: heartbeat + события.
     loop {
         tokio::select! {
+            _ = &mut ready_timeout, if !*got_ready => {
+                return Ok(End::Reconnect("Discord не ответил на вход за 40 секунд".into()));
+            }
             _ = hb.tick() => {
                 if !acked {
-                    return Ok(End::Reconnect); // сервер перестал отвечать
+                    return Ok(End::Reconnect("сервер перестал отвечать на heartbeat".into()));
                 }
                 acked = false;
                 write.send(WsMsg::Text(heartbeat(seq))).await?;
@@ -657,30 +724,37 @@ async fn session(auth: &Auth, sink: &Sink, delay: &mut u64) -> Result<End, BoxEr
                                 0 => {
                                     let t = p.t.as_deref().unwrap_or("");
                                     let d = p.d.map(|d| d.get()).unwrap_or("null");
-                                    if t == "READY" {
-                                        *delay = 1;
-                                    }
-                                    if let Err(e) = handle_dispatch(t, d, sink) {
-                                        eprintln!("не удалось разобрать {t}: {e}");
+                                    match handle_dispatch(t, d, sink) {
+                                        Ok(()) if t == "READY" => {
+                                            *got_ready = true;
+                                            crate::store::log("вход выполнен (READY)");
+                                        }
+                                        Ok(()) => {}
+                                        Err(e) if t == "READY" => {
+                                            return Ok(End::Fatal(format!(
+                                                "Discord ответил на вход, но ответ не удалось разобрать: {e}"
+                                            )));
+                                        }
+                                        Err(e) => crate::store::log(&format!("не удалось разобрать {t}: {e}")),
                                     }
                                 }
                                 1 => write.send(WsMsg::Text(heartbeat(seq))).await?,
-                                7 => return Ok(End::Reconnect),
+                                7 => return Ok(End::Reconnect("Discord попросил переподключиться".into())),
                                 9 => {
                                     tokio::time::sleep(Duration::from_secs(3)).await;
-                                    return Ok(End::Reconnect);
+                                    return Ok(End::Reconnect("Discord отклонил сессию (invalid session)".into()));
                                 }
                                 11 => acked = true,
                                 _ => {}
                             }
                         }
-                        Err(e) => eprintln!("gateway: плохой пакет: {e}"),
+                        Err(e) => crate::store::log(&format!("gateway: плохой пакет: {e}")),
                     }
                 }
                 Some(Ok(WsMsg::Close(f))) => return Ok(close_end(f)),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
-                None => return Ok(End::Reconnect),
+                None => return Ok(End::Reconnect("соединение оборвалось".into())),
             }
         }
     }
