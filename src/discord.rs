@@ -66,6 +66,8 @@ pub struct Guild {
     pub id: u64,
     pub name: String,
     pub icon: Option<String>,
+    /// id роли -> (название, цвет)
+    pub roles: HashMap<String, (String, u32)>,
     pub channels: Vec<Channel>,
 }
 
@@ -140,6 +142,73 @@ pub struct Reply {
     pub content: String,
 }
 
+/// Эмодзи: обычный юникод (id = None) или кастомный эмодзи сервера.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Emoji {
+    pub id: Option<u64>,
+    pub name: String,
+    pub animated: bool,
+}
+
+impl Emoji {
+    pub fn unicode(s: &str) -> Self {
+        Self {
+            id: None,
+            name: s.to_string(),
+            animated: false,
+        }
+    }
+
+    /// Как эмодзи записывается в адресе запроса реакции.
+    fn api_key(&self) -> String {
+        match self.id {
+            Some(id) => format!("{}:{id}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    pub fn image_url(&self) -> String {
+        match self.id {
+            Some(id) => custom_emoji_url(id, self.animated),
+            None => crate::emoji::twemoji_url(&self.name),
+        }
+    }
+}
+
+pub fn custom_emoji_url(id: u64, animated: bool) -> String {
+    let ext = if animated { "gif" } else { "png" };
+    format!("https://cdn.discordapp.com/emojis/{id}.{ext}?size=48")
+}
+
+#[derive(Clone, Debug)]
+pub struct Reaction {
+    pub emoji: Emoji,
+    pub count: u32,
+    pub me: bool,
+}
+
+/// Строка списка участников: заголовок группы или участник.
+#[derive(Clone, Debug)]
+pub enum ListItem {
+    Group {
+        id: String,
+        count: u64,
+    },
+    Member {
+        id: u64,
+        name: String,
+        avatar: Option<String>,
+        status: String,
+    },
+}
+
+pub enum ListOp {
+    Sync { start: usize, items: Vec<ListItem> },
+    Insert { index: usize, item: ListItem },
+    Update { index: usize, item: ListItem },
+    Delete { index: usize },
+}
+
 #[derive(Clone, Debug)]
 pub struct Msg {
     pub id: u64,
@@ -155,6 +224,7 @@ pub struct Msg {
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
     pub reply: Option<Reply>,
+    pub reactions: Vec<Reaction>,
 }
 
 /// Один кадр картинки (у статичной — один, у GIF — много).
@@ -180,6 +250,29 @@ pub enum Cmd {
     Send {
         channel_id: u64,
         content: String,
+        reply_to: Option<u64>,
+    },
+    Edit {
+        channel_id: u64,
+        message_id: u64,
+        content: String,
+    },
+    Delete {
+        channel_id: u64,
+        message_id: u64,
+    },
+    React {
+        channel_id: u64,
+        message_id: u64,
+        emoji: Emoji,
+        add: bool,
+    },
+    Typing {
+        channel_id: u64,
+    },
+    SubscribeMembers {
+        guild_id: u64,
+        channel_id: u64,
     },
     Upload {
         channel_id: u64,
@@ -236,6 +329,27 @@ pub enum Event {
     Image {
         key: String,
         result: Result<Vec<Frame>, String>,
+    },
+    Reaction {
+        channel_id: u64,
+        message_id: u64,
+        user_id: u64,
+        emoji: Emoji,
+        add: bool,
+    },
+    ReactionsCleared {
+        channel_id: u64,
+        message_id: u64,
+    },
+    Typing {
+        channel_id: u64,
+        user_id: u64,
+        name: Option<String>,
+    },
+    MemberList {
+        guild_id: u64,
+        groups: Vec<(String, u64)>,
+        ops: Vec<ListOp>,
     },
     Info(String),
     Error(String),
@@ -312,7 +426,19 @@ struct RawGuildProps {
 }
 
 #[derive(Deserialize)]
+struct RawRole {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    color: u32,
+}
+
+#[derive(Deserialize)]
 struct RawGuild {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    roles: Vec<RawRole>,
     id: String,
     #[serde(default)]
     name: Option<String>,
@@ -420,6 +546,146 @@ struct RawEmbed {
 }
 
 #[derive(Deserialize)]
+struct RawEmoji {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    animated: bool,
+}
+
+impl RawEmoji {
+    fn convert(&self) -> Emoji {
+        Emoji {
+            id: self.id.as_deref().map(sid).filter(|i| *i != 0),
+            name: self.name.clone().unwrap_or_default(),
+            animated: self.animated,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawReaction {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    me: bool,
+    emoji: RawEmoji,
+}
+
+#[derive(Deserialize)]
+struct RawReactionEvent {
+    #[serde(default)]
+    user_id: String,
+    channel_id: String,
+    message_id: String,
+    emoji: RawEmoji,
+}
+
+#[derive(Deserialize)]
+struct RawReactionClear {
+    channel_id: String,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+struct RawTypingMember {
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    nick: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawTyping {
+    channel_id: String,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    member: Option<RawTypingMember>,
+}
+
+#[derive(Deserialize)]
+struct RawPresence {
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct RawListMember {
+    user: RawUser,
+    #[serde(default)]
+    nick: Option<String>,
+    #[serde(default)]
+    presence: Option<RawPresence>,
+}
+
+#[derive(Deserialize)]
+struct RawGroup {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    count: u64,
+}
+
+#[derive(Deserialize)]
+struct RawListItem {
+    #[serde(default)]
+    group: Option<RawGroup>,
+    #[serde(default)]
+    member: Option<RawListMember>,
+}
+
+impl RawListItem {
+    fn convert(self) -> Option<ListItem> {
+        if let Some(g) = self.group {
+            return Some(ListItem::Group {
+                id: g.id,
+                count: g.count,
+            });
+        }
+        let m = self.member?;
+        let name = m
+            .nick
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| m.user.display());
+        Some(ListItem::Member {
+            id: sid(&m.user.id),
+            name,
+            avatar: m.user.avatar,
+            status: m
+                .presence
+                .map(|p| p.status)
+                .unwrap_or_else(|| "offline".into()),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawListOp {
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    range: Option<Vec<usize>>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    items: Vec<RawListItem>,
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    item: Option<RawListItem>,
+}
+
+#[derive(Deserialize)]
+struct RawMemberList {
+    guild_id: String,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    groups: Vec<RawGroup>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    ops: Vec<RawListOp>,
+}
+
+#[derive(Deserialize)]
 struct RawRef {
     #[serde(default)]
     author: Option<RawUser>,
@@ -450,6 +716,8 @@ struct RawMessage {
     mentions: Vec<RawUser>,
     #[serde(default)]
     referenced_message: Option<Box<RawRef>>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    reactions: Vec<RawReaction>,
     #[serde(rename = "type", default)]
     kind: u8,
 }
@@ -518,7 +786,7 @@ fn system_text(kind: u8) -> Option<&'static str> {
 }
 
 /// `<@123>` → `@имя`, `<:smile:123>` → `:smile:`, `<t:1700000000:f>` → дата.
-fn render_markup(content: &str, names: &HashMap<String, String>) -> String {
+fn render_markup(content: &str, names: &HashMap<String, String>, keep_emoji: bool) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
     while let Some(start) = rest.find('<') {
@@ -546,7 +814,7 @@ fn render_markup(content: &str, names: &HashMap<String, String>) -> String {
                 id.chars()
                     .all(|c| c.is_ascii_digit())
                     .then(|| "#канал".to_string())
-            } else if inner.starts_with(':') || inner.starts_with("a:") {
+            } else if (inner.starts_with(':') || inner.starts_with("a:")) && !keep_emoji {
                 let body = inner.trim_start_matches("a:").trim_start_matches(':');
                 body.split_once(':').map(|(name, _)| format!(":{name}:"))
             } else if let Some(ts) = inner.strip_prefix("t:") {
@@ -634,7 +902,7 @@ fn convert_msg(m: RawMessage) -> Msg {
         .iter()
         .map(|u| (u.id.clone(), u.display()))
         .collect();
-    let mut content = render_markup(&m.content, &names);
+    let mut content = render_markup(&m.content, &names, true);
     let mut system = false;
     if content.is_empty()
         && m.attachments.is_empty()
@@ -694,8 +962,7 @@ fn convert_msg(m: RawMessage) -> Msg {
 
     let reply = m.referenced_message.map(|r| Reply {
         author: r.author.as_ref().map(RawUser::display).unwrap_or_default(),
-        content: r
-            .content
+        content: render_markup(&r.content, &HashMap::new(), false)
             .chars()
             .take(120)
             .collect::<String>()
@@ -716,6 +983,15 @@ fn convert_msg(m: RawMessage) -> Msg {
         attachments,
         embeds: m.embeds.into_iter().map(convert_embed).collect(),
         reply,
+        reactions: m
+            .reactions
+            .iter()
+            .map(|r| Reaction {
+                emoji: r.emoji.convert(),
+                count: r.count,
+                me: r.me,
+            })
+            .collect(),
     }
 }
 
@@ -744,6 +1020,11 @@ fn convert_guild(g: RawGuild) -> Guild {
             .or(prop_name)
             .unwrap_or_else(|| "Без названия".to_string()),
         icon: g.icon.or(prop_icon),
+        roles: g
+            .roles
+            .iter()
+            .map(|r| (r.id.clone(), (r.name.clone(), r.color)))
+            .collect(),
         channels: g.channels.iter().map(convert_channel).collect(),
     }
 }
@@ -836,6 +1117,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
     let mut http = reqwest::Client::new();
     let mut auth: Option<Auth> = None;
     let mut gateway: Option<tokio::task::JoinHandle<()>> = None;
+    let mut gateway_out: Option<UnboundedSender<String>> = None;
     // Не больше 4 одновременных загрузок картинок.
     let images = Arc::new(tokio::sync::Semaphore::new(4));
 
@@ -858,14 +1140,150 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         continue;
                     }
                 };
-                gateway = Some(tokio::spawn(gateway_loop(a.clone(), proxy, sink.clone())));
+                let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+                gateway_out = Some(out_tx);
+                gateway = Some(tokio::spawn(gateway_loop(
+                    a.clone(),
+                    proxy,
+                    sink.clone(),
+                    out_rx,
+                )));
                 auth = Some(a);
             }
             Cmd::Logout => {
                 if let Some(h) = gateway.take() {
                     h.abort();
                 }
+                gateway_out = None;
                 auth = None;
+            }
+            Cmd::SubscribeMembers {
+                guild_id,
+                channel_id,
+            } => {
+                // Список участников (как в официальном клиенте) — только для аккаунтов.
+                if let (Some(a), Some(out)) = (&auth, &gateway_out) {
+                    if !a.bot {
+                        let mut channels = serde_json::Map::new();
+                        channels.insert(channel_id.to_string(), json!([[0, 99], [100, 199]]));
+                        let packet = json!({
+                            "op": 14,
+                            "d": {
+                                "guild_id": guild_id.to_string(),
+                                "typing": true,
+                                "activities": false,
+                                "threads": false,
+                                "channels": channels
+                            }
+                        });
+                        let _ = out.send(packet.to_string());
+                    }
+                }
+            }
+            Cmd::Edit {
+                channel_id,
+                message_id,
+                content,
+            } => {
+                if let Some(a) = auth.clone() {
+                    let (http, sink) = (http.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let url = format!("{API}/channels/{channel_id}/messages/{message_id}");
+                        let res = http
+                            .patch(url)
+                            .header("Authorization", a.header())
+                            .json(&json!({ "content": content }))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => sink.send(Event::MessageUpdate {
+                                id: message_id,
+                                channel_id,
+                                content: render_markup(&content, &HashMap::new(), true),
+                            }),
+                            Ok(r) => sink.send(Event::Error(format!(
+                                "Не изменено: {}",
+                                http_error(r.status())
+                            ))),
+                            Err(e) => {
+                                sink.send(Event::Error(format!("Не изменено, нет связи: {e}")))
+                            }
+                        }
+                    });
+                }
+            }
+            Cmd::Delete {
+                channel_id,
+                message_id,
+            } => {
+                if let Some(a) = auth.clone() {
+                    let (http, sink) = (http.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let url = format!("{API}/channels/{channel_id}/messages/{message_id}");
+                        let res = http
+                            .delete(url)
+                            .header("Authorization", a.header())
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => sink.send(Event::MessageDelete {
+                                id: message_id,
+                                channel_id,
+                            }),
+                            Ok(r) => sink.send(Event::Error(format!(
+                                "Не удалено: {}",
+                                http_error(r.status())
+                            ))),
+                            Err(e) => {
+                                sink.send(Event::Error(format!("Не удалено, нет связи: {e}")))
+                            }
+                        }
+                    });
+                }
+            }
+            Cmd::React {
+                channel_id,
+                message_id,
+                emoji,
+                add,
+            } => {
+                if let Some(a) = auth.clone() {
+                    let (http, sink) = (http.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        let url = format!(
+                            "{API}/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
+                            percent_encode(&emoji.api_key())
+                        );
+                        let req = if add {
+                            http.put(url).body("")
+                        } else {
+                            http.delete(url)
+                        };
+                        match req.header("Authorization", a.header()).send().await {
+                            Ok(r) if r.status().is_success() => {}
+                            Ok(r) => sink.send(Event::Error(format!(
+                                "Реакция не поставлена: {}",
+                                http_error(r.status())
+                            ))),
+                            Err(e) => {
+                                sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
+                            }
+                        }
+                    });
+                }
+            }
+            Cmd::Typing { channel_id } => {
+                if let Some(a) = auth.clone() {
+                    let http = http.clone();
+                    tokio::spawn(async move {
+                        let _ = http
+                            .post(format!("{API}/channels/{channel_id}/typing"))
+                            .header("Authorization", a.header())
+                            .body("")
+                            .send()
+                            .await;
+                    });
+                }
             }
             Cmd::FetchMessages { channel_id, before } => {
                 if let Some(a) = auth.clone() {
@@ -883,11 +1301,12 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
             Cmd::Send {
                 channel_id,
                 content,
+                reply_to,
             } => {
                 if let Some(a) = auth.clone() {
                     let (http, sink) = (http.clone(), sink.clone());
                     tokio::spawn(async move {
-                        match send_message(&http, &a, channel_id, &content).await {
+                        match send_message(&http, &a, channel_id, &content, reply_to).await {
                             Ok(m) => sink.send(Event::MessageCreate(m)),
                             Err(e) => sink.send(Event::Error(e)),
                         }
@@ -940,6 +1359,18 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
 
 // ======================= REST =======================
 
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn http_error(status: reqwest::StatusCode) -> String {
     match status.as_u16() {
         401 => "Токен недействителен".into(),
@@ -984,11 +1415,17 @@ async fn send_message(
     auth: &Auth,
     channel_id: u64,
     content: &str,
+    reply_to: Option<u64>,
 ) -> Result<Msg, String> {
+    let mut body = json!({ "content": content });
+    if let Some(id) = reply_to {
+        body["message_reference"] =
+            json!({ "message_id": id.to_string(), "fail_if_not_exists": false });
+    }
     let resp = http
         .post(format!("{API}/channels/{channel_id}/messages"))
         .header("Authorization", auth.header())
-        .json(&json!({ "content": content }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("Не отправлено, нет связи: {e}"))?;
@@ -1179,7 +1616,12 @@ enum End {
 /// а не крутим «Подключение…» бесконечно.
 const MAX_LOGIN_ATTEMPTS: u32 = 3;
 
-async fn gateway_loop(auth: Auth, proxy: Option<Proxy>, sink: Sink) {
+async fn gateway_loop(
+    auth: Auth,
+    proxy: Option<Proxy>,
+    sink: Sink,
+    mut out_rx: UnboundedReceiver<String>,
+) {
     let mut delay: u64 = 1;
     let mut ever_ready = false;
     let mut failures: u32 = 0;
@@ -1190,7 +1632,8 @@ async fn gateway_loop(auth: Auth, proxy: Option<Proxy>, sink: Sink) {
             Status::Connecting
         }));
         let mut got_ready = false;
-        let reason = match session(&auth, proxy.as_ref(), &sink, &mut got_ready).await {
+        let reason = match session(&auth, proxy.as_ref(), &sink, &mut got_ready, &mut out_rx).await
+        {
             Ok(End::Fatal(msg)) => {
                 crate::store::log(&format!("ФАТАЛЬНО: {msg}"));
                 sink.send(Event::Fatal(msg));
@@ -1278,6 +1721,7 @@ async fn session(
     proxy: Option<&Proxy>,
     sink: &Sink,
     got_ready: &mut bool,
+    out_rx: &mut UnboundedReceiver<String>,
 ) -> Result<End, BoxErr> {
     let stream = crate::net::connect(proxy, "gateway.discord.gg", 443).await?;
     let (ws, _) = tokio_tungstenite::client_async_tls(GATEWAY, stream).await?;
@@ -1319,6 +1763,9 @@ async fn session(
         tokio::select! {
             _ = &mut ready_timeout, if !*got_ready => {
                 return Ok(End::Reconnect("Discord не ответил на вход за 40 секунд".into()));
+            }
+            Some(packet) = out_rx.recv(), if *got_ready => {
+                write.send(WsMsg::Text(packet)).await?;
             }
             _ = hb.tick() => {
                 if !acked {
@@ -1448,9 +1895,82 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 sink.send(Event::MessageUpdate {
                     id: sid(&m.id),
                     channel_id: sid(&m.channel_id),
-                    content: render_markup(&content, &HashMap::new()),
+                    content: render_markup(&content, &HashMap::new(), true),
                 });
             }
+        }
+        "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
+            let r: RawReactionEvent = serde_json::from_str(d)?;
+            sink.send(Event::Reaction {
+                channel_id: sid(&r.channel_id),
+                message_id: sid(&r.message_id),
+                user_id: sid(&r.user_id),
+                emoji: r.emoji.convert(),
+                add: t == "MESSAGE_REACTION_ADD",
+            });
+        }
+        "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => {
+            let r: RawReactionClear = serde_json::from_str(d)?;
+            sink.send(Event::ReactionsCleared {
+                channel_id: sid(&r.channel_id),
+                message_id: sid(&r.message_id),
+            });
+        }
+        "TYPING_START" => {
+            let r: RawTyping = serde_json::from_str(d)?;
+            let name = r.member.and_then(|m| {
+                m.nick
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| m.user.map(|u| u.display()))
+            });
+            sink.send(Event::Typing {
+                channel_id: sid(&r.channel_id),
+                user_id: sid(&r.user_id),
+                name,
+            });
+        }
+        "GUILD_MEMBER_LIST_UPDATE" => {
+            let r: RawMemberList = serde_json::from_str(d)?;
+            let mut ops = Vec::new();
+            for op in r.ops {
+                match op.op.as_str() {
+                    "SYNC" => ops.push(ListOp::Sync {
+                        start: op
+                            .range
+                            .as_ref()
+                            .and_then(|r| r.first().copied())
+                            .unwrap_or(0),
+                        items: op
+                            .items
+                            .into_iter()
+                            .filter_map(RawListItem::convert)
+                            .collect(),
+                    }),
+                    "INSERT" | "UPDATE" => {
+                        let insert = op.op == "INSERT";
+                        if let (Some(index), Some(item)) =
+                            (op.index, op.item.and_then(RawListItem::convert))
+                        {
+                            ops.push(if insert {
+                                ListOp::Insert { index, item }
+                            } else {
+                                ListOp::Update { index, item }
+                            });
+                        }
+                    }
+                    "DELETE" => {
+                        if let Some(index) = op.index {
+                            ops.push(ListOp::Delete { index });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            sink.send(Event::MemberList {
+                guild_id: sid(&r.guild_id),
+                groups: r.groups.into_iter().map(|g| (g.id, g.count)).collect(),
+                ops,
+            });
         }
         "MESSAGE_DELETE" => {
             let x: RawIds = serde_json::from_str(d)?;

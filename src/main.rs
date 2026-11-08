@@ -13,6 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod discord;
+mod emoji;
 mod fonts;
 mod media;
 mod net;
@@ -32,7 +33,8 @@ use eframe::egui::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use discord::{
-    Attachment, Auth, Channel, Cmd, Dm, Embed, Event, Guild, Msg, Status, DISCORD_EPOCH,
+    Attachment, Auth, Channel, Cmd, Dm, Embed, Emoji, Event, Guild, ListItem, ListOp, Msg,
+    Reaction, Status, DISCORD_EPOCH,
 };
 use media::MediaCache;
 use settings::{Settings, Theme};
@@ -83,7 +85,36 @@ struct ChannelCache {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PickerTarget {
+    Composer,
+    React { channel_id: u64, message_id: u64 },
+}
+
+#[derive(Default)]
+struct MemberList {
+    items: Vec<Option<ListItem>>,
+    groups: HashMap<String, u64>,
+}
+
 enum Action {
+    ToggleMembers,
+    React {
+        channel_id: u64,
+        message_id: u64,
+        emoji: Emoji,
+        add: bool,
+    },
+    Reply(u64, String),
+    StartEdit(u64, u64, String),
+    EditLast(u64),
+    CancelCompose,
+    AskDelete(u64, u64, String),
+    CopyText(String),
+    Report(String),
+    OpenPicker(PickerTarget, egui::Pos2),
+    Typing(u64),
+    ScrollBottom,
     SelectGuild(Option<u64>),
     OpenChannel(u64),
     ToggleCategory(u64),
@@ -131,6 +162,17 @@ struct App {
     unread: HashMap<u64, u64>,
     draft: String,
     media: MediaCache,
+    reply_to: Option<(u64, String)>,
+    editing: Option<(u64, u64)>,
+    pending_delete: Option<(u64, u64, String)>,
+    picker: Option<(PickerTarget, egui::Pos2, f64)>,
+    members_open: bool,
+    member_lists: HashMap<u64, MemberList>,
+    member_sub: Option<(u64, u64)>,
+    /// канал -> кто печатает (id, имя, когда)
+    typing: HashMap<u64, Vec<(u64, String, Instant)>>,
+    last_typing: Instant,
+    scroll_until: Option<Instant>,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -177,6 +219,16 @@ impl App {
             unread: HashMap::new(),
             draft: String::new(),
             media: MediaCache::default(),
+            reply_to: None,
+            editing: None,
+            pending_delete: None,
+            picker: None,
+            members_open: true,
+            member_lists: HashMap::new(),
+            member_sub: None,
+            typing: HashMap::new(),
+            last_typing: Instant::now() - Duration::from_secs(60),
+            scroll_until: None,
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
@@ -273,7 +325,23 @@ impl App {
     }
 
     fn open_channel(&mut self, id: u64) {
+        if self.sel_channel != Some(id) {
+            if self.editing.take().is_some() {
+                self.draft.clear();
+            }
+            self.reply_to = None;
+        }
         self.sel_channel = Some(id);
+        self.scroll_until = Some(Instant::now() + Duration::from_millis(1500));
+        if let Some(g) = self.sel_guild {
+            if self.member_sub != Some((g, id)) {
+                self.member_sub = Some((g, id));
+                let _ = self.cmd.send(Cmd::SubscribeMembers {
+                    guild_id: g,
+                    channel_id: id,
+                });
+            }
+        }
         self.last_channel.insert(self.sel_guild, id);
         self.unread.remove(&id);
         self.lru.retain(|x| *x != id);
@@ -360,6 +428,8 @@ impl App {
                 }
                 self.cache = HashMap::new();
                 self.lru = VecDeque::new();
+                self.member_sub = None;
+                self.member_lists = HashMap::new();
                 let guild = self
                     .sel_guild
                     .filter(|id| self.guilds.iter().any(|g| g.id == *id));
@@ -409,7 +479,98 @@ impl App {
                     self.select_guild(self.sel_guild);
                 }
             }
-            Event::MessageCreate(m) => self.on_message(m),
+            Event::MessageCreate(m) => {
+                if let Some(list) = self.typing.get_mut(&m.channel_id) {
+                    list.retain(|(uid, _, _)| *uid != m.author_id);
+                }
+                if m.author_id == self.me_id && self.sel_channel == Some(m.channel_id) {
+                    self.scroll_until = Some(Instant::now() + Duration::from_millis(1200));
+                }
+                self.on_message(m)
+            }
+            Event::Reaction {
+                channel_id,
+                message_id,
+                user_id,
+                emoji,
+                add,
+            } => self.apply_reaction(channel_id, message_id, user_id, &emoji, add),
+            Event::ReactionsCleared {
+                channel_id,
+                message_id,
+            } => {
+                if let Some(c) = self.cache.get_mut(&channel_id) {
+                    if let Some(m) = c.msgs.iter_mut().find(|m| m.id == message_id) {
+                        m.reactions.clear();
+                    }
+                }
+            }
+            Event::Typing {
+                channel_id,
+                user_id,
+                name,
+            } => {
+                if user_id != self.me_id {
+                    let name = name
+                        .or_else(|| {
+                            self.dms
+                                .iter()
+                                .find(|d| d.id == channel_id)
+                                .map(|d| d.name.clone())
+                        })
+                        .unwrap_or_else(|| "Кто-то".into());
+                    let list = self.typing.entry(channel_id).or_default();
+                    list.retain(|(uid, _, _)| *uid != user_id);
+                    list.push((user_id, name, Instant::now()));
+                }
+            }
+            Event::MemberList {
+                guild_id,
+                groups,
+                ops,
+            } => {
+                let list = self.member_lists.entry(guild_id).or_default();
+                if !groups.is_empty() {
+                    list.groups = groups.into_iter().collect();
+                }
+                for op in ops {
+                    match op {
+                        ListOp::Sync { start, items } => {
+                            if start == 0 {
+                                list.items.clear();
+                            }
+                            if list.items.len() < start {
+                                list.items.resize(start, None);
+                            }
+                            for (i, item) in items.into_iter().enumerate() {
+                                let idx = start + i;
+                                if idx < list.items.len() {
+                                    list.items[idx] = Some(item);
+                                } else {
+                                    list.items.push(Some(item));
+                                }
+                            }
+                        }
+                        ListOp::Insert { index, item } => {
+                            if index <= list.items.len() {
+                                list.items.insert(index, Some(item));
+                            } else {
+                                list.items.push(Some(item));
+                            }
+                        }
+                        ListOp::Update { index, item } => {
+                            if index < list.items.len() {
+                                list.items[index] = Some(item);
+                            }
+                        }
+                        ListOp::Delete { index } => {
+                            if index < list.items.len() {
+                                list.items.remove(index);
+                            }
+                        }
+                    }
+                }
+            }
             Event::MessageUpdate {
                 id,
                 channel_id,
@@ -877,11 +1038,12 @@ impl App {
             });
 
         // --- заголовок канала ---
+        let show_members = self.sel_guild.is_some() && self.members_open;
         egui::TopBottomPanel::top("channel_head")
             .frame(
                 egui::Frame::none()
                     .fill(pal.main)
-                    .inner_margin(Margin::symmetric(18.0, 12.0)),
+                    .inner_margin(Margin::symmetric(18.0, 10.0)),
             )
             .show_separator_line(false)
             .show(ctx, |ui| {
@@ -906,6 +1068,16 @@ impl App {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.sel_guild.is_some() {
+                            let tip = if show_members {
+                                "Скрыть участников"
+                            } else {
+                                "Показать участников"
+                            };
+                            if icon_button(ui, &pal, "👥", tip).clicked() {
+                                actions.push(Action::ToggleMembers);
+                            }
+                        }
                         if self.settings.show_ram {
                             chip(ui, &pal, &format!("ОЗУ {:.0} МБ", self.mem_mb), pal.muted);
                         }
@@ -926,18 +1098,154 @@ impl App {
             );
         }
 
+        // --- участники ---
+        if show_members {
+            let gid = self.sel_guild.unwrap_or(0);
+            let is_bot = self.pending.as_ref().map_or(false, |a| a.bot);
+            egui::SidePanel::right("members")
+                .resizable(false)
+                .exact_width(240.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(pal.side)
+                        .inner_margin(Margin::symmetric(8.0, 10.0)),
+                )
+                .show(ctx, |ui| {
+                    let guild = self.guilds.iter().find(|g| g.id == gid);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            if is_bot {
+                                ui.label(
+                                    RichText::new(
+                                        "Список участников доступен только при входе аккаунтом.",
+                                    )
+                                    .color(pal.muted),
+                                );
+                                return;
+                            }
+                            let Some(list) = self.member_lists.get(&gid) else {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(
+                                        RichText::new("Загрузка участников…").color(pal.muted),
+                                    );
+                                });
+                                return;
+                            };
+                            let mut group_color: Option<Color32> = None;
+                            let mut offline = false;
+                            for item in list.items.iter().flatten() {
+                                match item {
+                                    ListItem::Group { id, count } => {
+                                        offline = id == "offline";
+                                        let (title, color) = match id.as_str() {
+                                            "online" => ("В сети".to_string(), 0),
+                                            "offline" => ("Не в сети".to_string(), 0),
+                                            other => guild
+                                                .and_then(|g| g.roles.get(other))
+                                                .map(|(n, c)| (n.clone(), *c))
+                                                .unwrap_or_else(|| ("Участники".into(), 0)),
+                                        };
+                                        group_color = (color != 0).then(|| {
+                                            Color32::from_rgb(
+                                                (color >> 16) as u8,
+                                                (color >> 8) as u8,
+                                                color as u8,
+                                            )
+                                        });
+                                        let count = list.groups.get(id).copied().unwrap_or(*count);
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} — {count}",
+                                                title.to_uppercase()
+                                            ))
+                                            .size(11.5)
+                                            .strong()
+                                            .color(pal.faint),
+                                        );
+                                    }
+                                    ListItem::Member {
+                                        id,
+                                        name,
+                                        avatar,
+                                        status,
+                                    } => {
+                                        let tex = match (avatar, load_avatars) {
+                                            (Some(h), true) => {
+                                                let url = discord::avatar_url(*id, h);
+                                                self.media.get(
+                                                    ui.ctx(),
+                                                    &self.cmd,
+                                                    &url,
+                                                    &url,
+                                                    64,
+                                                    false,
+                                                )
+                                            }
+                                            _ => None,
+                                        };
+                                        let resp = member_row(
+                                            ui,
+                                            &pal,
+                                            tex,
+                                            *id,
+                                            name,
+                                            status,
+                                            group_color,
+                                            offline,
+                                        );
+                                        resp.on_hover_text(name.as_str());
+                                    }
+                                }
+                            }
+                        });
+                });
+        }
+
         // --- поле ввода ---
         if let (Some(cid), Some((icon, name))) = (self.sel_channel, &title) {
+            let typing_text = typing_line(self.typing.get(&cid));
             egui::TopBottomPanel::bottom("composer")
                 .frame(egui::Frame::none().fill(pal.main).inner_margin(Margin {
                     left: 16.0,
                     right: 16.0,
-                    top: 6.0,
-                    bottom: 16.0,
+                    top: 0.0,
+                    bottom: 14.0,
                 }))
                 .show_separator_line(false)
                 .show(ctx, |ui| {
-                    egui::Frame::none()
+                    let bar = match (&self.editing, &self.reply_to) {
+                        (Some(_), _) => Some("Редактирование сообщения · Esc — отмена".to_string()),
+                        (None, Some((_, author))) => {
+                            Some(format!("Ответ для {author} · Esc — отмена"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(text) = bar {
+                        egui::Frame::none()
+                            .fill(pal.side)
+                            .rounding(Rounding {
+                                nw: 12.0,
+                                ne: 12.0,
+                                sw: 0.0,
+                                se: 0.0,
+                            })
+                            .inner_margin(Margin::symmetric(12.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(text).small().color(pal.muted));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if tool_button(ui, &pal, "✕", "Отмена").clicked() {
+                                            actions.push(Action::CancelCompose);
+                                        }
+                                    });
+                                });
+                            });
+                    }
+                    let frame = egui::Frame::none()
                         .fill(pal.elevated)
                         .rounding(12.0)
                         .inner_margin(Margin::symmetric(8.0, 6.0))
@@ -951,17 +1259,47 @@ impl App {
                                 {
                                     actions.push(Action::Attach(cid));
                                 }
-                                let hint = format!("Написать {icon}{name}");
-                                let edit_width = (ui.available_width() - 44.0).max(60.0);
+                                let hint = if self.editing.is_some() {
+                                    "Изменить сообщение".to_string()
+                                } else {
+                                    format!("Написать {icon}{name}")
+                                };
+                                let edit_width = (ui.available_width() - 82.0).max(60.0);
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.draft)
+                                        .id(egui::Id::new("composer_input"))
                                         .hint_text(hint)
                                         .frame(false)
                                         .desired_width(edit_width)
                                         .vertical_align(Align::Center),
                                 );
+                                if resp.changed()
+                                    && !self.draft.is_empty()
+                                    && self.editing.is_none()
+                                {
+                                    actions.push(Action::Typing(cid));
+                                }
+                                if resp.has_focus() || resp.lost_focus() {
+                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                        actions.push(Action::CancelCompose);
+                                    }
+                                    if self.draft.is_empty()
+                                        && self.editing.is_none()
+                                        && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                                    {
+                                        actions.push(Action::EditLast(cid));
+                                    }
+                                }
                                 let enter = resp.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let emoji_btn = round_button(ui, &pal, "😊", pal.muted, pal.hover)
+                                    .on_hover_text("Эмодзи");
+                                if emoji_btn.clicked() {
+                                    actions.push(Action::OpenPicker(
+                                        PickerTarget::Composer,
+                                        emoji_btn.rect.left_top() - vec2(300.0, 350.0),
+                                    ));
+                                }
                                 let send_clicked =
                                     round_button(ui, &pal, "➤", Color32::WHITE, pal.accent)
                                         .on_hover_text("Отправить (Enter)")
@@ -982,10 +1320,27 @@ impl App {
                                 }
                             });
                         });
+                    let _ = frame;
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+                    if let Some(t) = typing_text {
+                        ui.painter().text(
+                            rect.left_center() + vec2(6.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            t,
+                            FontId::proportional(12.0),
+                            pal.muted,
+                        );
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
                 });
         }
 
         // --- сообщения ---
+        let force_bottom = self.scroll_until.map_or(false, |t| Instant::now() < t);
+        let me_id = self.me_id;
+        let guild_id = self.sel_guild;
+        let toolbar_allowed = self.picker.is_none() && self.pending_delete.is_none();
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.main))
             .show(ctx, |ui| {
@@ -1008,8 +1363,12 @@ impl App {
                     media: &mut self.media,
                     cmd: &self.cmd,
                     actions: &mut actions,
+                    me_id,
+                    guild_id,
+                    channel_id: cid,
+                    toolbar_allowed,
                 };
-                ui.push_id(cid, |ui| {
+                let out = ui.push_id(cid, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .stick_to_bottom(true)
@@ -1046,7 +1405,6 @@ impl App {
                                 let grouped = !new_day
                                     && prev.map_or(false, |p| {
                                         p.author_id == m.author_id
-                                            && p.reply.is_none()
                                             && m.reply.is_none()
                                             && snowflake_ms(m.id).saturating_sub(snowflake_ms(p.id))
                                                 < 7 * 60 * 1000
@@ -1054,9 +1412,36 @@ impl App {
                                 message_ui(ui, &mut mcx, m, grouped);
                                 prev = Some(m);
                             }
-                            ui.add_space(12.0);
-                        });
+                            ui.add_space(6.0);
+                            if force_bottom {
+                                ui.scroll_to_cursor(Some(Align::BOTTOM));
+                                ui.ctx().request_repaint();
+                            }
+                        })
                 });
+                let scroll = out.inner;
+                let distance =
+                    scroll.content_size.y - scroll.state.offset.y - scroll.inner_rect.height();
+                if distance > 400.0 {
+                    let r = scroll.inner_rect;
+                    let btn = Rect::from_min_size(
+                        pos2(r.right() - 190.0, r.bottom() - 48.0),
+                        vec2(170.0, 34.0),
+                    );
+                    let resp = ui.put(
+                        btn,
+                        egui::Button::new(
+                            RichText::new("↓ К последним")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(pal.accent)
+                        .rounding(17.0),
+                    );
+                    if resp.clicked() {
+                        actions.push(Action::ScrollBottom);
+                    }
+                }
             });
 
         // --- перетаскивание файлов ---
@@ -1091,37 +1476,342 @@ impl App {
         }
 
         for action in actions {
-            match action {
-                Action::SelectGuild(g) => self.select_guild(g),
-                Action::OpenChannel(id) => self.open_channel(id),
-                Action::ToggleCategory(id) => {
-                    if !self.collapsed.remove(&id) {
-                        self.collapsed.insert(id);
-                    }
+            self.handle_action(ctx, action);
+        }
+    }
+
+    fn handle_action(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::SelectGuild(g) => self.select_guild(g),
+            Action::OpenChannel(id) => self.open_channel(id),
+            Action::ToggleCategory(id) => {
+                if !self.collapsed.remove(&id) {
+                    self.collapsed.insert(id);
                 }
-                Action::LoadOlder(id) => self.load_older(id),
-                Action::Send(channel_id, content) => {
+            }
+            Action::LoadOlder(id) => self.load_older(id),
+            Action::Send(channel_id, content) => {
+                if let Some((cid, mid)) = self.editing.take() {
+                    let _ = self.cmd.send(Cmd::Edit {
+                        channel_id: cid,
+                        message_id: mid,
+                        content,
+                    });
+                } else {
+                    let reply_to = self.reply_to.take().map(|(id, _)| id);
                     let _ = self.cmd.send(Cmd::Send {
                         channel_id,
                         content,
+                        reply_to,
                     });
+                    self.scroll_until = Some(Instant::now() + Duration::from_millis(1500));
                 }
-                Action::Attach(cid) => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Выберите файл для отправки")
-                        .pick_file()
-                    {
-                        self.upload(cid, path);
-                    }
-                }
-                Action::Download(url, filename) => {
-                    self.toast(format!("Скачиваю {filename}…"), false);
-                    let _ = self.cmd.send(Cmd::Download { url, filename });
-                }
-                Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
-                Action::OpenSettings => self.settings_open = true,
-                Action::Logout => self.logout(None),
             }
+            Action::Attach(cid) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Выберите файл для отправки")
+                    .pick_file()
+                {
+                    self.upload(cid, path);
+                }
+            }
+            Action::Download(url, filename) => {
+                self.toast(format!("Скачиваю {filename}…"), false);
+                let _ = self.cmd.send(Cmd::Download { url, filename });
+            }
+            Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Action::OpenSettings => self.settings_open = true,
+            Action::Logout => self.logout(None),
+            Action::ToggleMembers => self.members_open = !self.members_open,
+            Action::React {
+                channel_id,
+                message_id,
+                emoji,
+                add,
+            } => {
+                self.apply_reaction(channel_id, message_id, self.me_id, &emoji, add);
+                let _ = self.cmd.send(Cmd::React {
+                    channel_id,
+                    message_id,
+                    emoji,
+                    add,
+                });
+            }
+            Action::Reply(id, author) => {
+                self.editing = None;
+                self.reply_to = Some((id, author));
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("composer_input")));
+            }
+            Action::StartEdit(cid, mid, content) => {
+                self.reply_to = None;
+                self.editing = Some((cid, mid));
+                self.draft = content;
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("composer_input")));
+            }
+            Action::EditLast(cid) => {
+                let last = self.cache.get(&cid).and_then(|c| {
+                    c.msgs
+                        .iter()
+                        .rev()
+                        .find(|m| m.author_id == self.me_id && !m.system)
+                        .map(|m| (m.id, m.content.clone()))
+                });
+                if let Some((mid, content)) = last {
+                    self.reply_to = None;
+                    self.editing = Some((cid, mid));
+                    self.draft = content;
+                }
+            }
+            Action::CancelCompose => {
+                if self.editing.take().is_some() {
+                    self.draft.clear();
+                }
+                self.reply_to = None;
+            }
+            Action::AskDelete(cid, mid, preview) => self.pending_delete = Some((cid, mid, preview)),
+            Action::CopyText(text) => {
+                ctx.copy_text(text);
+                self.toast("Текст скопирован", false);
+            }
+            Action::Report(link) => {
+                ctx.copy_text(link);
+                ctx.open_url(egui::OpenUrl::new_tab(
+                    "https://support.discord.com/hc/requests/new",
+                ));
+                self.toast(
+                    "Ссылка на сообщение скопирована — вставьте её в форму жалобы Discord",
+                    false,
+                );
+            }
+            Action::OpenPicker(target, pos) => {
+                self.picker = Some((target, pos, ctx.input(|i| i.time)));
+            }
+            Action::Typing(cid) => {
+                if self.last_typing.elapsed() > Duration::from_secs(8) {
+                    self.last_typing = Instant::now();
+                    let _ = self.cmd.send(Cmd::Typing { channel_id: cid });
+                }
+            }
+            Action::ScrollBottom => {
+                self.scroll_until = Some(Instant::now() + Duration::from_millis(600));
+            }
+        }
+    }
+
+    fn apply_reaction(
+        &mut self,
+        channel_id: u64,
+        message_id: u64,
+        user_id: u64,
+        emoji: &Emoji,
+        add: bool,
+    ) {
+        let mine = user_id == self.me_id;
+        let Some(c) = self.cache.get_mut(&channel_id) else {
+            return;
+        };
+        let Some(m) = c.msgs.iter_mut().rev().find(|m| m.id == message_id) else {
+            return;
+        };
+        match m.reactions.iter().position(|r| r.emoji == *emoji) {
+            Some(i) => {
+                let r = &mut m.reactions[i];
+                if mine && r.me == add {
+                    return; // уже учтено (мы сами нажали, сервер подтвердил)
+                }
+                if add {
+                    r.count += 1;
+                } else {
+                    r.count = r.count.saturating_sub(1);
+                }
+                if mine {
+                    r.me = add;
+                }
+                if r.count == 0 {
+                    m.reactions.remove(i);
+                }
+            }
+            None if add => m.reactions.push(Reaction {
+                emoji: emoji.clone(),
+                count: 1,
+                me: mine,
+            }),
+            None => {}
+        }
+    }
+
+    // ======================= панель эмодзи и удаление =======================
+
+    fn picker_ui(&mut self, ctx: &egui::Context) {
+        let Some((target, pos, opened_at)) = self.picker else {
+            return;
+        };
+        let pal = self.pal;
+        let mut chosen: Option<String> = None;
+        let area = egui::Area::new(egui::Id::new("emoji_picker"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(pal.side)
+                    .rounding(12.0)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(336.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for (category, list) in emoji::CATEGORIES {
+                                    ui.label(
+                                        RichText::new(category.to_uppercase())
+                                            .size(11.0)
+                                            .strong()
+                                            .color(pal.faint),
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                                        for e in list.split_whitespace() {
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                vec2(36.0, 36.0),
+                                                Sense::click(),
+                                            );
+                                            if resp.hovered() {
+                                                ui.painter().rect_filled(rect, 6.0, pal.hover);
+                                            }
+                                            if ui.is_rect_visible(rect) {
+                                                let url = emoji::twemoji_url(e);
+                                                let key = format!("72|false|{url}");
+                                                let inner = Rect::from_center_size(
+                                                    rect.center(),
+                                                    vec2(26.0, 26.0),
+                                                );
+                                                match self
+                                                    .media
+                                                    .get(ctx, &self.cmd, &key, &url, 72, false)
+                                                {
+                                                    Some((id, _)) => {
+                                                        egui::Image::from_texture(
+                                                            SizedTexture::new(id, inner.size()),
+                                                        )
+                                                        .paint_at(ui, inner);
+                                                    }
+                                                    None => {
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            Align2::CENTER_CENTER,
+                                                            e,
+                                                            FontId::proportional(20.0),
+                                                            pal.text,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                chosen = Some(e.to_string());
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    });
+            });
+        let now = ctx.input(|i| i.time);
+        let clicked_outside =
+            ctx.input(|i| i.pointer.any_click()) && !area.response.contains_pointer();
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if let Some(e) = chosen {
+            match target {
+                PickerTarget::Composer => {
+                    self.draft.push_str(&e);
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("composer_input")));
+                }
+                PickerTarget::React {
+                    channel_id,
+                    message_id,
+                } => {
+                    self.picker = None;
+                    self.handle_action(
+                        ctx,
+                        Action::React {
+                            channel_id,
+                            message_id,
+                            emoji: Emoji::unicode(&e),
+                            add: true,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        if escape || (clicked_outside && now - opened_at > 0.15) {
+            self.picker = None;
+        }
+    }
+
+    fn delete_ui(&mut self, ctx: &egui::Context) {
+        let Some((cid, mid, preview)) = self.pending_delete.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let mut decision: Option<bool> = None;
+        egui::Window::new(RichText::new("Удалить сообщение?").strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(pal.side)
+                    .inner_margin(Margin::same(18.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new("Сообщение будет удалено у всех.").color(pal.muted));
+                if !preview.is_empty() {
+                    egui::Frame::none()
+                        .fill(pal.elevated)
+                        .rounding(8.0)
+                        .inner_margin(Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&preview).color(pal.text));
+                        });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Удалить").strong().color(Color32::WHITE),
+                            )
+                            .fill(pal.danger),
+                        )
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Отмена").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+        match decision {
+            Some(true) => {
+                self.pending_delete = None;
+                let _ = self.cmd.send(Cmd::Delete {
+                    channel_id: cid,
+                    message_id: mid,
+                });
+            }
+            Some(false) => self.pending_delete = None,
+            None => {}
         }
     }
 
@@ -1266,6 +1956,11 @@ impl App {
                                 .small()
                                 .color(pal.faint),
                         );
+                        ui.label(
+                            RichText::new("Цветные эмодзи: Twemoji (CC-BY 4.0)")
+                                .small()
+                                .color(pal.faint),
+                        );
                     });
             });
 
@@ -1326,6 +2021,8 @@ impl eframe::App for App {
             Screen::Login => self.login_ui(ctx),
             Screen::Main => self.main_ui(ctx),
         }
+        self.picker_ui(ctx);
+        self.delete_ui(ctx);
         self.settings_ui(ctx);
         self.toast_ui(ctx);
         self.media.evict(ctx.input(|i| i.time));
@@ -1340,6 +2037,10 @@ struct MsgCtx<'a> {
     media: &'a mut MediaCache,
     cmd: &'a UnboundedSender<Cmd>,
     actions: &'a mut Vec<Action>,
+    me_id: u64,
+    guild_id: Option<u64>,
+    channel_id: u64,
+    toolbar_allowed: bool,
 }
 
 impl MsgCtx<'_> {
@@ -1354,6 +2055,68 @@ impl MsgCtx<'_> {
         let tex = self.media.get(ctx, self.cmd, &key, url, max_side, animate);
         (key, tex)
     }
+
+    fn message_link(&self, message_id: u64) -> String {
+        let guild = self
+            .guild_id
+            .map(|g| g.to_string())
+            .unwrap_or_else(|| "@me".into());
+        format!(
+            "https://discord.com/channels/{guild}/{}/{message_id}",
+            self.channel_id
+        )
+    }
+}
+
+/// Цветной эмодзи (картинка), с запасным вариантом — символом шрифта.
+fn emoji_image(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, emoji: &Emoji, size: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let animate = emoji.animated && cx.settings.animate_gifs;
+        let (key, tex) = cx.image(ui.ctx(), &emoji.image_url(), 72, animate);
+        match tex {
+            Some((id, _)) => {
+                egui::Image::from_texture(SizedTexture::new(id, rect.size())).paint_at(ui, rect);
+            }
+            None if cx.media.failed(&key) || emoji.id.is_some() => {
+                let label = if emoji.id.is_some() {
+                    format!(":{}:", emoji.name)
+                } else {
+                    emoji.name.clone()
+                };
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(size * 0.7),
+                    cx.pal.text,
+                );
+            }
+            None => {}
+        }
+    }
+    if emoji.id.is_some() {
+        resp.on_hover_text(format!(":{}:", emoji.name))
+    } else {
+        resp
+    }
+}
+
+fn tool_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, pal.hover);
+    }
+    let color = if resp.hovered() { pal.text } else { pal.muted };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(16.0),
+        color,
+    );
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
@@ -1374,7 +2137,17 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
         let gutter = if compact { 0.0 } else { 40.0 };
         if gutter > 0.0 {
             if grouped {
-                ui.allocate_exact_size(vec2(gutter, 1.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(gutter, 18.0), Sense::hover());
+                if ui.rect_contains_pointer(rect.expand2(vec2(full_width, 0.0))) {
+                    let t = m.time.get(11..).unwrap_or("");
+                    ui.painter().text(
+                        rect.right_center(),
+                        Align2::RIGHT_CENTER,
+                        t,
+                        FontId::proportional(10.5),
+                        pal.faint,
+                    );
+                }
             } else {
                 let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
                 let tex = match (
@@ -1424,7 +2197,7 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                         .color(pal.muted),
                 );
             } else if !m.content.is_empty() && !hide_text {
-                text_block(ui, &pal, &m.content);
+                text_block(ui, cx, &m.content);
             }
             if m.edited {
                 ui.label(RichText::new("(изменено)").small().color(pal.faint));
@@ -1435,6 +2208,9 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             for e in &m.embeds {
                 embed_ui(ui, cx, e);
             }
+            if !m.reactions.is_empty() {
+                reactions_ui(ui, cx, m);
+            }
         });
     });
 
@@ -1442,14 +2218,111 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
         pos2(ui.max_rect().left(), row.response.rect.top() - 2.0),
         pos2(ui.max_rect().right(), row.response.rect.bottom() + 2.0),
     );
-    if ui.rect_contains_pointer(rect) {
+    let hovered = ui.rect_contains_pointer(rect.expand2(vec2(0.0, 6.0)));
+    if hovered {
         ui.painter()
             .set(bg, egui::Shape::rect_filled(rect, 0.0, pal.msg_hover));
     }
+    if hovered && cx.toolbar_allowed && !m.system {
+        message_toolbar(ui, cx, m, rect);
+    }
 }
 
-/// Текст сообщения: блоки кода ``` и кликабельные ссылки.
-fn text_block(ui: &mut egui::Ui, pal: &Palette, content: &str) {
+/// Панель действий над сообщением при наведении.
+fn message_toolbar(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, rect: Rect) {
+    let pal = cx.pal;
+    let own = m.author_id == cx.me_id;
+    let buttons = if own { 5.0 } else { 4.0 };
+    let w = buttons * 30.0 + 6.0;
+    let tb = Rect::from_min_size(
+        pos2(rect.right() - w - 20.0, rect.top() - 6.0),
+        vec2(w, 34.0),
+    );
+    #[allow(deprecated)]
+    let mut tui = ui.child_ui(tb, Layout::left_to_right(Align::Center), None);
+    egui::Frame::none()
+        .fill(pal.side)
+        .rounding(8.0)
+        .stroke(Stroke::new(1.0, pal.border))
+        .inner_margin(Margin::same(2.0))
+        .show(&mut tui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let r = tool_button(ui, &pal, "😊", "Добавить реакцию");
+            if r.clicked() {
+                cx.actions.push(Action::OpenPicker(
+                    PickerTarget::React {
+                        channel_id: cx.channel_id,
+                        message_id: m.id,
+                    },
+                    r.rect.left_bottom(),
+                ));
+            }
+            if tool_button(ui, &pal, "↩", "Ответить").clicked() {
+                cx.actions.push(Action::Reply(m.id, m.author.clone()));
+            }
+            if tool_button(ui, &pal, "⧉", "Копировать текст").clicked() {
+                cx.actions.push(Action::CopyText(m.content.clone()));
+            }
+            if own {
+                if tool_button(ui, &pal, "✏", "Изменить").clicked() {
+                    cx.actions
+                        .push(Action::StartEdit(cx.channel_id, m.id, m.content.clone()));
+                }
+                if tool_button(ui, &pal, "🗑", "Удалить").clicked() {
+                    let preview: String = m.content.chars().take(160).collect();
+                    cx.actions
+                        .push(Action::AskDelete(cx.channel_id, m.id, preview));
+                }
+            } else if tool_button(ui, &pal, "⚑", "Пожаловаться").clicked() {
+                cx.actions.push(Action::Report(cx.message_link(m.id)));
+            }
+        });
+}
+
+fn reactions_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg) {
+    let pal = cx.pal;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for r in &m.reactions {
+            let (fill, stroke) = if r.me {
+                (
+                    pal.accent.gamma_multiply(0.22),
+                    Stroke::new(1.0, pal.accent),
+                )
+            } else {
+                (pal.elevated, Stroke::new(1.0, pal.border))
+            };
+            let resp = egui::Frame::none()
+                .fill(fill)
+                .stroke(stroke)
+                .rounding(8.0)
+                .inner_margin(Margin::symmetric(6.0, 2.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        emoji_image(ui, cx, &r.emoji, 18.0);
+                        let color = if r.me { pal.text } else { pal.muted };
+                        ui.label(RichText::new(r.count.to_string()).small().color(color));
+                    });
+                })
+                .response
+                .interact(Sense::click());
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                cx.actions.push(Action::React {
+                    channel_id: cx.channel_id,
+                    message_id: m.id,
+                    emoji: r.emoji.clone(),
+                    add: !r.me,
+                });
+            }
+        }
+    });
+}
+
+/// Текст сообщения: блоки кода ```, кликабельные ссылки, цветные и кастомные эмодзи.
+fn text_block(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, content: &str) {
+    let pal = cx.pal;
+    let jumbo = emoji::is_jumbo(content);
     for (i, part) in content.split("```").enumerate() {
         if i % 2 == 1 {
             let code = part
@@ -1485,28 +2358,33 @@ fn text_block(ui: &mut egui::Ui, pal: &Palette, content: &str) {
                 ui.add_space(4.0);
                 continue;
             }
-            if !(line.contains("http://") || line.contains("https://")) {
+            if !emoji::needs_rich(line) {
                 ui.label(RichText::new(line).color(pal.text));
                 continue;
             }
+            let size = if jumbo { 44.0 } else { 20.0 };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let mut text = String::new();
-                for (j, word) in line.split(' ').enumerate() {
-                    let sep = if j == 0 { "" } else { " " };
-                    if word.starts_with("http://") || word.starts_with("https://") {
-                        if !text.is_empty() || !sep.is_empty() {
-                            text.push_str(sep);
-                            ui.label(RichText::new(std::mem::take(&mut text)).color(pal.text));
+                for seg in emoji::segment(line) {
+                    match seg {
+                        emoji::Seg::Text(t) => {
+                            ui.label(RichText::new(t).color(pal.text));
                         }
-                        ui.hyperlink_to(RichText::new(word).color(pal.link), word);
-                    } else {
-                        text.push_str(sep);
-                        text.push_str(word);
+                        emoji::Seg::Link(u) => {
+                            ui.hyperlink_to(RichText::new(u).color(pal.link), u);
+                        }
+                        emoji::Seg::Emoji(e) => {
+                            emoji_image(ui, cx, &Emoji::unicode(e), size);
+                        }
+                        emoji::Seg::Custom { name, id, animated } => {
+                            let em = Emoji {
+                                id: Some(id),
+                                name: name.to_string(),
+                                animated,
+                            };
+                            emoji_image(ui, cx, &em, size);
+                        }
                     }
-                }
-                if !text.is_empty() {
-                    ui.label(RichText::new(text).color(pal.text));
                 }
             });
         }
@@ -2253,4 +3131,73 @@ fn channel_rows(g: &Guild) -> Vec<Row<'_>> {
         rows.extend(kids.into_iter().map(Row::Chan));
     }
     rows
+}
+
+/// Строка «… печатает…» для канала.
+fn typing_line(list: Option<&Vec<(u64, String, Instant)>>) -> Option<String> {
+    let names: Vec<&str> = list?
+        .iter()
+        .filter(|(_, _, t)| t.elapsed() < Duration::from_secs(10))
+        .map(|(_, n, _)| n.as_str())
+        .collect();
+    match names.len() {
+        0 => None,
+        1 => Some(format!("{} печатает…", names[0])),
+        2 => Some(format!("{} и {} печатают…", names[0], names[1])),
+        3 => Some(format!(
+            "{}, {} и {} печатают…",
+            names[0], names[1], names[2]
+        )),
+        _ => Some("Несколько человек печатают…".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn member_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    tex: Option<(TextureId, Vec2)>,
+    id: u64,
+    name: &str,
+    status: &str,
+    color: Option<Color32>,
+    offline: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, pal.hover);
+    }
+    let cy = rect.center().y;
+    let ar = Rect::from_center_size(pos2(rect.left() + 22.0, cy), vec2(30.0, 30.0));
+    paint_avatar(ui, ar, tex, id, name);
+    let dot = match status {
+        "online" => Some(pal.ok),
+        "idle" => Some(pal.warn),
+        "dnd" => Some(pal.danger),
+        _ => None,
+    };
+    if let Some(c) = dot {
+        let p = ar.right_bottom() - vec2(3.0, 3.0);
+        ui.painter().circle_filled(p, 6.0, pal.side);
+        ui.painter().circle_filled(p, 4.5, c);
+    }
+    let text_color = color.unwrap_or(pal.text);
+    let text_color = if offline {
+        text_color.gamma_multiply(0.45)
+    } else {
+        text_color
+    };
+    let x = rect.left() + 46.0;
+    let clip = Rect::from_min_max(pos2(x, rect.top()), pos2(rect.right() - 6.0, rect.bottom()));
+    ui.painter_at(clip).text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(14.5),
+        text_color,
+    );
+    resp
 }
