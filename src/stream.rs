@@ -324,6 +324,16 @@ impl Depacketizer {
             self.waiting_key = true;
             return None;
         }
+        if self.waiting_key {
+            // после потери ждём ключевой кадр, иначе декодер покажет «кашу»
+            if !split_nals(&frame)
+                .iter()
+                .any(|n| matches!(n.first().map(|b| b & 0x1F), Some(5) | Some(7)))
+            {
+                return None;
+            }
+            self.waiting_key = false;
+        }
         Some(frame)
     }
 }
@@ -444,24 +454,35 @@ fn spawn_decoder(key: String, sink: Sink) -> std::sync::mpsc::Sender<Vec<u8>> {
                 }
             };
             let mut rgba: Vec<u8> = Vec::new();
-            while let Ok(mut frame) = rx.recv() {
-                // если кадры копятся — показываем только самый свежий
-                while let Ok(newer) = rx.try_recv() {
-                    frame = newer;
+            let mut errors = 0u32;
+            while let Ok(first) = rx.recv() {
+                // все кадры нужно декодировать по порядку (P-кадры ссылаются на предыдущие),
+                // но в картинку переводим только самый свежий
+                let mut batch = vec![first];
+                while let Ok(more) = rx.try_recv() {
+                    batch.push(more);
                 }
-                match decoder.decode(&frame) {
-                    Ok(Some(yuv)) => {
-                        let (w, h) = yuv.dimensions();
-                        rgba.resize(w * h * 4, 0);
-                        yuv.write_rgba8(&mut rgba);
-                        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                        sink.send(Event::StreamFrame {
-                            key: key.clone(),
-                            image,
-                        });
+                let last = batch.len() - 1;
+                for (i, frame) in batch.iter().enumerate() {
+                    match decoder.decode(frame) {
+                        Ok(Some(yuv)) if i == last => {
+                            let (w, h) = yuv.dimensions();
+                            rgba.resize(w * h * 4, 0);
+                            yuv.write_rgba8(&mut rgba);
+                            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                            sink.send(Event::StreamFrame {
+                                key: key.clone(),
+                                image,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            errors += 1;
+                            if errors % 50 == 1 {
+                                crate::store::log(&format!("декодирование кадра: {e}"));
+                            }
+                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => crate::store::log(&format!("декодирование кадра: {e}")),
                 }
             }
         })
@@ -730,7 +751,10 @@ async fn session(
                 if pkt.pt != H264_PT {
                     continue; // звук трансляции и повторы (RTX) пока пропускаем
                 }
-                let Some(frame) = depack.entry(pkt.ssrc).or_default().push(&pkt) else { continue };
+                let Some(frame) = depack
+                    .entry(pkt.ssrc)
+                    .or_insert_with(|| Depacketizer { waiting_key: true, ..Default::default() })
+                    .push(&pkt) else { continue };
                 let mut data = frame;
                 if let Some(owner) = ssrc_owner.get(&pkt.ssrc).copied() {
                     if let Some(s) = dave.session.as_mut() {
