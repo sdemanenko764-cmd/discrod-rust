@@ -1042,7 +1042,7 @@ impl App {
         egui::TopBottomPanel::top("channel_head")
             .frame(
                 egui::Frame::none()
-                    .fill(pal.main)
+                    .fill(pal.header)
                     .inner_margin(Margin::symmetric(18.0, 10.0)),
             )
             .show_separator_line(false)
@@ -1099,7 +1099,7 @@ impl App {
         }
 
         // --- участники ---
-        if show_members {
+        if self.sel_guild.is_some() {
             let gid = self.sel_guild.unwrap_or(0);
             let is_bot = self.pending.as_ref().map_or(false, |a| a.bot);
             egui::SidePanel::right("members")
@@ -1110,7 +1110,7 @@ impl App {
                         .fill(pal.side)
                         .inner_margin(Margin::symmetric(8.0, 10.0)),
                 )
-                .show(ctx, |ui| {
+                .show_animated(ctx, show_members, |ui| {
                     let guild = self.guilds.iter().find(|g| g.id == gid);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
@@ -1846,14 +1846,88 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(410.0);
                         section(ui, &pal, "Внешний вид");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.settings.theme, Theme::Dark, "Тёмная");
-                            ui.selectable_value(
-                                &mut self.settings.theme,
-                                Theme::Midnight,
-                                "Чёрная (AMOLED)",
-                            );
-                            ui.selectable_value(&mut self.settings.theme, Theme::Light, "Светлая");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                            for (theme, label) in theme::THEMES {
+                                let preview = theme::palette_for(theme, pal.accent);
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(vec2(124.0, 80.0), Sense::click());
+                                let selected = self.settings.theme == theme;
+                                let t = ui.ctx().animate_bool_with_time(
+                                    resp.id.with("sel"),
+                                    selected || resp.hovered(),
+                                    0.15,
+                                );
+                                let rr = 10.0;
+                                let p = ui.painter();
+                                p.rect_filled(rect, rr, preview.main);
+                                p.rect_filled(
+                                    Rect::from_min_size(rect.min, vec2(30.0, rect.height())),
+                                    Rounding {
+                                        nw: rr,
+                                        sw: rr,
+                                        ne: 0.0,
+                                        se: 0.0,
+                                    },
+                                    preview.side,
+                                );
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        rect.min + vec2(30.0, 0.0),
+                                        vec2(rect.width() - 30.0, 14.0),
+                                    ),
+                                    Rounding {
+                                        nw: 0.0,
+                                        sw: 0.0,
+                                        ne: rr,
+                                        se: 0.0,
+                                    },
+                                    preview.header,
+                                );
+                                for k in 0..3 {
+                                    p.circle_filled(
+                                        rect.min + vec2(15.0, 16.0 + k as f32 * 16.0),
+                                        5.5,
+                                        if k == 0 {
+                                            preview.accent
+                                        } else {
+                                            preview.elevated
+                                        },
+                                    );
+                                }
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        rect.min + vec2(40.0, 22.0),
+                                        vec2(64.0, 9.0),
+                                    ),
+                                    4.5,
+                                    preview.elevated,
+                                );
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        rect.min + vec2(40.0, 36.0),
+                                        vec2(44.0, 9.0),
+                                    ),
+                                    4.5,
+                                    preview.accent,
+                                );
+                                p.text(
+                                    pos2(rect.left() + 40.0, rect.bottom() - 13.0),
+                                    Align2::LEFT_CENTER,
+                                    label,
+                                    FontId::proportional(12.0),
+                                    preview.text,
+                                );
+                                let stroke = if selected {
+                                    Stroke::new(2.5, pal.accent)
+                                } else {
+                                    Stroke::new(1.0 + t, mix(pal.border, pal.accent, t * 0.7))
+                                };
+                                p.rect_stroke(rect, rr, stroke);
+                                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    self.settings.theme = theme;
+                                }
+                            }
                         });
                         ui.add_space(6.0);
                         ui.label(RichText::new("Акцентный цвет").color(pal.muted));
@@ -1989,9 +2063,17 @@ impl App {
             self.toast = None;
         }
         let pal = self.pal;
+        let slide = self.toast.as_ref().map_or(0.0, |(_, at, _)| {
+            let k = (at.elapsed().as_secs_f32() / 0.22).min(1.0);
+            let ease = 1.0 - (1.0 - k).powi(3);
+            (1.0 - ease) * 30.0
+        });
+        if slide > 0.0 {
+            ctx.request_repaint();
+        }
         if let Some((text, _, error)) = &self.toast {
             egui::Area::new(egui::Id::new("toast"))
-                .anchor(Align2::CENTER_BOTTOM, [0.0, -96.0])
+                .anchor(Align2::CENTER_BOTTOM, [0.0, -96.0 + slide])
                 .order(egui::Order::Foreground)
                 .interactable(false)
                 .show(ctx, |ui| {
@@ -2201,6 +2283,14 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             }
             if m.edited {
                 ui.label(RichText::new("(изменено)").small().color(pal.faint));
+            }
+            if m.content.is_empty() && m.attachments.is_empty() && m.embeds.is_empty() && !m.system
+            {
+                ui.label(
+                    RichText::new("[этот тип сообщения пока не поддерживается]")
+                        .italics()
+                        .color(pal.faint),
+                );
             }
             for a in &m.attachments {
                 attachment_ui(ui, cx, a);
@@ -2466,8 +2556,70 @@ fn image_box(
     failed
 }
 
+fn sticker_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, a: &Attachment) {
+    let pal = cx.pal;
+    let (rect, resp) = ui.allocate_exact_size(vec2(160.0, 160.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let animate = a.content_type == "sticker/gif" && cx.settings.animate_gifs;
+        let tex = if cx.settings.load_images {
+            let (key, tex) = cx.image(ui.ctx(), &a.proxy_url, 160, animate);
+            tex.ok_or(cx.media.failed(&key))
+        } else {
+            Err(true)
+        };
+        match tex {
+            Ok((id, size)) => {
+                let fitted = fit(size.x as u32, size.y as u32, 160.0, 160.0);
+                let r = Rect::from_min_size(rect.min, fitted);
+                egui::Image::from_texture(SizedTexture::new(id, r.size())).paint_at(ui, r);
+            }
+            Err(true) => {
+                let card = rect.shrink(6.0);
+                ui.painter()
+                    .rect_filled(card, pal.radius + 4.0, pal.elevated);
+                ui.painter()
+                    .rect_stroke(card, pal.radius + 4.0, Stroke::new(1.0, pal.border));
+                ui.painter().text(
+                    card.center() - vec2(0.0, 22.0),
+                    Align2::CENTER_CENTER,
+                    "✨",
+                    FontId::proportional(34.0),
+                    pal.accent,
+                );
+                ui.painter_at(card).text(
+                    card.center() + vec2(0.0, 14.0),
+                    Align2::CENTER_CENTER,
+                    &a.filename,
+                    FontId::proportional(14.0),
+                    pal.text,
+                );
+                ui.painter().text(
+                    card.center() + vec2(0.0, 34.0),
+                    Align2::CENTER_CENTER,
+                    "стикер",
+                    FontId::proportional(11.5),
+                    pal.faint,
+                );
+            }
+            Err(false) => {
+                ui.painter()
+                    .rect_filled(rect.shrink(6.0), pal.radius + 4.0, pal.elevated);
+                ui.put(
+                    Rect::from_center_size(rect.center(), vec2(22.0, 22.0)),
+                    egui::Spinner::new(),
+                );
+            }
+        }
+    }
+    resp.on_hover_text(format!("Стикер «{}»", a.filename));
+}
+
 fn attachment_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, a: &Attachment) {
     let pal = cx.pal;
+    if a.content_type.starts_with("sticker/") {
+        sticker_ui(ui, cx, a);
+        return;
+    }
     if a.is_image() && cx.settings.load_images {
         let animate = a.is_gif() && cx.settings.animate_gifs && a.size <= 8 * 1024 * 1024;
         let max = vec2(400.0, 300.0);
@@ -2658,10 +2810,14 @@ fn rail_item(
     let hovered = resp.hovered();
     let center = rect.center();
     let icon_rect = Rect::from_center_size(center, vec2(48.0, 48.0));
-    let rounding = if selected || hovered { 16.0 } else { 24.0 };
+    // плавное превращение круга в скруглённый квадрат и заливка акцентом
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("shape"), selected || hovered, 0.18);
+    let rounding = 24.0 - (24.0 - pal.radius.max(12.0)) * t;
     let painter = ui.painter();
 
-    let pill_h = if selected {
+    let pill_target = if selected {
         38.0
     } else if hovered {
         20.0
@@ -2670,7 +2826,10 @@ fn rail_item(
     } else {
         0.0
     };
-    if pill_h > 0.0 {
+    let pill_h = ui
+        .ctx()
+        .animate_value_with_time(resp.id.with("pill"), pill_target, 0.2);
+    if pill_h > 0.5 {
         painter.rect_filled(
             Rect::from_min_size(
                 pos2(rect.left(), center.y - pill_h / 2.0),
@@ -2688,17 +2847,9 @@ fn rail_item(
 
     match icon {
         RailIcon::Home => {
-            let fill = if selected || hovered {
-                pal.accent
-            } else {
-                pal.elevated
-            };
+            let fill = mix(pal.elevated, pal.accent, t);
             painter.rect_filled(icon_rect, rounding, fill);
-            let fg = if selected || hovered {
-                Color32::WHITE
-            } else {
-                pal.text
-            };
+            let fg = mix(pal.text, Color32::WHITE, t);
             // облачко сообщения
             let b = Rect::from_center_size(center - vec2(0.0, 2.0), vec2(22.0, 16.0));
             painter.rect_filled(b, 5.0, fg);
@@ -2719,17 +2870,9 @@ fn rail_item(
                     .paint_at(ui, icon_rect);
             }
             None => {
-                let fill = if selected || hovered {
-                    pal.accent
-                } else {
-                    pal.elevated
-                };
+                let fill = mix(pal.elevated, pal.accent, t);
                 painter.rect_filled(icon_rect, rounding, fill);
-                let fg = if selected || hovered {
-                    Color32::WHITE
-                } else {
-                    pal.text
-                };
+                let fg = mix(pal.text, Color32::WHITE, t);
                 let text = initials(name);
                 let size = if text.chars().count() > 2 { 13.0 } else { 16.0 };
                 painter.text(
@@ -2776,10 +2919,16 @@ fn nav_row(
         return resp;
     }
     let hovered = resp.hovered() && enabled;
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), hovered || selected, 0.12);
+    let r = (pal.radius - 4.0).max(6.0);
     if selected {
-        ui.painter().rect_filled(rect, 6.0, pal.selected);
-    } else if hovered {
-        ui.painter().rect_filled(rect, 6.0, pal.hover);
+        ui.painter()
+            .rect_filled(rect, r, mix(pal.hover, pal.selected, t));
+    } else if t > 0.01 {
+        ui.painter()
+            .rect_filled(rect, r, pal.hover.gamma_multiply(t));
     }
     let cy = rect.center().y;
     let mut x = rect.left() + 10.0;
@@ -3200,4 +3349,16 @@ fn member_row(
         text_color,
     );
     resp
+}
+
+/// Плавное смешивание двух цветов (для анимаций).
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        l(a.r(), b.r()),
+        l(a.g(), b.g()),
+        l(a.b(), b.b()),
+        l(a.a(), b.a()),
+    )
 }

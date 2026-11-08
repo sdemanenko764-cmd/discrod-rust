@@ -713,6 +713,8 @@ struct RawMessage {
     #[serde(default, deserialize_with = "lenient_vec")]
     sticker_items: Vec<RawSticker>,
     #[serde(default, deserialize_with = "lenient_vec")]
+    stickers: Vec<RawSticker>,
+    #[serde(default, deserialize_with = "lenient_vec")]
     mentions: Vec<RawUser>,
     #[serde(default)]
     referenced_message: Option<Box<RawRef>>,
@@ -908,6 +910,7 @@ fn convert_msg(m: RawMessage) -> Msg {
         && m.attachments.is_empty()
         && m.embeds.is_empty()
         && m.sticker_items.is_empty()
+        && m.stickers.is_empty()
     {
         if let Some(t) = system_text(m.kind) {
             content.push_str(t);
@@ -933,28 +936,36 @@ fn convert_msg(m: RawMessage) -> Msg {
         })
         .collect();
     // Стикеры показываем как картинки (PNG/APNG/GIF); Lottie-стикеры — подписью.
-    for s in &m.sticker_items {
-        let ext = match s.format_type {
-            1 | 2 => "png",
-            4 => "gif",
-            _ => {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&format!("[стикер: {}]", s.name));
-                continue;
-            }
+    // Стикеры: PNG/APNG/GIF показываем картинкой, Lottie (анимированные стикеры
+    // Discord) — через статичное превью медиапрокси или карточкой.
+    let stickers = if m.sticker_items.is_empty() {
+        &m.stickers
+    } else {
+        &m.sticker_items
+    };
+    for s in stickers {
+        let (ext, kind) = match s.format_type {
+            1 | 2 => ("png", "sticker/png"),
+            4 => ("gif", "sticker/gif"),
+            _ => ("png", "sticker/lottie"),
         };
-        let url = format!(
-            "https://media.discordapp.net/stickers/{}.{ext}?size=160",
-            s.id
-        );
+        let url = if kind == "sticker/lottie" {
+            format!(
+                "https://media.discordapp.net/stickers/{}.png?size=160&passthrough=false",
+                s.id
+            )
+        } else {
+            format!(
+                "https://media.discordapp.net/stickers/{}.{ext}?size=160",
+                s.id
+            )
+        };
         attachments.push(Attachment {
-            filename: format!("{}.{ext}", s.name),
+            filename: s.name.clone(),
             size: 0,
             proxy_url: url.clone(),
             url,
-            content_type: format!("image/{ext}"),
+            content_type: kind.to_string(),
             width: 160,
             height: 160,
         });

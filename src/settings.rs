@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Theme {
+    AdwaitaDark,
+    AdwaitaLight,
+    Catppuccin,
+    Nord,
     Dark,
     Midnight,
     Light,
@@ -27,8 +31,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: Theme::Dark,
-            accent: 0,
+            theme: Theme::AdwaitaDark,
+            accent: 1,
             zoom: 1.0,
             compact: false,
             load_images: true,
