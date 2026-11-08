@@ -1,0 +1,82 @@
+//! Шрифты. Базовый шрифт egui не знает японского, китайского, «красивых»
+//! математических букв (𝓐𝓑𝓒), многих символов — отсюда квадратики □□□.
+//! Подключаем системные шрифты Windows. Файлы не читаются целиком в память,
+//! а отображаются (mmap): ОС подгружает только реально нужные кусочки.
+
+use std::path::{Path, PathBuf};
+
+use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
+
+/// (имя, варианты файлов, индекс шрифта в .ttc, основной шрифт интерфейса?)
+const WINDOWS_FONTS: &[(&str, &[&str], u32, bool)] = &[
+    ("segoe-ui", &["segoeui.ttf"], 0, true),
+    ("segoe-symbol", &["seguisym.ttf"], 0, false),
+    ("cambria-math", &["cambria.ttc"], 1, false),
+    ("yahei", &["msyh.ttc", "msyh.ttf"], 0, false),
+    (
+        "yu-gothic",
+        &["YuGothM.ttc", "yugothm.ttc", "meiryo.ttc", "msgothic.ttc"],
+        0,
+        false,
+    ),
+    ("malgun", &["malgun.ttf"], 0, false),
+    ("nirmala", &["Nirmala.ttc", "Nirmala.ttf"], 0, false),
+    ("ebrima", &["ebrima.ttf"], 0, false),
+    ("segoe-historic", &["seguihis.ttf"], 0, false),
+    ("tahoma", &["tahoma.ttf"], 0, false),
+    ("segoe-emoji", &["seguiemj.ttf"], 0, false),
+];
+
+fn fonts_dir() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("Fonts")
+}
+
+/// Отображает файл шрифта в память и проверяет, что egui сможет его прочитать
+/// (иначе egui упадёт при старте).
+fn map_font(path: &Path, index: u32) -> Option<&'static [u8]> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: системные шрифты не меняются, пока программа работает.
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    ab_glyph::FontRef::try_from_slice_and_index(&mmap[..], index).ok()?;
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    Some(&leaked[..])
+}
+
+pub fn install(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let dir = fonts_dir();
+    let mut primary: Vec<String> = Vec::new();
+    let mut fallback: Vec<String> = Vec::new();
+
+    for (name, files, index, is_primary) in WINDOWS_FONTS {
+        for file in *files {
+            if let Some(bytes) = map_font(&dir.join(file), *index) {
+                let mut data = FontData::from_static(bytes);
+                data.index = *index;
+                fonts.font_data.insert((*name).to_string(), data);
+                if *is_primary {
+                    primary.push((*name).to_string());
+                } else {
+                    fallback.push((*name).to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
+        for (i, name) in primary.iter().enumerate() {
+            list.insert(i, name.clone());
+        }
+        list.extend(fallback.iter().cloned());
+    }
+    if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
+        list.extend(primary.iter().cloned());
+        list.extend(fallback.iter().cloned());
+    }
+    ctx.set_fonts(fonts);
+}

@@ -17,7 +17,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Сборка rustcord.exe
-        run: cargo build --release
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --color never 2>&1 | tee build.log
+
+      - name: Публикация лога неудачной сборки
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-log
+          name: Лог последней неудачной сборки
+          prerelease: true
+          make_latest: false
+          files: build.log
 
       - name: Сборка установщика
         shell: pwsh

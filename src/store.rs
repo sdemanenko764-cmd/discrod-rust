@@ -88,3 +88,8 @@ pub fn save_proxy(proxy: &str) {
         let _ = fs::write(p, proxy);
     }
 }
+
+/// Путь к файлу в папке настроек Rustcord.
+pub fn config_path(name: &str) -> Option<PathBuf> {
+    Some(path()?.with_file_name(name))
+}

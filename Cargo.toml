@@ -1,6 +1,6 @@
 [package]
 name = "rustcord"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Лёгкий нативный клиент Discord на Rust"
 license = "MIT"
@@ -9,10 +9,10 @@ license = "MIT"
 # Интерфейс: нативное окно + OpenGL, без браузерного движка внутри
 eframe = "0.29"
 # Сеть
-tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "fs", "io-util"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", features = ["json", "socks"] }
+reqwest = { version = "0.12", features = ["json", "socks", "multipart"] }
 tokio-socks = "0.5"
 # Данные
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +20,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Индикатор потребления ОЗУ
 memory-stats = "1"
+# Картинки, GIF, аватарки (декодируются в фоне и уменьшаются)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Системные шрифты подключаются через отображение файла в память — почти без расхода ОЗУ
+memmap2 = "0.9"
+# Проверка файлов шрифтов перед подключением (тот же движок, что внутри egui)
+ab_glyph = "0.2"
+# Окно выбора файла для отправки
+rfd = "0.15"
 
 [profile.release]
 opt-level = 3

@@ -3,14 +3,20 @@
 //! Всё сетевое живёт в отдельном потоке с однопоточным tokio-рантаймом.
 //! Интерфейс шлёт сюда команды (`Cmd`), обратно приходят события (`Event`).
 //! Ответы Discord сразу разбираются в компактные структуры: лишние поля
-//! (аватары, роли, эмодзи, стикеры, настройки...) не попадают в память вовсе.
+//! не попадают в память вовсе. Картинки скачиваются и уменьшаются здесь же,
+//! в фоне, чтобы окно не подвисало.
 
-use std::{collections::HashMap, sync::mpsc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{mpsc, Arc},
+    time::Duration,
+};
 
 use crate::net::Proxy;
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
-use serde::{de::IgnoredAny, Deserialize};
+use serde::Deserialize;
 use serde_json::{json, value::RawValue};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::{protocol::CloseFrame, Message as WsMsg};
@@ -21,6 +27,10 @@ const GATEWAY: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const BOT_INTENTS: u64 = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 /// Эпоха Discord для снежинок (id), в миллисекундах.
 pub const DISCORD_EPOCH: u64 = 1_420_070_400_000;
+/// Лимит Discord на файл без подписки.
+pub const MAX_UPLOAD: u64 = 10 * 1024 * 1024;
+const MAX_IMAGE_DOWNLOAD: u64 = 16 * 1024 * 1024;
+const MAX_GIF_FRAMES: usize = 90;
 
 // ======================= компактные модели для интерфейса =======================
 
@@ -55,6 +65,7 @@ pub struct Channel {
 pub struct Guild {
     pub id: u64,
     pub name: String,
+    pub icon: Option<String>,
     pub channels: Vec<Channel>,
 }
 
@@ -63,6 +74,70 @@ pub struct Dm {
     pub id: u64,
     pub name: String,
     pub last_message: u64,
+    /// (id собеседника, хэш аватарки) — только для личных диалогов 1 на 1.
+    pub avatar: Option<(u64, Option<String>)>,
+    pub group: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub filename: String,
+    pub size: u64,
+    pub url: String,
+    pub proxy_url: String,
+    pub content_type: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Attachment {
+    fn ext(&self) -> String {
+        self.filename
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.content_type.starts_with("image/")
+            || matches!(self.ext().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+    }
+
+    pub fn is_gif(&self) -> bool {
+        self.content_type == "image/gif" || self.ext() == "gif"
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.content_type.starts_with("video/")
+            || matches!(self.ext().as_str(), "mp4" | "webm" | "mov" | "mkv")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Media {
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Embed {
+    pub kind: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub color: Option<u32>,
+    /// Картинка/превью для показа.
+    pub media: Option<Media>,
+    /// Прямая ссылка на анимированный GIF, если удалось её получить.
+    pub gif_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Reply {
+    pub author: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug)]
@@ -72,9 +147,20 @@ pub struct Msg {
     pub guild_id: Option<u64>,
     pub author_id: u64,
     pub author: String,
+    pub author_avatar: Option<String>,
     pub content: String,
     pub time: String,
     pub edited: bool,
+    pub system: bool,
+    pub attachments: Vec<Attachment>,
+    pub embeds: Vec<Embed>,
+    pub reply: Option<Reply>,
+}
+
+/// Один кадр картинки (у статичной — один, у GIF — много).
+pub struct Frame {
+    pub image: egui::ColorImage,
+    pub delay_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +181,21 @@ pub enum Cmd {
         channel_id: u64,
         content: String,
     },
+    Upload {
+        channel_id: u64,
+        path: PathBuf,
+        content: String,
+    },
+    FetchImage {
+        key: String,
+        url: String,
+        max_side: u32,
+        animate: bool,
+    },
+    Download {
+        url: String,
+        filename: String,
+    },
 }
 
 pub enum Event {
@@ -102,6 +203,7 @@ pub enum Event {
     Ready {
         user_id: u64,
         username: String,
+        avatar: Option<String>,
         guilds: Vec<Guild>,
         dms: Vec<Dm>,
     },
@@ -131,8 +233,29 @@ pub enum Event {
         before: Option<u64>,
         result: Result<Vec<Msg>, String>,
     },
+    Image {
+        key: String,
+        result: Result<Vec<Frame>, String>,
+    },
+    Info(String),
     Error(String),
     Fatal(String),
+}
+
+// ======================= ссылки на CDN =======================
+
+pub fn avatar_url(user_id: u64, hash: &str) -> String {
+    format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.png?size=64")
+}
+
+pub fn guild_icon_url(guild_id: u64, hash: &str) -> String {
+    format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=96")
+}
+
+/// Ссылка на уменьшенную копию через медиапрокси Discord (экономит трафик и память).
+pub fn resized_url(url: &str, width: u32, height: u32) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}width={width}&height={height}")
 }
 
 // ======================= сырые структуры Discord (только нужные поля) =======================
@@ -145,6 +268,8 @@ struct RawUser {
     username: String,
     #[serde(default)]
     global_name: Option<String>,
+    #[serde(default)]
+    avatar: Option<String>,
 }
 
 impl RawUser {
@@ -182,6 +307,8 @@ struct RawChannel {
 struct RawGuildProps {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +316,8 @@ struct RawGuild {
     id: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
     #[serde(default)]
     properties: Option<RawGuildProps>,
     #[serde(default, deserialize_with = "lenient_vec")]
@@ -209,8 +338,6 @@ struct RawReady {
 }
 
 /// Список, в котором неподходящие элементы молча пропускаются, а не ломают весь разбор.
-/// Discord иногда присылает поля другого вида — из-за одного странного канала
-/// не должен отваливаться вход целиком.
 fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -228,12 +355,76 @@ where
 struct RawAttachment {
     #[serde(default)]
     filename: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct RawSticker {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
+    format_type: u8,
+}
+
+#[derive(Deserialize)]
+struct RawMedia {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawProvider {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawEmbed {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    color: Option<u32>,
+    #[serde(default)]
+    provider: Option<RawProvider>,
+    #[serde(default)]
+    thumbnail: Option<RawMedia>,
+    #[serde(default)]
+    image: Option<RawMedia>,
+    #[serde(default)]
+    video: Option<RawMedia>,
+}
+
+#[derive(Deserialize)]
+struct RawRef {
+    #[serde(default)]
+    author: Option<RawUser>,
+    #[serde(default)]
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -249,12 +440,16 @@ struct RawMessage {
     timestamp: String,
     #[serde(default)]
     edited_timestamp: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
     attachments: Vec<RawAttachment>,
-    #[serde(default)]
-    embeds: Vec<IgnoredAny>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_vec")]
+    embeds: Vec<RawEmbed>,
+    #[serde(default, deserialize_with = "lenient_vec")]
     sticker_items: Vec<RawSticker>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    mentions: Vec<RawUser>,
+    #[serde(default)]
+    referenced_message: Option<Box<RawRef>>,
     #[serde(rename = "type", default)]
     kind: u8,
 }
@@ -308,53 +503,219 @@ fn fmt_time(ts: &str) -> String {
         .unwrap_or_default()
 }
 
-fn system_text(kind: u8) -> &'static str {
-    match kind {
-        1 => "добавил участника в группу",
-        2 => "удалил участника из группы",
-        3 => "начал звонок",
-        4 => "изменил название",
-        6 => "закрепил сообщение",
-        7 => "присоединился к серверу",
-        8 => "забустил сервер",
-        _ => "[системное сообщение]",
+fn system_text(kind: u8) -> Option<&'static str> {
+    Some(match kind {
+        1 => "добавил(а) участника в группу",
+        2 => "удалил(а) участника из группы",
+        3 => "начал(а) звонок",
+        4 => "изменил(а) название",
+        5 => "изменил(а) значок",
+        6 => "закрепил(а) сообщение",
+        7 => "присоединился(-ась) к серверу",
+        8..=11 => "забустил(а) сервер",
+        _ => return None,
+    })
+}
+
+/// `<@123>` → `@имя`, `<:smile:123>` → `:smile:`, `<t:1700000000:f>` → дата.
+fn render_markup(content: &str, names: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find('>') else {
+            out.push_str(after);
+            rest = "";
+            break;
+        };
+        let inner = &after[1..end];
+        let replaced =
+            if let Some(id) = inner.strip_prefix("@!").or_else(|| inner.strip_prefix('@')) {
+                if let Some(role) = id.strip_prefix('&') {
+                    (role.chars().all(|c| c.is_ascii_digit())).then(|| "@роль".to_string())
+                } else if id.chars().all(|c| c.is_ascii_digit()) {
+                    Some(format!(
+                        "@{}",
+                        names.get(id).map(String::as_str).unwrap_or("пользователь")
+                    ))
+                } else {
+                    None
+                }
+            } else if let Some(id) = inner.strip_prefix('#') {
+                id.chars()
+                    .all(|c| c.is_ascii_digit())
+                    .then(|| "#канал".to_string())
+            } else if inner.starts_with(':') || inner.starts_with("a:") {
+                let body = inner.trim_start_matches("a:").trim_start_matches(':');
+                body.split_once(':').map(|(name, _)| format!(":{name}:"))
+            } else if let Some(ts) = inner.strip_prefix("t:") {
+                let secs = ts.split(':').next().and_then(|s| s.parse::<i64>().ok());
+                secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+                    .map(|d| {
+                        d.with_timezone(&chrono::Local)
+                            .format("%d.%m.%Y %H:%M")
+                            .to_string()
+                    })
+            } else {
+                None
+            };
+        match replaced {
+            Some(r) => out.push_str(&r),
+            None => out.push_str(&after[..=end]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Превью Tenor (`...AAAAe/name.png`) → анимированный GIF (`...AAAAC/name.gif`).
+fn gif_from_preview(url: &str) -> Option<String> {
+    if url.contains("media.tenor.com") {
+        let (base, file) = url.split('?').next()?.rsplit_once('/')?;
+        let (prefix, id) = base.rsplit_once('/')?;
+        if id.len() < 6 {
+            return None;
+        }
+        let slug = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+        return Some(format!("{prefix}/{}C/{slug}.gif", &id[..id.len() - 1]));
+    }
+    if url.contains("giphy.com") && url.contains("_s.gif") {
+        return Some(url.replace("_s.gif", ".gif"));
+    }
+    None
+}
+
+fn convert_media(m: &RawMedia) -> Option<Media> {
+    let url = m
+        .proxy_url
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| m.url.clone());
+    (!url.is_empty()).then(|| Media {
+        url,
+        width: m.width.unwrap_or(0),
+        height: m.height.unwrap_or(0),
+    })
+}
+
+fn convert_embed(e: RawEmbed) -> Embed {
+    let kind = e.kind.unwrap_or_else(|| "rich".into());
+    let media = e
+        .image
+        .as_ref()
+        .and_then(convert_media)
+        .or_else(|| e.thumbnail.as_ref().and_then(convert_media));
+    let gif_url = if kind == "gifv" {
+        e.video
+            .as_ref()
+            .map(|v| v.url.clone())
+            .filter(|u| u.ends_with(".gif"))
+            .or_else(|| e.thumbnail.as_ref().and_then(|t| gif_from_preview(&t.url)))
+    } else {
+        None
+    };
+    Embed {
+        kind,
+        url: e.url,
+        title: e.title,
+        description: e.description,
+        provider: e.provider.and_then(|p| p.name),
+        color: e.color,
+        media,
+        gif_url,
     }
 }
 
 fn convert_msg(m: RawMessage) -> Msg {
-    let mut content = m.content;
-    for a in &m.attachments {
-        if !content.is_empty() {
-            content.push('\n');
+    let names: HashMap<String, String> = m
+        .mentions
+        .iter()
+        .map(|u| (u.id.clone(), u.display()))
+        .collect();
+    let mut content = render_markup(&m.content, &names);
+    let mut system = false;
+    if content.is_empty()
+        && m.attachments.is_empty()
+        && m.embeds.is_empty()
+        && m.sticker_items.is_empty()
+    {
+        if let Some(t) = system_text(m.kind) {
+            content.push_str(t);
+            system = true;
         }
-        content.push_str("[файл: ");
-        content.push_str(&a.filename);
-        content.push(']');
-    }
-    for s in &m.sticker_items {
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str("[стикер: ");
-        content.push_str(&s.name);
-        content.push(']');
-    }
-    if content.is_empty() && !m.embeds.is_empty() {
-        content.push_str("[встроенное содержимое]");
-    }
-    if content.is_empty() {
-        content.push_str(system_text(m.kind));
     }
     content.shrink_to_fit();
+
+    let mut attachments: Vec<Attachment> = m
+        .attachments
+        .into_iter()
+        .map(|a| Attachment {
+            proxy_url: a
+                .proxy_url
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| a.url.clone()),
+            filename: a.filename,
+            size: a.size,
+            url: a.url,
+            content_type: a.content_type.unwrap_or_default(),
+            width: a.width.unwrap_or(0),
+            height: a.height.unwrap_or(0),
+        })
+        .collect();
+    // Стикеры показываем как картинки (PNG/APNG/GIF); Lottie-стикеры — подписью.
+    for s in &m.sticker_items {
+        let ext = match s.format_type {
+            1 | 2 => "png",
+            4 => "gif",
+            _ => {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&format!("[стикер: {}]", s.name));
+                continue;
+            }
+        };
+        let url = format!(
+            "https://media.discordapp.net/stickers/{}.{ext}?size=160",
+            s.id
+        );
+        attachments.push(Attachment {
+            filename: format!("{}.{ext}", s.name),
+            size: 0,
+            proxy_url: url.clone(),
+            url,
+            content_type: format!("image/{ext}"),
+            width: 160,
+            height: 160,
+        });
+    }
+
+    let reply = m.referenced_message.map(|r| Reply {
+        author: r.author.as_ref().map(RawUser::display).unwrap_or_default(),
+        content: r
+            .content
+            .chars()
+            .take(120)
+            .collect::<String>()
+            .replace('\n', " "),
+    });
+
     Msg {
         id: sid(&m.id),
         channel_id: sid(&m.channel_id),
         guild_id: m.guild_id.as_deref().map(sid),
         author_id: sid(&m.author.id),
         author: m.author.display(),
+        author_avatar: m.author.avatar.clone(),
         content,
         time: fmt_time(&m.timestamp),
         edited: m.edited_timestamp.is_some(),
+        system,
+        attachments,
+        embeds: m.embeds.into_iter().map(convert_embed).collect(),
+        reply,
     }
 }
 
@@ -372,40 +733,56 @@ fn convert_channel(c: &RawChannel) -> Channel {
 }
 
 fn convert_guild(g: RawGuild) -> Guild {
-    let name = g
-        .name
-        .or_else(|| g.properties.and_then(|p| p.name))
-        .unwrap_or_else(|| "Без названия".to_string());
+    let (prop_name, prop_icon) = match g.properties {
+        Some(p) => (p.name, p.icon),
+        None => (None, None),
+    };
     Guild {
         id: sid(&g.id),
-        name,
+        name: g
+            .name
+            .or(prop_name)
+            .unwrap_or_else(|| "Без названия".to_string()),
+        icon: g.icon.or(prop_icon),
         channels: g.channels.iter().map(convert_channel).collect(),
     }
 }
 
-fn convert_dm(c: &RawChannel, users: &HashMap<String, String>) -> Dm {
+/// users: id -> (имя, хэш аватарки)
+fn convert_dm(c: &RawChannel, users: &HashMap<String, (String, Option<String>)>) -> Dm {
+    let mut people: Vec<(u64, String, Option<String>)> = c
+        .recipients
+        .iter()
+        .map(|u| (sid(&u.id), u.display(), u.avatar.clone()))
+        .collect();
+    if people.is_empty() {
+        people = c
+            .recipient_ids
+            .iter()
+            .filter_map(|id| users.get(id).map(|(n, a)| (sid(id), n.clone(), a.clone())))
+            .collect();
+    }
+    let group = c.kind == 3;
     let name = match &c.name {
         Some(n) if !n.is_empty() => n.clone(),
-        _ => {
-            let mut names: Vec<String> = c.recipients.iter().map(RawUser::display).collect();
-            if names.is_empty() {
-                names = c
-                    .recipient_ids
-                    .iter()
-                    .filter_map(|id| users.get(id).cloned())
-                    .collect();
-            }
-            if names.is_empty() {
-                "Неизвестный".to_string()
-            } else {
-                names.join(", ")
-            }
-        }
+        _ if people.is_empty() => "Неизвестный".to_string(),
+        _ => people
+            .iter()
+            .map(|(_, n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let avatar = if !group && people.len() == 1 {
+        Some((people[0].0, people[0].2.clone()))
+    } else {
+        None
     };
     Dm {
         id: sid(&c.id),
         name,
         last_message: c.last_message_id.as_deref().map(sid).unwrap_or(0),
+        avatar,
+        group,
     }
 }
 
@@ -435,6 +812,7 @@ pub fn spawn(ctx: egui::Context) -> (UnboundedSender<Cmd>, mpsc::Receiver<Event>
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .max_blocking_threads(2)
                 .build()
                 .expect("не удалось запустить tokio");
             rt.block_on(backend(cmd_rx, sink));
@@ -458,6 +836,8 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
     let mut http = reqwest::Client::new();
     let mut auth: Option<Auth> = None;
     let mut gateway: Option<tokio::task::JoinHandle<()>> = None;
+    // Не больше 4 одновременных загрузок картинок.
+    let images = Arc::new(tokio::sync::Semaphore::new(4));
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -514,6 +894,46 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                     });
                 }
             }
+            Cmd::Upload {
+                channel_id,
+                path,
+                content,
+            } => {
+                if let Some(a) = auth.clone() {
+                    let (http, sink) = (http.clone(), sink.clone());
+                    tokio::spawn(async move {
+                        sink.send(Event::Info("Отправляю файл…".into()));
+                        match upload_file(&http, &a, channel_id, &path, &content).await {
+                            Ok(m) => sink.send(Event::MessageCreate(m)),
+                            Err(e) => sink.send(Event::Error(e)),
+                        }
+                    });
+                }
+            }
+            Cmd::FetchImage {
+                key,
+                url,
+                max_side,
+                animate,
+            } => {
+                let (http, sink, sem) = (http.clone(), sink.clone(), images.clone());
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let result = fetch_image(&http, &url, max_side, animate).await;
+                    sink.send(Event::Image { key, result });
+                });
+            }
+            Cmd::Download { url, filename } => {
+                let (http, sink) = (http.clone(), sink.clone());
+                tokio::spawn(async move {
+                    match download(&http, &url, &filename).await {
+                        Ok(path) => {
+                            sink.send(Event::Info(format!("Сохранено: {}", path.display())))
+                        }
+                        Err(e) => sink.send(Event::Error(format!("Не скачалось: {e}"))),
+                    }
+                });
+            }
         }
     }
 }
@@ -525,6 +945,7 @@ fn http_error(status: reqwest::StatusCode) -> String {
         401 => "Токен недействителен".into(),
         403 => "Нет доступа к этому каналу".into(),
         404 => "Канал не найден".into(),
+        413 => "Файл слишком большой для Discord".into(),
         429 => "Слишком много запросов — подождите немного".into(),
         code => format!("Ошибка Discord: HTTP {code}"),
     }
@@ -579,6 +1000,170 @@ async fn send_message(
         .await
         .map_err(|e| format!("Неожиданный ответ Discord: {e}"))?;
     Ok(convert_msg(raw))
+}
+
+async fn upload_file(
+    http: &reqwest::Client,
+    auth: &Auth,
+    channel_id: u64,
+    path: &std::path::Path,
+    content: &str,
+) -> Result<Msg, String> {
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size > MAX_UPLOAD {
+        return Err(format!(
+            "Файл «{filename}» больше 10 МБ — Discord без подписки такие не принимает"
+        ));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("Не удалось прочитать файл: {e}"))?;
+    let payload = json!({
+        "content": content,
+        "attachments": [{ "id": 0, "filename": filename }]
+    });
+    let form = reqwest::multipart::Form::new()
+        .text("payload_json", payload.to_string())
+        .part(
+            "files[0]",
+            reqwest::multipart::Part::bytes(bytes).file_name(filename.clone()),
+        );
+    let resp = http
+        .post(format!("{API}/channels/{channel_id}/messages"))
+        .header("Authorization", auth.header())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Файл не отправлен, нет связи: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Файл не отправлен: {}", http_error(resp.status())));
+    }
+    let raw: RawMessage = resp
+        .json()
+        .await
+        .map_err(|e| format!("Неожиданный ответ Discord: {e}"))?;
+    Ok(convert_msg(raw))
+}
+
+fn downloads_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join("Downloads");
+    if dir.is_dir() {
+        dir
+    } else {
+        home
+    }
+}
+
+/// Имя файла без символов, запрещённых в Windows.
+fn safe_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if "<>:\"/\\|?*".contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "file".into()
+    } else {
+        cleaned
+    }
+}
+
+async fn download(http: &reqwest::Client, url: &str, filename: &str) -> Result<PathBuf, String> {
+    let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let dir = downloads_dir();
+    let name = safe_filename(filename);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (name.clone(), String::new()),
+    };
+    let mut path = dir.join(&name);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+async fn fetch_image(
+    http: &reqwest::Client,
+    url: &str,
+    max_side: u32,
+    animate: bool,
+) -> Result<Vec<Frame>, String> {
+    let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    if resp.content_length().unwrap_or(0) > MAX_IMAGE_DOWNLOAD {
+        return Err("слишком большая картинка".into());
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || decode_image(&bytes, max_side, animate))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn to_color_image(img: image::DynamicImage, max_side: u32) -> egui::ColorImage {
+    let img = if img.width() > max_side || img.height() > max_side {
+        img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    )
+}
+
+/// Декодирует и сразу уменьшает: в памяти хранится только то, что видно на экране.
+fn decode_image(bytes: &[u8], max_side: u32, animate: bool) -> Result<Vec<Frame>, String> {
+    use image::AnimationDecoder;
+    let format = image::guess_format(bytes).map_err(|e| e.to_string())?;
+    if animate && format == image::ImageFormat::Gif {
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(|e| e.to_string())?;
+        let mut frames = Vec::new();
+        for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
+            let Ok(frame) = frame else { break };
+            let (num, den) = frame.delay().numer_denom_ms();
+            let delay_ms = if den == 0 { 100 } else { (num / den).max(20) };
+            let img = image::DynamicImage::ImageRgba8(frame.into_buffer());
+            frames.push(Frame {
+                image: to_color_image(img, max_side),
+                delay_ms,
+            });
+        }
+        if !frames.is_empty() {
+            return Ok(frames);
+        }
+    }
+    let img = image::load_from_memory_with_format(bytes, format).map_err(|e| e.to_string())?;
+    Ok(vec![Frame {
+        image: to_color_image(img, max_side),
+        delay_ms: 0,
+    }])
 }
 
 // ======================= Gateway =======================
@@ -795,10 +1380,10 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
     match t {
         "READY" => {
             let r: RawReady = serde_json::from_str(d)?;
-            let users: HashMap<String, String> = r
+            let users: HashMap<String, (String, Option<String>)> = r
                 .users
                 .iter()
-                .map(|u| (u.id.clone(), u.display()))
+                .map(|u| (u.id.clone(), (u.display(), u.avatar.clone())))
                 .collect();
             let mut dms: Vec<Dm> = r
                 .private_channels
@@ -816,6 +1401,7 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
             sink.send(Event::Ready {
                 user_id: sid(&r.user.id),
                 username: r.user.display(),
+                avatar: r.user.avatar.clone(),
                 guilds,
                 dms,
             });
@@ -862,7 +1448,7 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 sink.send(Event::MessageUpdate {
                     id: sid(&m.id),
                     channel_id: sid(&m.channel_id),
-                    content,
+                    content: render_markup(&content, &HashMap::new()),
                 });
             }
         }
