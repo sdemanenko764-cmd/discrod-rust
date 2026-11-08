@@ -68,3 +68,23 @@ pub fn log(line: &str) {
         let _ = writeln!(f, "[{now}] {line}");
     }
 }
+
+fn proxy_path() -> Option<PathBuf> {
+    Some(path()?.with_file_name("proxy.txt"))
+}
+
+pub fn load_proxy() -> String {
+    proxy_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn save_proxy(proxy: &str) {
+    if let Some(p) = proxy_path() {
+        if let Some(dir) = p.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(p, proxy);
+    }
+}

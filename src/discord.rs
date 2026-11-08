@@ -7,6 +7,7 @@
 
 use std::{collections::HashMap, sync::mpsc, time::Duration};
 
+use crate::net::Proxy;
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::IgnoredAny, Deserialize};
@@ -27,6 +28,8 @@ pub const DISCORD_EPOCH: u64 = 1_420_070_400_000;
 pub struct Auth {
     pub token: String,
     pub bot: bool,
+    /// Что пользователь ввёл в поле «Прокси» (пусто = системный прокси).
+    pub proxy: String,
 }
 
 impl Auth {
@@ -440,19 +443,19 @@ pub fn spawn(ctx: egui::Context) -> (UnboundedSender<Cmd>, mpsc::Receiver<Event>
     (cmd_tx, ev_rx)
 }
 
-async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
-    let http = match reqwest::Client::builder()
+fn http_client(proxy: Option<&Proxy>) -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .user_agent(concat!("Rustcord/", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            sink.send(Event::Fatal(format!(
-                "Не удалось инициализировать сеть: {e}"
-            )));
-            return;
-        }
+        .connect_timeout(Duration::from_secs(15));
+    let builder = match proxy {
+        Some(p) => builder.proxy(reqwest::Proxy::all(p.reqwest_url())?),
+        None => builder.no_proxy(),
     };
+    builder.build()
+}
+
+async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
+    let mut http = reqwest::Client::new();
     let mut auth: Option<Auth> = None;
     let mut gateway: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -462,7 +465,20 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                 if let Some(h) = gateway.take() {
                     h.abort();
                 }
-                gateway = Some(tokio::spawn(gateway_loop(a.clone(), sink.clone())));
+                let proxy = crate::net::resolve(&a.proxy);
+                let route = proxy
+                    .as_ref()
+                    .map(Proxy::describe)
+                    .unwrap_or_else(|| "напрямую".into());
+                crate::store::log(&format!("вход: соединение {route}"));
+                http = match http_client(proxy.as_ref()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        sink.send(Event::Fatal(format!("Неверные настройки прокси: {e}")));
+                        continue;
+                    }
+                };
+                gateway = Some(tokio::spawn(gateway_loop(a.clone(), proxy, sink.clone())));
                 auth = Some(a);
             }
             Cmd::Logout => {
@@ -578,7 +594,7 @@ enum End {
 /// а не крутим «Подключение…» бесконечно.
 const MAX_LOGIN_ATTEMPTS: u32 = 3;
 
-async fn gateway_loop(auth: Auth, sink: Sink) {
+async fn gateway_loop(auth: Auth, proxy: Option<Proxy>, sink: Sink) {
     let mut delay: u64 = 1;
     let mut ever_ready = false;
     let mut failures: u32 = 0;
@@ -589,7 +605,7 @@ async fn gateway_loop(auth: Auth, sink: Sink) {
             Status::Connecting
         }));
         let mut got_ready = false;
-        let reason = match session(&auth, &sink, &mut got_ready).await {
+        let reason = match session(&auth, proxy.as_ref(), &sink, &mut got_ready).await {
             Ok(End::Fatal(msg)) => {
                 crate::store::log(&format!("ФАТАЛЬНО: {msg}"));
                 sink.send(Event::Fatal(msg));
@@ -608,8 +624,15 @@ async fn gateway_loop(auth: Auth, sink: Sink) {
         }
         if !ever_ready {
             if failures >= MAX_LOGIN_ATTEMPTS {
+                let hint = if proxy.is_none() {
+                    "\n\nПохоже, соединение с Discord блокируется. Включите VPN в режиме «весь трафик» \
+                     (TUN), либо укажите в поле «Прокси» локальный прокси вашего VPN-клиента, \
+                     например socks5://127.0.0.1:10808."
+                } else {
+                    "\n\nПроверьте, что VPN-клиент запущен и адрес прокси указан верно."
+                };
                 sink.send(Event::Fatal(format!(
-                    "Не удалось войти: {reason}.\nЛог: {}",
+                    "Не удалось войти: {reason}.{hint}\n\nЛог: {}",
                     crate::store::log_path_display()
                 )));
                 return;
@@ -665,8 +688,14 @@ fn close_end(frame: Option<CloseFrame<'_>>) -> End {
     }
 }
 
-async fn session(auth: &Auth, sink: &Sink, got_ready: &mut bool) -> Result<End, BoxErr> {
-    let (ws, _) = tokio_tungstenite::connect_async(GATEWAY).await?;
+async fn session(
+    auth: &Auth,
+    proxy: Option<&Proxy>,
+    sink: &Sink,
+    got_ready: &mut bool,
+) -> Result<End, BoxErr> {
+    let stream = crate::net::connect(proxy, "gateway.discord.gg", 443).await?;
+    let (ws, _) = tokio_tungstenite::client_async_tls(GATEWAY, stream).await?;
     let (mut write, mut read) = ws.split();
 
     // 1. Ждём Hello с интервалом heartbeat.

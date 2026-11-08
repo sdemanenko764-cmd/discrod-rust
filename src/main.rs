@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod discord;
+mod net;
 mod store;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -87,6 +88,7 @@ struct App {
 
     // вход
     token_input: String,
+    proxy_input: String,
     bot_input: bool,
     remember: bool,
     login_error: Option<String>,
@@ -127,6 +129,7 @@ impl App {
             events,
             screen: Screen::Login,
             token_input: String::new(),
+            proxy_input: store::load_proxy(),
             bot_input: false,
             remember: true,
             login_error: None,
@@ -149,7 +152,8 @@ impl App {
             mem_checked: Instant::now() - Duration::from_secs(10),
         };
         if let Some((token, bot)) = store::load() {
-            app.start_login(Auth { token, bot });
+            let proxy = app.proxy_input.clone();
+            app.start_login(Auth { token, bot, proxy });
         }
         app
     }
@@ -170,7 +174,9 @@ impl App {
             return;
         }
         let bot = self.bot_input;
-        self.start_login(Auth { token, bot });
+        let proxy = self.proxy_input.trim().to_string();
+        store::save_proxy(&proxy);
+        self.start_login(Auth { token, bot, proxy });
     }
 
     fn start_login(&mut self, auth: Auth) {
@@ -500,6 +506,22 @@ impl App {
                     ui.add_space(6.0);
                     ui.checkbox(&mut self.bot_input, "Это токен бота");
                     ui.checkbox(&mut self.remember, "Запомнить на этом компьютере");
+                    ui.add_space(8.0);
+                    ui.label("Прокси (необязательно)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.proxy_input)
+                            .hint_text("пусто = системный, или socks5://127.0.0.1:10808")
+                            .desired_width(360.0),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Если Discord у вас работает только через VPN: включите в VPN режим \
+                             «весь трафик» (TUN) или впишите сюда локальный прокси VPN-клиента. \
+                             «нет» — подключаться напрямую.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                     ui.add_space(10.0);
 
                     if self.logging_in {
