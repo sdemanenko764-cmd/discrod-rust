@@ -363,6 +363,15 @@ async fn udp_recv(udp: Option<&UdpSocket>, buf: &mut [u8]) -> std::io::Result<us
     }
 }
 
+/// Случайное начальное значение для RTP (без лишних зависимостей).
+fn seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9);
+    nanos ^ (nanos >> 29) ^ 0xA076_1D64_78BD_642F
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -512,8 +521,8 @@ async fn session(
                                 cipher = Some(Aes256Gcm::new_from_slice(&key).map_err(|_| "неверный ключ шифрования")?);
                                 rtp = Some(Rtp {
                                     ssrc: ssrc.unwrap_or(0),
-                                    seq: rand::random(),
-                                    timestamp: rand::random(),
+                                    seq: (seed() & 0xFFFF) as u16,
+                                    timestamp: (seed() >> 16) as u32,
                                     nonce: 0,
                                 });
                                 dave.version = d["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
