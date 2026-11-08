@@ -62,7 +62,52 @@ pub struct Channel {
 }
 
 #[derive(Clone, Debug)]
+pub struct VoiceMember {
+    pub user_id: u64,
+    pub channel_id: u64,
+    pub muted: bool,
+    pub deafened: bool,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum VoiceUi {
+    Connecting {
+        guild_id: Option<u64>,
+        channel_id: u64,
+    },
+    Connected {
+        ping_ms: u32,
+        e2ee: bool,
+    },
+    Disconnected(Option<String>),
+}
+
+/// Внутренние сигналы для голосового менеджера (из основного gateway).
+pub(crate) enum VoiceSignal {
+    State {
+        session_id: String,
+        channel_id: Option<u64>,
+    },
+    Server {
+        token: String,
+        endpoint: String,
+    },
+}
+
+static ME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VOICE_SIGNAL: std::sync::OnceLock<UnboundedSender<VoiceSignal>> = std::sync::OnceLock::new();
+
+fn voice_signal(sig: VoiceSignal) {
+    if let Some(tx) = VOICE_SIGNAL.get() {
+        let _ = tx.send(sig);
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Guild {
+    pub voice: Vec<VoiceMember>,
     pub id: u64,
     pub name: String,
     pub icon: Option<String>,
@@ -241,6 +286,15 @@ pub enum Status {
 }
 
 pub enum Cmd {
+    JoinVoice {
+        guild_id: Option<u64>,
+        channel_id: u64,
+    },
+    LeaveVoice,
+    SetMute(bool),
+    SetDeaf(bool),
+    RingCall(u64),
+    DeclineCall(u64),
     Login(Auth),
     Logout,
     FetchMessages {
@@ -351,6 +405,23 @@ pub enum Event {
         groups: Vec<(String, u64)>,
         ops: Vec<ListOp>,
     },
+    Voice(VoiceUi),
+    Speaking {
+        user_id: u64,
+        speaking: bool,
+    },
+    VoiceState {
+        guild_id: Option<u64>,
+        member: VoiceMember,
+        left: bool,
+    },
+    CallRing {
+        channel_id: u64,
+        ringing: bool,
+    },
+    CallEnded {
+        channel_id: u64,
+    },
     Info(String),
     Error(String),
     Fatal(String),
@@ -436,7 +507,70 @@ struct RawRole {
 }
 
 #[derive(Deserialize)]
+struct RawVoiceState {
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    guild_id: Option<String>,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    self_mute: bool,
+    #[serde(default)]
+    self_deaf: bool,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    deaf: bool,
+    #[serde(default)]
+    member: Option<RawTypingMember>,
+}
+
+impl RawVoiceState {
+    fn member(&self) -> Option<VoiceMember> {
+        let channel_id = self.channel_id.as_deref().map(sid)?;
+        let (name, avatar) = match &self.member {
+            Some(m) => (
+                m.nick
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| m.user.as_ref().map(|u| u.display())),
+                m.user.as_ref().and_then(|u| u.avatar.clone()),
+            ),
+            None => (None, None),
+        };
+        Some(VoiceMember {
+            user_id: sid(&self.user_id),
+            channel_id,
+            muted: self.self_mute || self.mute,
+            deafened: self.self_deaf || self.deaf,
+            name,
+            avatar,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawVoiceServer {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawCall {
+    channel_id: String,
+    #[serde(default)]
+    ringing: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct RawGuild {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    voice_states: Vec<RawVoiceState>,
     #[serde(default, deserialize_with = "lenient_vec")]
     roles: Vec<RawRole>,
     id: String,
@@ -1036,6 +1170,11 @@ fn convert_guild(g: RawGuild) -> Guild {
             .iter()
             .map(|r| (r.id.clone(), (r.name.clone(), r.color)))
             .collect(),
+        voice: g
+            .voice_states
+            .iter()
+            .filter_map(RawVoiceState::member)
+            .collect(),
         channels: g.channels.iter().map(convert_channel).collect(),
     }
 }
@@ -1081,13 +1220,13 @@ fn convert_dm(c: &RawChannel, users: &HashMap<String, (String, Option<String>)>)
 // ======================= фоновый поток =======================
 
 #[derive(Clone)]
-struct Sink {
+pub(crate) struct Sink {
     tx: mpsc::Sender<Event>,
     ctx: egui::Context,
 }
 
 impl Sink {
-    fn send(&self, e: Event) {
+    pub(crate) fn send(&self, e: Event) {
         let _ = self.tx.send(e);
         self.ctx.request_repaint();
     }
@@ -1131,9 +1270,60 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
     let mut gateway_out: Option<UnboundedSender<String>> = None;
     // Не больше 4 одновременных загрузок картинок.
     let images = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut proxy_now: Option<Proxy> = None;
+    let mut voice = VoiceManager::default();
+    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel::<VoiceSignal>();
+    let _ = VOICE_SIGNAL.set(sig_tx);
 
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            c = rx.recv() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            Some(sig) = sig_rx.recv() => {
+                voice.on_signal(sig, &sink, proxy_now.clone());
+                continue;
+            }
+        };
         match cmd {
+            Cmd::JoinVoice {
+                guild_id,
+                channel_id,
+            } => {
+                voice.join(guild_id, channel_id, &gateway_out, &sink);
+            }
+            Cmd::LeaveVoice => voice.leave(&gateway_out, &sink),
+            Cmd::SetMute(m) => voice.set_flags(Some(m), None, &gateway_out),
+            Cmd::SetDeaf(d) => voice.set_flags(None, Some(d), &gateway_out),
+            Cmd::RingCall(channel_id) | Cmd::DeclineCall(channel_id) if auth.is_some() => {
+                let ring = matches!(cmd, Cmd::RingCall(_));
+                let a = auth.clone().unwrap();
+                let (http, sink) = (http.clone(), sink.clone());
+                tokio::spawn(async move {
+                    let me = ME.load(std::sync::atomic::Ordering::Relaxed);
+                    let (path, body) = if ring {
+                        ("ring", json!({ "recipients": null }))
+                    } else {
+                        ("stop-ringing", json!({ "recipients": [me.to_string()] }))
+                    };
+                    let res = http
+                        .post(format!("{API}/channels/{channel_id}/call/{path}"))
+                        .header("Authorization", a.header())
+                        .json(&body)
+                        .send()
+                        .await;
+                    if let Ok(r) = res {
+                        if !r.status().is_success() && ring {
+                            sink.send(Event::Error(format!(
+                                "Не удалось позвонить: {}",
+                                http_error(r.status())
+                            )));
+                        }
+                    }
+                });
+            }
+            Cmd::RingCall(_) | Cmd::DeclineCall(_) => {}
             Cmd::Login(a) => {
                 if let Some(h) = gateway.take() {
                     h.abort();
@@ -1153,6 +1343,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                 };
                 let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
                 gateway_out = Some(out_tx);
+                proxy_now = proxy.clone();
                 gateway = Some(tokio::spawn(gateway_loop(
                     a.clone(),
                     proxy,
@@ -1165,6 +1356,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                 if let Some(h) = gateway.take() {
                     h.abort();
                 }
+                voice.leave(&gateway_out, &sink);
                 gateway_out = None;
                 auth = None;
             }
@@ -1838,6 +2030,7 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
     match t {
         "READY" => {
             let r: RawReady = serde_json::from_str(d)?;
+            ME.store(sid(&r.user.id), std::sync::atomic::Ordering::Relaxed);
             let users: HashMap<String, (String, Option<String>)> = r
                 .users
                 .iter()
@@ -1983,6 +2176,53 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 ops,
             });
         }
+        "VOICE_STATE_UPDATE" => {
+            let v: RawVoiceState = serde_json::from_str(d)?;
+            let user_id = sid(&v.user_id);
+            if user_id == ME.load(std::sync::atomic::Ordering::Relaxed) {
+                voice_signal(VoiceSignal::State {
+                    session_id: v.session_id.clone(),
+                    channel_id: v.channel_id.as_deref().map(sid),
+                });
+            }
+            let guild_id = v.guild_id.as_deref().map(sid);
+            let member = v.member().unwrap_or(VoiceMember {
+                user_id,
+                channel_id: 0,
+                muted: false,
+                deafened: false,
+                name: None,
+                avatar: None,
+            });
+            sink.send(Event::VoiceState {
+                guild_id,
+                left: v.channel_id.is_none(),
+                member,
+            });
+        }
+        "VOICE_SERVER_UPDATE" => {
+            let v: RawVoiceServer = serde_json::from_str(d)?;
+            if let Some(endpoint) = v.endpoint.filter(|e| !e.is_empty()) {
+                voice_signal(VoiceSignal::Server {
+                    token: v.token,
+                    endpoint,
+                });
+            }
+        }
+        "CALL_CREATE" | "CALL_UPDATE" => {
+            let c: RawCall = serde_json::from_str(d)?;
+            let me = ME.load(std::sync::atomic::Ordering::Relaxed);
+            sink.send(Event::CallRing {
+                channel_id: sid(&c.channel_id),
+                ringing: c.ringing.iter().any(|id| sid(id) == me),
+            });
+        }
+        "CALL_DELETE" => {
+            let c: RawCall = serde_json::from_str(d)?;
+            sink.send(Event::CallEnded {
+                channel_id: sid(&c.channel_id),
+            });
+        }
         "MESSAGE_DELETE" => {
             let x: RawIds = serde_json::from_str(d)?;
             sink.send(Event::MessageDelete {
@@ -1993,4 +2233,145 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+// ======================= голосовой менеджер =======================
+
+#[derive(Default)]
+struct VoiceManager {
+    target: Option<(Option<u64>, u64)>,
+    session_id: Option<String>,
+    server: Option<(String, String)>,
+    conn: Option<(
+        tokio::task::JoinHandle<()>,
+        UnboundedSender<crate::voice::Ctl>,
+    )>,
+    mute: bool,
+    deaf: bool,
+}
+
+impl VoiceManager {
+    fn send_state(
+        &self,
+        out: &Option<UnboundedSender<String>>,
+        guild: Option<u64>,
+        channel: Option<u64>,
+    ) {
+        if let Some(out) = out {
+            let packet = json!({
+                "op": 4,
+                "d": {
+                    "guild_id": guild.map(|g| g.to_string()),
+                    "channel_id": channel.map(|c| c.to_string()),
+                    "self_mute": self.mute,
+                    "self_deaf": self.deaf,
+                    "self_video": false
+                }
+            });
+            let _ = out.send(packet.to_string());
+        }
+    }
+
+    fn stop_conn(&mut self) {
+        if let Some((h, _)) = self.conn.take() {
+            h.abort();
+        }
+    }
+
+    fn join(
+        &mut self,
+        guild: Option<u64>,
+        channel: u64,
+        out: &Option<UnboundedSender<String>>,
+        sink: &Sink,
+    ) {
+        self.stop_conn();
+        self.target = Some((guild, channel));
+        self.session_id = None;
+        self.server = None;
+        self.send_state(out, guild, Some(channel));
+        sink.send(Event::Voice(VoiceUi::Connecting {
+            guild_id: guild,
+            channel_id: channel,
+        }));
+    }
+
+    fn leave(&mut self, out: &Option<UnboundedSender<String>>, sink: &Sink) {
+        self.stop_conn();
+        if let Some((guild, _)) = self.target.take() {
+            self.send_state(out, guild, None);
+            sink.send(Event::Voice(VoiceUi::Disconnected(None)));
+        }
+        self.session_id = None;
+        self.server = None;
+    }
+
+    fn set_flags(
+        &mut self,
+        mute: Option<bool>,
+        deaf: Option<bool>,
+        out: &Option<UnboundedSender<String>>,
+    ) {
+        if let Some(m) = mute {
+            self.mute = m;
+        }
+        if let Some(d) = deaf {
+            self.deaf = d;
+        }
+        if let Some((_, ctl)) = &self.conn {
+            let _ = ctl.send(crate::voice::Ctl::Mute(self.mute));
+            let _ = ctl.send(crate::voice::Ctl::Deaf(self.deaf));
+        }
+        if let Some((guild, channel)) = self.target {
+            self.send_state(out, guild, Some(channel));
+        }
+    }
+
+    fn on_signal(&mut self, sig: VoiceSignal, sink: &Sink, proxy: Option<Proxy>) {
+        let Some((guild, channel)) = self.target else {
+            return;
+        };
+        match sig {
+            VoiceSignal::State {
+                session_id,
+                channel_id,
+            } => {
+                if channel_id.is_none() {
+                    // нас отключили от канала (или мы вышли с другого устройства)
+                    self.stop_conn();
+                    self.target = None;
+                    sink.send(Event::Voice(VoiceUi::Disconnected(None)));
+                    return;
+                }
+                self.session_id = Some(session_id);
+            }
+            VoiceSignal::Server { token, endpoint } => {
+                // смена голосового сервера — переподключаемся
+                self.stop_conn();
+                self.server = Some((token, endpoint));
+            }
+        }
+        if self.conn.is_none() {
+            if let (Some(session_id), Some((token, endpoint))) = (&self.session_id, &self.server) {
+                let params = crate::voice::VoiceParams {
+                    guild_id: guild,
+                    channel_id: channel,
+                    user_id: ME.load(std::sync::atomic::Ordering::Relaxed),
+                    session_id: session_id.clone(),
+                    token: token.clone(),
+                    endpoint: endpoint.clone(),
+                };
+                let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+                let handle = tokio::spawn(crate::voice::run(
+                    params,
+                    proxy,
+                    sink.clone(),
+                    ctl_rx,
+                    self.mute,
+                    self.deaf,
+                ));
+                self.conn = Some((handle, ctl_tx));
+            }
+        }
+    }
 }

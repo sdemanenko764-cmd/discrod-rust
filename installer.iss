@@ -2,7 +2,7 @@
 ; Собирается автоматически: build-windows.bat или GitHub Actions.
 
 #define AppName "Rustcord"
-#define AppVersion "0.5.0"
+#define AppVersion "0.6.0"
 
 [Setup]
 AppId={{8F3C2A51-7B4E-4C1D-9A2F-5E6B7C8D9E01}

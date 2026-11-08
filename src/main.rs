@@ -12,6 +12,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod discord;
 mod emoji;
 mod fonts;
@@ -20,6 +21,7 @@ mod net;
 mod settings;
 mod store;
 mod theme;
+mod voice;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -34,7 +36,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use discord::{
     Attachment, Auth, Channel, Cmd, Dm, Embed, Emoji, Event, Guild, ListItem, ListOp, Msg,
-    Reaction, Status, DISCORD_EPOCH,
+    Reaction, Status, VoiceMember, VoiceUi, DISCORD_EPOCH,
 };
 use media::MediaCache;
 use settings::{Settings, Theme};
@@ -85,6 +87,22 @@ struct ChannelCache {
     error: Option<String>,
 }
 
+#[derive(Clone, PartialEq)]
+enum VoiceStatus {
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct VoiceConn {
+    guild_id: Option<u64>,
+    channel_id: u64,
+    status: VoiceStatus,
+    ping: u32,
+    e2ee: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum PickerTarget {
     Composer,
@@ -115,6 +133,13 @@ enum Action {
     OpenPicker(PickerTarget, egui::Pos2),
     Typing(u64),
     ScrollBottom,
+    JoinVoice(Option<u64>, u64),
+    LeaveVoice,
+    ToggleMute,
+    ToggleDeaf,
+    CallDm(u64),
+    AcceptCall(u64),
+    DeclineCall(u64),
     SelectGuild(Option<u64>),
     OpenChannel(u64),
     ToggleCategory(u64),
@@ -173,6 +198,13 @@ struct App {
     typing: HashMap<u64, Vec<(u64, String, Instant)>>,
     last_typing: Instant,
     scroll_until: Option<Instant>,
+    voice: Option<VoiceConn>,
+    self_mute: bool,
+    self_deaf: bool,
+    /// голосовой канал -> кто в нём
+    voice_members: HashMap<u64, Vec<VoiceMember>>,
+    speaking: HashSet<u64>,
+    incoming_call: Option<u64>,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -229,6 +261,12 @@ impl App {
             typing: HashMap::new(),
             last_typing: Instant::now() - Duration::from_secs(60),
             scroll_until: None,
+            voice: None,
+            self_mute: false,
+            self_deaf: false,
+            voice_members: HashMap::new(),
+            speaking: HashSet::new(),
+            incoming_call: None,
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
@@ -430,12 +468,29 @@ impl App {
                 self.lru = VecDeque::new();
                 self.member_sub = None;
                 self.member_lists = HashMap::new();
+                self.voice_members = HashMap::new();
+                for g in &self.guilds {
+                    for m in &g.voice {
+                        self.voice_members
+                            .entry(m.channel_id)
+                            .or_default()
+                            .push(m.clone());
+                    }
+                }
                 let guild = self
                     .sel_guild
                     .filter(|id| self.guilds.iter().any(|g| g.id == *id));
                 self.select_guild(guild);
             }
             Event::GuildCreate(g) => {
+                let ids: HashSet<u64> = g.channels.iter().map(|c| c.id).collect();
+                self.voice_members.retain(|cid, _| !ids.contains(cid));
+                for m in &g.voice {
+                    self.voice_members
+                        .entry(m.channel_id)
+                        .or_default()
+                        .push(m.clone());
+                }
                 match self.guilds.iter_mut().find(|x| x.id == g.id) {
                     Some(existing) => *existing = g,
                     None => self.guilds.push(g),
@@ -613,6 +668,88 @@ impl App {
                 }
             }
             Event::Image { key, result } => self.media.on_loaded(ctx, key, result),
+            Event::Voice(v) => match v {
+                VoiceUi::Connecting {
+                    guild_id,
+                    channel_id,
+                } => {
+                    self.voice = Some(VoiceConn {
+                        guild_id,
+                        channel_id,
+                        status: VoiceStatus::Connecting,
+                        ping: 0,
+                        e2ee: false,
+                    });
+                }
+                VoiceUi::Connected { ping_ms, e2ee } => {
+                    if let Some(c) = &mut self.voice {
+                        c.status = VoiceStatus::Connected;
+                        c.ping = ping_ms;
+                        c.e2ee = e2ee;
+                    }
+                }
+                VoiceUi::Disconnected(err) => match err {
+                    Some(e) => {
+                        if let Some(c) = &mut self.voice {
+                            c.status = VoiceStatus::Failed(e.clone());
+                        }
+                        self.toast(format!("Звонок: {e}"), true);
+                    }
+                    None => {
+                        self.voice = None;
+                        self.speaking.clear();
+                    }
+                },
+            },
+            Event::Speaking { user_id, speaking } => {
+                if speaking {
+                    self.speaking.insert(user_id);
+                } else {
+                    self.speaking.remove(&user_id);
+                }
+            }
+            Event::VoiceState { member, left, .. } => {
+                let mut prev: Option<VoiceMember> = None;
+                for list in self.voice_members.values_mut() {
+                    if let Some(i) = list.iter().position(|m| m.user_id == member.user_id) {
+                        prev = Some(list.remove(i));
+                    }
+                }
+                self.voice_members.retain(|_, l| !l.is_empty());
+                if !left {
+                    let mut m = member;
+                    if let Some(p) = prev {
+                        if m.name.is_none() {
+                            m.name = p.name;
+                        }
+                        if m.avatar.is_none() {
+                            m.avatar = p.avatar;
+                        }
+                    }
+                    self.voice_members.entry(m.channel_id).or_default().push(m);
+                } else {
+                    self.speaking.remove(&member.user_id);
+                }
+            }
+            Event::CallRing {
+                channel_id,
+                ringing,
+            } => {
+                let in_call = self
+                    .voice
+                    .as_ref()
+                    .map_or(false, |v| v.channel_id == channel_id);
+                if ringing && !in_call {
+                    self.incoming_call = Some(channel_id);
+                } else if self.incoming_call == Some(channel_id) {
+                    self.incoming_call = None;
+                }
+            }
+            Event::CallEnded { channel_id } => {
+                if self.incoming_call == Some(channel_id) {
+                    self.incoming_call = None;
+                }
+            }
             Event::Info(t) => self.toast(t, false),
             Event::Error(e) => self.toast(e, true),
             Event::Fatal(e) => self.logout(Some(e)),
@@ -905,22 +1042,34 @@ impl App {
             .exact_width(250.0)
             .frame(egui::Frame::none().fill(pal.side))
             .show(ctx, |ui| {
-                let guild = self.sel_guild.and_then(|id| self.guilds.iter().find(|g| g.id == id));
+                let guild = self
+                    .sel_guild
+                    .and_then(|id| self.guilds.iter().find(|g| g.id == id));
 
                 egui::TopBottomPanel::top("side_head")
                     .frame(egui::Frame::none().inner_margin(Margin::symmetric(16.0, 14.0)))
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
                         let name = guild.map(|g| g.name.as_str()).unwrap_or("Личные сообщения");
-                        ui.add(egui::Label::new(RichText::new(name).size(16.5).strong().color(pal.text)).truncate());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(name).size(16.5).strong().color(pal.text),
+                            )
+                            .truncate(),
+                        );
                     });
 
                 egui::TopBottomPanel::bottom("me_panel")
-                    .frame(egui::Frame::none().fill(pal.rail.gamma_multiply(0.9)).inner_margin(Margin::symmetric(10.0, 8.0)))
+                    .frame(
+                        egui::Frame::none()
+                            .fill(pal.rail.gamma_multiply(0.9))
+                            .inner_margin(Margin::symmetric(10.0, 8.0)),
+                    )
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
                             let tex = match (&self.me_avatar, load_avatars) {
                                 (Some(h), true) => {
                                     let url = discord::avatar_url(self.me_id, h);
@@ -933,11 +1082,24 @@ impl App {
                                 Status::Online => pal.ok,
                                 _ => pal.warn,
                             };
-                            ui.painter().circle_filled(rect.right_bottom() - vec2(4.0, 4.0), 6.0, pal.rail);
-                            ui.painter().circle_filled(rect.right_bottom() - vec2(4.0, 4.0), 4.5, dot);
+                            ui.painter().circle_filled(
+                                rect.right_bottom() - vec2(4.0, 4.0),
+                                6.0,
+                                pal.rail,
+                            );
+                            ui.painter().circle_filled(
+                                rect.right_bottom() - vec2(4.0, 4.0),
+                                4.5,
+                                dot,
+                            );
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.add(egui::Label::new(RichText::new(&self.me_name).strong().color(pal.text)).truncate());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&self.me_name).strong().color(pal.text),
+                                    )
+                                    .truncate(),
+                                );
                                 let status = match self.status {
                                     Status::Online => "в сети",
                                     Status::Connecting => "подключение…",
@@ -953,87 +1115,290 @@ impl App {
                         });
                     });
 
+                if let Some(vc) = self.voice.clone() {
+                    egui::TopBottomPanel::bottom("voice_panel")
+                        .frame(
+                            egui::Frame::none()
+                                .fill(pal.rail.gamma_multiply(0.9))
+                                .inner_margin(Margin::symmetric(10.0, 8.0)),
+                        )
+                        .show_separator_line(false)
+                        .show_inside(ui, |ui| {
+                            let (color, status) = match &vc.status {
+                                VoiceStatus::Connecting => (pal.warn, "Подключение…".to_string()),
+                                VoiceStatus::Connected => {
+                                    (pal.ok, format!("Голос подключён · {} мс", vc.ping))
+                                }
+                                VoiceStatus::Failed(_) => {
+                                    (pal.danger, "Ошибка подключения".to_string())
+                                }
+                            };
+                            ui.label(RichText::new(status).strong().color(color));
+                            let place = match vc.guild_id {
+                                Some(gid) => {
+                                    let g = self.guilds.iter().find(|g| g.id == gid);
+                                    let ch = g.and_then(|g| {
+                                        g.channels.iter().find(|c| c.id == vc.channel_id)
+                                    });
+                                    format!(
+                                        "{} / {}",
+                                        ch.map(|c| c.name.as_str()).unwrap_or("канал"),
+                                        g.map(|g| g.name.as_str()).unwrap_or("")
+                                    )
+                                }
+                                None => self
+                                    .dms
+                                    .iter()
+                                    .find(|d| d.id == vc.channel_id)
+                                    .map(|d| format!("Звонок: {}", d.name))
+                                    .unwrap_or_else(|| "Личный звонок".into()),
+                            };
+                            ui.add(
+                                egui::Label::new(RichText::new(place).small().color(pal.muted))
+                                    .truncate(),
+                            );
+                            if vc.e2ee {
+                                ui.label(
+                                    RichText::new("🔒 сквозное шифрование")
+                                        .small()
+                                        .color(pal.faint),
+                                );
+                            }
+                            if let VoiceStatus::Failed(e) = &vc.status {
+                                ui.label(RichText::new(e).small().color(pal.danger));
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let mic = if self.self_mute { "🔇" } else { "🎤" };
+                                let mic_tip = if self.self_mute {
+                                    "Включить микрофон"
+                                } else {
+                                    "Выключить микрофон"
+                                };
+                                if voice_button(ui, &pal, mic, mic_tip, self.self_mute).clicked() {
+                                    actions.push(Action::ToggleMute);
+                                }
+                                let deaf_tip = if self.self_deaf {
+                                    "Включить звук"
+                                } else {
+                                    "Выключить звук"
+                                };
+                                if voice_button(ui, &pal, "🎧", deaf_tip, self.self_deaf).clicked()
+                                {
+                                    actions.push(Action::ToggleDeaf);
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(vec2(44.0, 32.0), Sense::click());
+                                    let fill = if resp.hovered() {
+                                        pal.danger
+                                    } else {
+                                        pal.danger.gamma_multiply(0.85)
+                                    };
+                                    ui.painter().rect_filled(rect, 8.0, fill);
+                                    ui.painter().text(
+                                        rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "✆",
+                                        FontId::proportional(18.0),
+                                        Color32::WHITE,
+                                    );
+                                    if resp
+                                        .on_hover_text("Отключиться")
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        actions.push(Action::LeaveVoice);
+                                    }
+                                });
+                            });
+                        });
+                }
+
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().inner_margin(Margin::symmetric(8.0, 4.0)))
                     .show_inside(ui, |ui| {
-                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            match guild {
-                                Some(g) => {
-                                    let mut current_cat: Option<u64> = None;
-                                    for row in channel_rows(g) {
-                                        match row {
-                                            Row::Category(id, name) => {
-                                                current_cat = Some(id);
-                                                ui.add_space(10.0);
-                                                let collapsed = self.collapsed.contains(&id);
-                                                let arrow = if collapsed { "›" } else { "⌄" };
-                                                let text = RichText::new(format!("{arrow}  {}", name.to_uppercase()))
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                match guild {
+                                    Some(g) => {
+                                        let mut current_cat: Option<u64> = None;
+                                        for row in channel_rows(g) {
+                                            match row {
+                                                Row::Category(id, name) => {
+                                                    current_cat = Some(id);
+                                                    ui.add_space(10.0);
+                                                    let collapsed = self.collapsed.contains(&id);
+                                                    let arrow =
+                                                        if collapsed { "›" } else { "⌄" };
+                                                    let text = RichText::new(format!(
+                                                        "{arrow}  {}",
+                                                        name.to_uppercase()
+                                                    ))
                                                     .size(11.5)
                                                     .strong()
                                                     .color(pal.faint);
-                                                if ui.add(egui::Label::new(text).sense(Sense::click()).truncate()).clicked() {
-                                                    actions.push(Action::ToggleCategory(id));
-                                                }
-                                            }
-                                            Row::Chan(c) => {
-                                                let selected = self.sel_channel == Some(c.id);
-                                                if let Some(cat) = current_cat {
-                                                    if self.collapsed.contains(&cat) && !selected {
-                                                        continue;
+                                                    if ui
+                                                        .add(
+                                                            egui::Label::new(text)
+                                                                .sense(Sense::click())
+                                                                .truncate(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        actions.push(Action::ToggleCategory(id));
                                                     }
                                                 }
-                                                let unread = self.unread.contains_key(&c.id);
-                                                let (glyph, enabled) = if is_text(c.kind) {
-                                                    (if c.kind == 5 { "📢" } else { "#" }, true)
-                                                } else if is_voice(c.kind) {
-                                                    ("🔊", false)
-                                                } else {
-                                                    ("💬", false)
-                                                };
-                                                let resp = nav_row(ui, &pal, selected, unread, enabled, Leading::Glyph(glyph), &c.name, 32.0);
-                                                if enabled && resp.clicked() {
-                                                    actions.push(Action::OpenChannel(c.id));
-                                                }
-                                                if !enabled {
-                                                    resp.on_hover_text("Голосовые каналы и форумы пока не поддерживаются");
+                                                Row::Chan(c) => {
+                                                    let selected = self.sel_channel == Some(c.id);
+                                                    if let Some(cat) = current_cat {
+                                                        if self.collapsed.contains(&cat)
+                                                            && !selected
+                                                        {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    let unread = self.unread.contains_key(&c.id);
+                                                    let (glyph, enabled) = if is_text(c.kind) {
+                                                        (if c.kind == 5 { "📢" } else { "#" }, true)
+                                                    } else if is_voice(c.kind) {
+                                                        ("🔊", true)
+                                                    } else {
+                                                        ("💬", false)
+                                                    };
+                                                    let resp = nav_row(
+                                                        ui,
+                                                        &pal,
+                                                        selected,
+                                                        unread,
+                                                        enabled,
+                                                        Leading::Glyph(glyph),
+                                                        &c.name,
+                                                        32.0,
+                                                    );
+                                                    let in_this = self
+                                                        .voice
+                                                        .as_ref()
+                                                        .map_or(false, |v| v.channel_id == c.id);
+                                                    if is_voice(c.kind) {
+                                                        if resp
+                                                            .on_hover_text(if in_this {
+                                                                "Вы здесь"
+                                                            } else {
+                                                                "Подключиться к голосовому каналу"
+                                                            })
+                                                            .clicked()
+                                                            && !in_this
+                                                        {
+                                                            actions.push(Action::JoinVoice(
+                                                                Some(g.id),
+                                                                c.id,
+                                                            ));
+                                                        }
+                                                        if let Some(members) =
+                                                            self.voice_members.get(&c.id)
+                                                        {
+                                                            for m in members {
+                                                                let name = m
+                                                                    .name
+                                                                    .clone()
+                                                                    .unwrap_or_else(|| {
+                                                                        member_name(
+                                                                            &self.member_lists,
+                                                                            g.id,
+                                                                            m.user_id,
+                                                                        )
+                                                                    });
+                                                                let tex =
+                                                                    match (&m.avatar, load_avatars)
+                                                                    {
+                                                                        (Some(h), true) => {
+                                                                            let url =
+                                                                                discord::avatar_url(
+                                                                                    m.user_id, h,
+                                                                                );
+                                                                            self.media.get(
+                                                                                ui.ctx(),
+                                                                                &self.cmd,
+                                                                                &url,
+                                                                                &url,
+                                                                                64,
+                                                                                false,
+                                                                            )
+                                                                        }
+                                                                        _ => None,
+                                                                    };
+                                                                voice_member_row(
+                                                                    ui,
+                                                                    &pal,
+                                                                    tex,
+                                                                    m,
+                                                                    &name,
+                                                                    self.speaking
+                                                                        .contains(&m.user_id),
+                                                                );
+                                                            }
+                                                        }
+                                                    } else if enabled && resp.clicked() {
+                                                        actions.push(Action::OpenChannel(c.id));
+                                                    } else if !enabled {
+                                                        resp.on_hover_text(
+                                                            "Форумы пока не поддерживаются",
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                None => {
-                                    if self.dms.is_empty() {
-                                        ui.add_space(12.0);
-                                        ui.label(RichText::new("Диалогов пока нет").color(pal.muted));
-                                    }
-                                    for d in &self.dms {
-                                        let tex = match (&d.avatar, load_avatars) {
-                                            (Some((uid, Some(hash))), true) => {
-                                                let url = discord::avatar_url(*uid, hash);
-                                                self.media.get(ui.ctx(), &self.cmd, &url, &url, 64, false)
+                                    None => {
+                                        if self.dms.is_empty() {
+                                            ui.add_space(12.0);
+                                            ui.label(
+                                                RichText::new("Диалогов пока нет").color(pal.muted),
+                                            );
+                                        }
+                                        for d in &self.dms {
+                                            let tex = match (&d.avatar, load_avatars) {
+                                                (Some((uid, Some(hash))), true) => {
+                                                    let url = discord::avatar_url(*uid, hash);
+                                                    self.media.get(
+                                                        ui.ctx(),
+                                                        &self.cmd,
+                                                        &url,
+                                                        &url,
+                                                        64,
+                                                        false,
+                                                    )
+                                                }
+                                                _ => None,
+                                            };
+                                            let color_id =
+                                                d.avatar.as_ref().map(|(u, _)| *u).unwrap_or(d.id);
+                                            let lead = Leading::Avatar {
+                                                tex,
+                                                id: color_id,
+                                                name: &d.name,
+                                                group: d.group,
+                                            };
+                                            let resp = nav_row(
+                                                ui,
+                                                &pal,
+                                                self.sel_channel == Some(d.id),
+                                                self.unread.contains_key(&d.id),
+                                                true,
+                                                lead,
+                                                &d.name,
+                                                42.0,
+                                            );
+                                            if resp.clicked() {
+                                                actions.push(Action::OpenChannel(d.id));
                                             }
-                                            _ => None,
-                                        };
-                                        let color_id = d.avatar.as_ref().map(|(u, _)| *u).unwrap_or(d.id);
-                                        let lead = Leading::Avatar { tex, id: color_id, name: &d.name, group: d.group };
-                                        let resp = nav_row(
-                                            ui,
-                                            &pal,
-                                            self.sel_channel == Some(d.id),
-                                            self.unread.contains_key(&d.id),
-                                            true,
-                                            lead,
-                                            &d.name,
-                                            42.0,
-                                        );
-                                        if resp.clicked() {
-                                            actions.push(Action::OpenChannel(d.id));
                                         }
                                     }
                                 }
-                            }
-                        });
+                            });
                     });
             });
 
@@ -1068,6 +1433,14 @@ impl App {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let (None, Some(cid)) = (self.sel_guild, self.sel_channel) {
+                            let in_call =
+                                self.voice.as_ref().map_or(false, |v| v.channel_id == cid);
+                            if !in_call && icon_button(ui, &pal, "📞", "Позвонить").clicked()
+                            {
+                                actions.push(Action::CallDm(cid));
+                            }
+                        }
                         if self.sel_guild.is_some() {
                             let tip = if show_members {
                                 "Скрыть участников"
@@ -1592,6 +1965,47 @@ impl App {
                     let _ = self.cmd.send(Cmd::Typing { channel_id: cid });
                 }
             }
+            Action::JoinVoice(guild_id, channel_id) => {
+                let _ = self.cmd.send(Cmd::JoinVoice {
+                    guild_id,
+                    channel_id,
+                });
+            }
+            Action::LeaveVoice => {
+                let _ = self.cmd.send(Cmd::LeaveVoice);
+                self.voice = None;
+                self.speaking.clear();
+            }
+            Action::ToggleMute => {
+                self.self_mute = !self.self_mute;
+                if !self.self_mute && self.self_deaf {
+                    self.self_deaf = false;
+                    let _ = self.cmd.send(Cmd::SetDeaf(false));
+                }
+                let _ = self.cmd.send(Cmd::SetMute(self.self_mute));
+            }
+            Action::ToggleDeaf => {
+                self.self_deaf = !self.self_deaf;
+                let _ = self.cmd.send(Cmd::SetDeaf(self.self_deaf));
+            }
+            Action::CallDm(cid) => {
+                let _ = self.cmd.send(Cmd::JoinVoice {
+                    guild_id: None,
+                    channel_id: cid,
+                });
+                let _ = self.cmd.send(Cmd::RingCall(cid));
+            }
+            Action::AcceptCall(cid) => {
+                self.incoming_call = None;
+                let _ = self.cmd.send(Cmd::JoinVoice {
+                    guild_id: None,
+                    channel_id: cid,
+                });
+            }
+            Action::DeclineCall(cid) => {
+                self.incoming_call = None;
+                let _ = self.cmd.send(Cmd::DeclineCall(cid));
+            }
             Action::ScrollBottom => {
                 self.scroll_until = Some(Instant::now() + Duration::from_millis(600));
             }
@@ -1751,6 +2165,74 @@ impl App {
         }
         if escape || (clicked_outside && now - opened_at > 0.15) {
             self.picker = None;
+        }
+    }
+
+    fn call_ui(&mut self, ctx: &egui::Context) {
+        let Some(cid) = self.incoming_call else {
+            return;
+        };
+        let pal = self.pal;
+        let name = self
+            .dms
+            .iter()
+            .find(|d| d.id == cid)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "Кто-то".into());
+        let mut action: Option<Action> = None;
+        let pulse = (ctx.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5;
+        ctx.request_repaint_after(Duration::from_millis(33));
+        egui::Area::new(egui::Id::new("incoming_call"))
+            .anchor(Align2::CENTER_TOP, [0.0, 24.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(pal.side)
+                    .rounding(pal.radius + 6.0)
+                    .stroke(Stroke::new(1.5, mix(pal.border, pal.ok, pulse)))
+                    .inner_margin(Margin::same(16.0))
+                    .show(ui, |ui| {
+                        ui.set_width(320.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("📞 Входящий звонок").color(pal.muted));
+                            ui.label(RichText::new(&name).size(20.0).strong().color(pal.text));
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(40.0);
+                                if ui
+                                    .add_sized(
+                                        [110.0, 36.0],
+                                        egui::Button::new(
+                                            RichText::new("Принять").strong().color(Color32::WHITE),
+                                        )
+                                        .fill(pal.ok.gamma_multiply(0.8))
+                                        .rounding(18.0),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(Action::AcceptCall(cid));
+                                }
+                                if ui
+                                    .add_sized(
+                                        [110.0, 36.0],
+                                        egui::Button::new(
+                                            RichText::new("Отклонить")
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(pal.danger)
+                                        .rounding(18.0),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(Action::DeclineCall(cid));
+                                }
+                            });
+                        });
+                    });
+            });
+        if let Some(a) = action {
+            self.handle_action(ctx, a);
         }
     }
 
@@ -2103,6 +2585,7 @@ impl eframe::App for App {
             Screen::Login => self.login_ui(ctx),
             Screen::Main => self.main_ui(ctx),
         }
+        self.call_ui(ctx);
         self.picker_ui(ctx);
         self.delete_ui(ctx);
         self.settings_ui(ctx);
@@ -3361,4 +3844,99 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
         l(a.b(), b.b()),
         l(a.a(), b.a()),
     )
+}
+
+/// Имя участника голосового канала из списка участников сервера.
+fn member_name(lists: &HashMap<u64, MemberList>, guild_id: u64, user_id: u64) -> String {
+    lists
+        .get(&guild_id)
+        .and_then(|l| {
+            l.items.iter().flatten().find_map(|it| match it {
+                ListItem::Member { id, name, .. } if *id == user_id => Some(name.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| "Участник".into())
+}
+
+fn voice_member_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    tex: Option<(TextureId, Vec2)>,
+    m: &VoiceMember,
+    name: &str,
+    speaking: bool,
+) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, pal.hover);
+    }
+    let cy = rect.center().y;
+    let ar = Rect::from_center_size(pos2(rect.left() + 42.0, cy), vec2(22.0, 22.0));
+    let glow = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with(("talk", m.user_id)), speaking, 0.12);
+    if glow > 0.01 {
+        ui.painter().circle_stroke(
+            ar.center(),
+            13.0,
+            Stroke::new(2.0, pal.ok.gamma_multiply(glow)),
+        );
+    }
+    paint_avatar(ui, ar, tex, m.user_id, name);
+    let mut right = rect.right() - 6.0;
+    let icons = match (m.deafened, m.muted) {
+        (true, _) => "🎧✕",
+        (false, true) => "🔇",
+        _ => "",
+    };
+    if !icons.is_empty() {
+        ui.painter().text(
+            pos2(right, cy),
+            Align2::RIGHT_CENTER,
+            icons,
+            FontId::proportional(13.0),
+            pal.faint,
+        );
+        right -= 30.0;
+    }
+    let x = ar.right() + 8.0;
+    let clip = Rect::from_min_max(pos2(x, rect.top()), pos2(right, rect.bottom()));
+    ui.painter_at(clip).text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(14.0),
+        if speaking { pal.text } else { pal.muted },
+    );
+}
+
+fn voice_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: &str,
+    tip: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 32.0), Sense::click());
+    let fill = if active {
+        pal.danger.gamma_multiply(0.25)
+    } else if resp.hovered() {
+        pal.hover
+    } else {
+        pal.elevated
+    };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(16.0),
+        if active { pal.danger } else { pal.text },
+    );
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rustcord"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Лёгкий нативный клиент Discord на Rust"
 license = "MIT"
@@ -28,6 +28,12 @@ memmap2 = "0.9"
 ab_glyph = "0.2"
 # Окно выбора файла для отправки
 rfd = "0.15"
+# Звонки: звук, кодек, шифрование
+cpal = "0.15"
+opus = "0.3"
+aes-gcm = "0.10"
+# Сквозное шифрование звонков Discord (протокол DAVE), MIT
+davey = "0.2"
 
 [profile.release]
 opt-level = 3
