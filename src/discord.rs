@@ -295,6 +295,7 @@ pub enum Cmd {
     SetDeaf(bool),
     RingCall(u64),
     DeclineCall(u64),
+    VoiceOptions(crate::voice::VoiceOpts),
     Login(Auth),
     Logout,
     FetchMessages {
@@ -406,6 +407,7 @@ pub enum Event {
         ops: Vec<ListOp>,
     },
     Voice(VoiceUi),
+    MicLevel(f32),
     Speaking {
         user_id: u64,
         speaking: bool,
@@ -1296,6 +1298,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
             Cmd::LeaveVoice => voice.leave(&gateway_out, &sink),
             Cmd::SetMute(m) => voice.set_flags(Some(m), None, &gateway_out),
             Cmd::SetDeaf(d) => voice.set_flags(None, Some(d), &gateway_out),
+            Cmd::VoiceOptions(o) => voice.set_options(o),
             Cmd::RingCall(channel_id) | Cmd::DeclineCall(channel_id) if auth.is_some() => {
                 let ring = matches!(cmd, Cmd::RingCall(_));
                 let a = auth.clone().unwrap();
@@ -2248,9 +2251,17 @@ struct VoiceManager {
     )>,
     mute: bool,
     deaf: bool,
+    opts: Option<crate::voice::VoiceOpts>,
 }
 
 impl VoiceManager {
+    fn set_options(&mut self, o: crate::voice::VoiceOpts) {
+        if let Some((_, ctl)) = &self.conn {
+            let _ = ctl.send(crate::voice::Ctl::Options(o.clone()));
+        }
+        self.opts = Some(o);
+    }
+
     fn send_state(
         &self,
         out: &Option<UnboundedSender<String>>,
@@ -2369,6 +2380,13 @@ impl VoiceManager {
                     ctl_rx,
                     self.mute,
                     self.deaf,
+                    self.opts.clone().unwrap_or(crate::voice::VoiceOpts {
+                        input: None,
+                        output: None,
+                        threshold: 0.006,
+                        always: false,
+                        echo_guard: true,
+                    }),
                 ));
                 self.conn = Some((handle, ctl_tx));
             }

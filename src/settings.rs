@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Theme {
+    Aurora,
+    Sunset,
+    Ocean,
+    Neon,
     AdwaitaDark,
     AdwaitaLight,
     Catppuccin,
@@ -26,6 +30,12 @@ pub struct Settings {
     pub show_ram: bool,
     pub cached_channels: usize,
     pub messages_per_channel: usize,
+    pub animate_background: bool,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub mic_threshold: f32,
+    pub always_transmit: bool,
+    pub echo_guard: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +51,12 @@ impl Default for Settings {
             show_ram: true,
             cached_channels: 6,
             messages_per_channel: 200,
+            animate_background: true,
+            input_device: None,
+            output_device: None,
+            mic_threshold: 0.006,
+            always_transmit: false,
+            echo_guard: true,
         }
     }
 }
@@ -53,6 +69,7 @@ pub fn load() -> Settings {
     s.zoom = s.zoom.clamp(0.75, 1.6);
     s.cached_channels = s.cached_channels.clamp(2, 20);
     s.messages_per_channel = s.messages_per_channel.clamp(50, 500);
+    s.mic_threshold = s.mic_threshold.clamp(0.001, 0.08);
     s
 }
 

@@ -19,8 +19,6 @@ use crate::discord::{Event, Sink, VoiceUi};
 use crate::net::{BoxErr, Proxy};
 
 const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
-/// Порог громкости для «говорит» (примерно −38 дБ).
-const VAD_THRESHOLD: f32 = 0.012;
 /// Сколько кадров по 20 мс продолжать передачу после тишины.
 const VAD_HANGOVER: u32 = 15;
 
@@ -33,7 +31,21 @@ pub struct VoiceParams {
     pub endpoint: String,
 }
 
+/// Настройки звука для звонка.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoiceOpts {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    /// Порог «говорит» (RMS).
+    pub threshold: f32,
+    /// Передавать всегда, без детектора речи.
+    pub always: bool,
+    /// Простое подавление эха: не передавать тихий звук, пока говорят другие.
+    pub echo_guard: bool,
+}
+
 pub enum Ctl {
+    Options(VoiceOpts),
     Mute(bool),
     Deaf(bool),
 }
@@ -386,8 +398,9 @@ pub async fn run(
     ctl: UnboundedReceiver<Ctl>,
     mute: bool,
     deaf: bool,
+    opts: VoiceOpts,
 ) {
-    let result = session(&p, proxy.as_ref(), &sink, ctl, mute, deaf).await;
+    let result = session(&p, proxy.as_ref(), &sink, ctl, mute, deaf, opts).await;
     if let Some(user) = Some(p.user_id) {
         sink.send(Event::Speaking {
             user_id: user,
@@ -410,6 +423,7 @@ async fn session(
     mut ctl: UnboundedReceiver<Ctl>,
     mut mute: bool,
     mut deaf: bool,
+    mut opts: VoiceOpts,
 ) -> Result<(), BoxErr> {
     let (host, port) = parse_endpoint(&p.endpoint);
     crate::store::log(&format!("голос: подключаюсь к {host}:{port}"));
@@ -433,6 +447,9 @@ async fn session(
     let mut codec = Codec::new()?;
     let mut speaking = false;
     let mut hangover = 0u32;
+    let mut last_remote = Instant::now() - Duration::from_secs(10);
+    let mut ticks: u64 = 0;
+    let (mut sent, mut received, mut dropped) = (0u64, 0u64, 0u64);
     let mut frame = [0f32; 960];
     let mut stereo = vec![0f32; 1920];
     let mut opus_out = vec![0u8; 4000];
@@ -528,7 +545,7 @@ async fn session(
                                 dave.version = d["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
                                 dave.downgraded = dave.version == 0;
                                 dave.reinit(&mut out);
-                                match Audio::start() {
+                                match Audio::start(opts.input.clone(), opts.output.clone(), false) {
                                     Ok(a) => {
                                         if !a.has_mic {
                                             sink.send(Event::Error("Микрофон не найден — вас не слышно, но вы слышите других".into()));
@@ -604,12 +621,29 @@ async fn session(
             }
             _ = tick.tick(), if cipher.is_some() => {
                 let Some(a) = &audio_io else { continue };
+                ticks += 1;
+                if ticks % 5 == 0 {
+                    let lvl = if mute || deaf { 0.0 } else { a.level() };
+                    sink.send(Event::MicLevel(lvl));
+                }
+                if ticks % 500 == 0 {
+                    crate::store::log(&format!(
+                        "голос: отправлено {sent}, получено {received}, отброшено {dropped}; DAVE v{} активно={} шифрование={}; микрофон={}",
+                        dave.version,
+                        dave.active(),
+                        dave.session.as_ref().map_or(false, |s| s.can_encrypt()),
+                        a.has_mic
+                    ));
+                }
                 if mute || deaf || !a.has_mic {
                     a.clear_capture();
                 } else {
                     while a.take_frame(&mut frame) {
                         let rms = (frame.iter().map(|s| s * s).sum::<f32>() / 960.0).sqrt();
-                        if rms > VAD_THRESHOLD {
+                        let echo = opts.echo_guard
+                            && last_remote.elapsed() < Duration::from_millis(250)
+                            && rms < opts.threshold * 3.0;
+                        if opts.always || (rms > opts.threshold && !echo) {
                             hangover = VAD_HANGOVER;
                         } else {
                             hangover = hangover.saturating_sub(1);
@@ -626,7 +660,11 @@ async fn session(
                             }
                             if let Ok(n) = codec.encoder.encode_float(&stereo, &mut opus_out) {
                                 let packet = opus_out[..n].to_vec();
-                                send_audio(&mut dave, rtp.as_mut(), cipher.as_ref(), udp.as_ref(), &packet).await;
+                                if send_audio(&mut dave, rtp.as_mut(), cipher.as_ref(), udp.as_ref(), &packet).await {
+                                    sent += 1;
+                                } else {
+                                    dropped += 1;
+                                }
                             }
                         }
                         // В очереди могло накопиться несколько кадров — отправляем не больше одного за тик,
@@ -647,6 +685,7 @@ async fn session(
                 let n = res?;
                 if let (Some(c), Some(a)) = (cipher.as_ref(), audio_io.as_ref()) {
                     if let Some((from, payload)) = open_rtp(c, &rbuf[..n]) {
+                        received += 1;
                         let user = ssrc_users.get(&from).copied();
                         let mut data = payload;
                         if data.as_slice() != SILENCE.as_slice() {
@@ -673,7 +712,14 @@ async fn session(
                                 }
                             };
                             if let Ok(samples) = dec.decode_float(&data, &mut pcm, false) {
-                                audio::push_playback(&a.playback, from, &pcm[..samples * 2]);
+                                let chunk = &pcm[..samples * 2];
+                                if !chunk.is_empty() {
+                                    let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+                                    if rms > 0.01 {
+                                        last_remote = Instant::now();
+                                    }
+                                }
+                                audio::push_playback(&a.playback, from, chunk);
                             }
                         }
                     }
@@ -681,6 +727,17 @@ async fn session(
             }
             c = ctl.recv() => {
                 match c {
+                    Some(Ctl::Options(o)) => {
+                        let devices_changed = o.input != opts.input || o.output != opts.output;
+                        opts = o;
+                        if devices_changed && audio_io.is_some() {
+                            audio_io = None; // старые потоки останавливаются
+                            match Audio::start(opts.input.clone(), opts.output.clone(), false) {
+                                Ok(a) => audio_io = Some(a),
+                                Err(e) => sink.send(Event::Error(format!("Звук не запустился: {e}"))),
+                            }
+                        }
+                    }
                     Some(Ctl::Mute(m)) => mute = m,
                     Some(Ctl::Deaf(d)) => {
                         deaf = d;
@@ -711,24 +768,25 @@ async fn send_audio(
     cipher: Option<&Aes256Gcm>,
     udp: Option<&UdpSocket>,
     packet: &[u8],
-) {
+) -> bool {
     let (Some(rtp), Some(cipher), Some(udp)) = (rtp, cipher, udp) else {
-        return;
+        return false;
     };
     let mut frame: Vec<u8> = packet.to_vec();
     if dave.active() && packet != SILENCE.as_slice() {
         let Some(s) = dave.session.as_mut() else {
-            return;
+            return false;
         };
         if !s.can_encrypt() {
-            return; // ключа ещё нет — не отправляем, чтобы не утёк незашифрованный звук
+            return false; // ключа ещё нет — не отправляем, чтобы не утёк незашифрованный звук
         }
         match s.encrypt_opus(packet) {
             Ok(enc) => frame = enc.into_owned(),
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
-    if let Some(pkt) = rtp.packet(cipher, &frame) {
-        let _ = udp.send(&pkt).await;
+    match rtp.packet(cipher, &frame) {
+        Some(pkt) => udp.send(&pkt).await.is_ok(),
+        None => false,
     }
 }

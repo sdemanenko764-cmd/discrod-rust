@@ -21,7 +21,11 @@ pub const ACCENTS: [(&str, Color32); 10] = [
 ];
 
 /// Темы в порядке показа в настройках.
-pub const THEMES: [(Theme, &str); 7] = [
+pub const THEMES: [(Theme, &str); 11] = [
+    (Theme::Aurora, "Аврора ✦"),
+    (Theme::Sunset, "Закат ✦"),
+    (Theme::Ocean, "Океан ✦"),
+    (Theme::Neon, "Неон ✦"),
     (Theme::AdwaitaDark, "GNOME тёмная"),
     (Theme::AdwaitaLight, "GNOME светлая"),
     (Theme::Catppuccin, "Catppuccin"),
@@ -63,8 +67,101 @@ pub fn palette(s: &Settings) -> Palette {
     palette_for(s.theme, ACCENTS[s.accent.min(ACCENTS.len() - 1)].1)
 }
 
+/// Живой фон анимированных тем: базовый цвет и три светящихся пятна.
+#[derive(Clone, Copy)]
+pub struct Backdrop {
+    pub base: Color32,
+    pub glows: [Color32; 3],
+}
+
+pub fn backdrop(theme: Theme) -> Option<Backdrop> {
+    Some(match theme {
+        Theme::Aurora => Backdrop {
+            base: rgb(6, 10, 20),
+            glows: [rgb(20, 184, 166), rgb(99, 102, 241), rgb(34, 197, 94)],
+        },
+        Theme::Sunset => Backdrop {
+            base: rgb(18, 8, 20),
+            glows: [rgb(249, 115, 22), rgb(236, 72, 153), rgb(139, 92, 246)],
+        },
+        Theme::Ocean => Backdrop {
+            base: rgb(3, 14, 24),
+            glows: [rgb(14, 165, 233), rgb(6, 182, 212), rgb(59, 90, 246)],
+        },
+        Theme::Neon => Backdrop {
+            base: rgb(7, 6, 13),
+            glows: [rgb(217, 70, 239), rgb(34, 211, 238), rgb(163, 230, 53)],
+        },
+        _ => return None,
+    })
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// Полупрозрачная «стеклянная» палитра поверх живого фона.
+fn glass(
+    tint: (u8, u8, u8),
+    accent: Color32,
+    link: Color32,
+    text: Color32,
+    muted: Color32,
+) -> Palette {
+    let (r, g, b) = tint;
+    Palette {
+        rail: rgba(r, g, b, 215),
+        side: rgba(r, g, b, 175),
+        main: rgba(r, g, b, 105),
+        header: rgba(r, g, b, 150),
+        elevated: rgba(255, 255, 255, 20),
+        hover: rgba(255, 255, 255, 26),
+        selected: rgba(255, 255, 255, 40),
+        msg_hover: rgba(255, 255, 255, 9),
+        text,
+        muted,
+        faint: muted.gamma_multiply(0.7),
+        border: rgba(255, 255, 255, 24),
+        accent,
+        link,
+        danger: rgb(255, 99, 122),
+        ok: rgb(74, 222, 128),
+        warn: rgb(250, 204, 21),
+        radius: 14.0,
+        light: false,
+    }
+}
+
 pub fn palette_for(theme: Theme, accent: Color32) -> Palette {
     match theme {
+        Theme::Aurora => glass(
+            (8, 14, 26),
+            accent,
+            rgb(103, 232, 249),
+            rgb(238, 242, 255),
+            rgb(165, 180, 200),
+        ),
+        Theme::Sunset => glass(
+            (22, 10, 24),
+            accent,
+            rgb(253, 186, 116),
+            rgb(255, 241, 242),
+            rgb(205, 170, 190),
+        ),
+        Theme::Ocean => glass(
+            (4, 18, 30),
+            accent,
+            rgb(125, 211, 252),
+            rgb(236, 254, 255),
+            rgb(150, 190, 210),
+        ),
+        Theme::Neon => glass(
+            (10, 8, 18),
+            accent,
+            rgb(240, 171, 252),
+            rgb(250, 245, 255),
+            rgb(180, 170, 210),
+        ),
         Theme::AdwaitaDark => Palette {
             rail: rgb(26, 26, 29),
             side: rgb(46, 46, 50),

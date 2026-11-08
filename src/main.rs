@@ -136,6 +136,7 @@ enum Action {
     JoinVoice(Option<u64>, u64),
     LeaveVoice,
     ToggleMute,
+    ToggleStage,
     ToggleDeaf,
     CallDm(u64),
     AcceptCall(u64),
@@ -205,6 +206,10 @@ struct App {
     voice_members: HashMap<u64, Vec<VoiceMember>>,
     speaking: HashSet<u64>,
     incoming_call: Option<u64>,
+    stage_open: bool,
+    mic_level: f32,
+    devices: Option<(Vec<String>, Vec<String>)>,
+    mic_test: Option<audio::Audio>,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -267,10 +272,15 @@ impl App {
             voice_members: HashMap::new(),
             speaking: HashSet::new(),
             incoming_call: None,
+            stage_open: true,
+            mic_level: 0.0,
+            devices: None,
+            mic_test: None,
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
         };
+        let _ = app.cmd.send(Cmd::VoiceOptions(voice_opts(&app.settings)));
         if let Some((token, bot)) = store::load() {
             let proxy = app.proxy_input.clone();
             app.start_login(Auth { token, bot, proxy });
@@ -701,6 +711,7 @@ impl App {
                     }
                 },
             },
+            Event::MicLevel(l) => self.mic_level = l,
             Event::Speaking { user_id, speaking } => {
                 if speaking {
                     self.speaking.insert(user_id);
@@ -838,7 +849,18 @@ impl App {
         {
             self.media.clear();
         }
+        if voice_opts(before) != voice_opts(&self.settings) {
+            let _ = self.cmd.send(Cmd::VoiceOptions(voice_opts(&self.settings)));
+        }
         settings::save(&self.settings);
+    }
+
+    /// Непрозрачный фон для всплывающих окон (у «стеклянных» тем панели полупрозрачные).
+    fn solid(&self) -> Color32 {
+        match theme::backdrop(self.settings.theme) {
+            Some(b) => mix(b.base, Color32::WHITE, 0.06),
+            None => self.pal.side,
+        }
     }
 
     // ======================= экран входа =======================
@@ -1164,6 +1186,15 @@ impl App {
                                         .color(pal.faint),
                                 );
                             }
+                            if vc.status == VoiceStatus::Connected {
+                                level_meter(
+                                    ui,
+                                    &pal,
+                                    if self.self_mute { 0.0 } else { self.mic_level },
+                                    self.settings.mic_threshold,
+                                    6.0,
+                                );
+                            }
                             if let VoiceStatus::Failed(e) = &vc.status {
                                 ui.label(RichText::new(e).small().color(pal.danger));
                             }
@@ -1433,6 +1464,22 @@ impl App {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(vc) = &self.voice {
+                            let here = match vc.guild_id {
+                                None => self.sel_channel == Some(vc.channel_id),
+                                Some(g) => self.sel_guild == Some(g),
+                            };
+                            if here {
+                                let tip = if self.stage_open {
+                                    "Скрыть окно звонка"
+                                } else {
+                                    "Показать окно звонка"
+                                };
+                                if icon_button(ui, &pal, "📺", tip).clicked() {
+                                    actions.push(Action::ToggleStage);
+                                }
+                            }
+                        }
                         if let (None, Some(cid)) = (self.sel_guild, self.sel_channel) {
                             let in_call =
                                 self.voice.as_ref().map_or(false, |v| v.channel_id == cid);
@@ -1709,6 +1756,10 @@ impl App {
                 });
         }
 
+        // --- сцена звонка ---
+        let stage = self.stage_tiles(ctx);
+        let (self_mute, self_deaf) = (self.self_mute, self.self_deaf);
+
         // --- сообщения ---
         let force_bottom = self.scroll_until.map_or(false, |t| Instant::now() < t);
         let me_id = self.me_id;
@@ -1717,8 +1768,16 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.main))
             .show(ctx, |ui| {
+                if let Some(tiles) = &stage {
+                    let h = (ui.available_height() * 0.55).clamp(240.0, 560.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+                    draw_stage(ui, &pal, rect, tiles, self_mute, self_deaf, &mut actions);
+                }
                 let Some(cid) = self.sel_channel else {
-                    empty_state(ui, &pal, "Выберите канал или диалог слева");
+                    if stage.is_none() {
+                        empty_state(ui, &pal, "Выберите канал или диалог слева");
+                    }
                     return;
                 };
                 let Some(cache) = self.cache.get(&cid) else {
@@ -1965,7 +2024,9 @@ impl App {
                     let _ = self.cmd.send(Cmd::Typing { channel_id: cid });
                 }
             }
+            Action::ToggleStage => self.stage_open = !self.stage_open,
             Action::JoinVoice(guild_id, channel_id) => {
+                self.stage_open = true;
                 let _ = self.cmd.send(Cmd::JoinVoice {
                     guild_id,
                     channel_id,
@@ -1989,6 +2050,7 @@ impl App {
                 let _ = self.cmd.send(Cmd::SetDeaf(self.self_deaf));
             }
             Action::CallDm(cid) => {
+                self.stage_open = true;
                 let _ = self.cmd.send(Cmd::JoinVoice {
                     guild_id: None,
                     channel_id: cid,
@@ -1996,6 +2058,7 @@ impl App {
                 let _ = self.cmd.send(Cmd::RingCall(cid));
             }
             Action::AcceptCall(cid) => {
+                self.stage_open = true;
                 self.incoming_call = None;
                 let _ = self.cmd.send(Cmd::JoinVoice {
                     guild_id: None,
@@ -2061,6 +2124,7 @@ impl App {
             return;
         };
         let pal = self.pal;
+        let solid = self.solid();
         let mut chosen: Option<String> = None;
         let area = egui::Area::new(egui::Id::new("emoji_picker"))
             .order(egui::Order::Foreground)
@@ -2068,7 +2132,7 @@ impl App {
             .constrain(true)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(pal.side)
+                    .fill(solid)
                     .rounding(12.0)
                     .stroke(Stroke::new(1.0, pal.border))
                     .inner_margin(Margin::same(10.0))
@@ -2168,11 +2232,84 @@ impl App {
         }
     }
 
+    fn stage_tiles(&mut self, ctx: &egui::Context) -> Option<Vec<Tile>> {
+        let vc = self.voice.clone()?;
+        if !self.stage_open {
+            return None;
+        }
+        let visible = match vc.guild_id {
+            None => self.sel_channel == Some(vc.channel_id),
+            Some(g) => self.sel_guild == Some(g),
+        };
+        if !visible {
+            return None;
+        }
+        let mut members: Vec<VoiceMember> = self
+            .voice_members
+            .get(&vc.channel_id)
+            .cloned()
+            .unwrap_or_default();
+        if !members.iter().any(|m| m.user_id == self.me_id) {
+            members.insert(
+                0,
+                VoiceMember {
+                    user_id: self.me_id,
+                    channel_id: vc.channel_id,
+                    muted: self.self_mute,
+                    deafened: self.self_deaf,
+                    name: Some(self.me_name.clone()),
+                    avatar: self.me_avatar.clone(),
+                },
+            );
+        }
+        let dm = self.dms.iter().find(|d| d.id == vc.channel_id).cloned();
+        let mut tiles = Vec::new();
+        for m in members {
+            let (mut name, mut avatar) = (m.name.clone(), m.avatar.clone());
+            if m.user_id == self.me_id {
+                name = Some(self.me_name.clone());
+                avatar = self.me_avatar.clone();
+            } else if let Some(d) = &dm {
+                if let Some((uid, a)) = &d.avatar {
+                    if *uid == m.user_id {
+                        name = name.or_else(|| Some(d.name.clone()));
+                        avatar = avatar.or_else(|| a.clone());
+                    }
+                }
+            }
+            let name = name.unwrap_or_else(|| match vc.guild_id {
+                Some(g) => member_name(&self.member_lists, g, m.user_id),
+                None => "Участник".into(),
+            });
+            let tex = match (&avatar, self.settings.load_avatars) {
+                (Some(h), true) => {
+                    let url = format!(
+                        "https://cdn.discordapp.com/avatars/{}/{h}.png?size=128",
+                        m.user_id
+                    );
+                    self.media.get(ctx, &self.cmd, &url, &url, 128, false)
+                }
+                _ => None,
+            };
+            let me = m.user_id == self.me_id;
+            tiles.push(Tile {
+                id: m.user_id,
+                name,
+                tex,
+                muted: if me { self.self_mute } else { m.muted },
+                deafened: if me { self.self_deaf } else { m.deafened },
+                speaking: self.speaking.contains(&m.user_id),
+            });
+        }
+        Some(tiles)
+    }
+
     fn call_ui(&mut self, ctx: &egui::Context) {
         let Some(cid) = self.incoming_call else {
             return;
         };
         let pal = self.pal;
+        let solid = self.solid();
         let name = self
             .dms
             .iter()
@@ -2187,7 +2324,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(pal.side)
+                    .fill(solid)
                     .rounding(pal.radius + 6.0)
                     .stroke(Stroke::new(1.5, mix(pal.border, pal.ok, pulse)))
                     .inner_margin(Margin::same(16.0))
@@ -2241,6 +2378,7 @@ impl App {
             return;
         };
         let pal = self.pal;
+        let solid = self.solid();
         let mut decision: Option<bool> = None;
         egui::Window::new(RichText::new("Удалить сообщение?").strong())
             .collapsible(false)
@@ -2248,7 +2386,7 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::window(&ctx.style())
-                    .fill(pal.side)
+                    .fill(solid)
                     .inner_margin(Margin::same(18.0)),
             )
             .show(ctx, |ui| {
@@ -2310,6 +2448,20 @@ impl App {
         let mut logout = false;
         let mut apply_zoom = false;
         let (images, frames) = self.media.stats();
+        if self.devices.is_none() {
+            self.devices = Some(audio::list_devices());
+        }
+        let testing = self.mic_test.is_some();
+        let test_level = match &self.mic_test {
+            Some(a) => a.level(),
+            None => self.mic_level,
+        };
+        if testing || self.voice.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        let mut refresh_devices = false;
+        let mut toggle_test = false;
+        let solid = self.solid();
 
         egui::Window::new(RichText::new("Настройки").strong())
             .open(&mut open)
@@ -2319,7 +2471,7 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::window(&ctx.style())
-                    .fill(pal.side)
+                    .fill(solid)
                     .inner_margin(Margin::same(18.0)),
             )
             .show(ctx, |ui| {
@@ -2342,7 +2494,23 @@ impl App {
                                 );
                                 let rr = 10.0;
                                 let p = ui.painter();
-                                p.rect_filled(rect, rr, preview.main);
+                                match theme::backdrop(theme) {
+                                    Some(bd) => {
+                                        p.rect_filled(rect, rr, bd.base);
+                                        let pc = ui.painter_at(rect);
+                                        for (k, c) in bd.glows.iter().enumerate() {
+                                            let pos = rect.min
+                                                + vec2(
+                                                    20.0 + k as f32 * 42.0,
+                                                    24.0 + (k % 2) as f32 * 30.0,
+                                                );
+                                            glow(&pc, pos, 46.0, c.gamma_multiply(0.7));
+                                        }
+                                    }
+                                    None => {
+                                        p.rect_filled(rect, rr, preview.main);
+                                    }
+                                }
                                 p.rect_filled(
                                     Rect::from_min_size(rect.min, vec2(30.0, rect.height())),
                                     Rounding {
@@ -2444,6 +2612,12 @@ impl App {
                             &mut self.settings.compact,
                             "Компактные сообщения (без аватарок, плотнее)",
                         );
+                        if theme::backdrop(self.settings.theme).is_some() {
+                            ui.checkbox(
+                                &mut self.settings.animate_background,
+                                "Анимировать фон (чуть больше нагрузка на видеокарту)",
+                            );
+                        }
 
                         section(ui, &pal, "Картинки и медиа");
                         ui.checkbox(
@@ -2462,6 +2636,95 @@ impl App {
                             .small()
                             .color(pal.faint),
                         );
+
+                        section(ui, &pal, "Голос");
+                        let (ins, outs) = self.devices.clone().unwrap_or_default();
+                        let default_name = "По умолчанию (системное)".to_string();
+                        ui.label(RichText::new("Микрофон").color(pal.muted));
+                        #[allow(deprecated)]
+                        egui::ComboBox::from_id_source("input_device")
+                            .width(390.0)
+                            .selected_text(
+                                self.settings
+                                    .input_device
+                                    .clone()
+                                    .unwrap_or(default_name.clone()),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.input_device,
+                                    None,
+                                    default_name.as_str(),
+                                );
+                                for n in &ins {
+                                    ui.selectable_value(
+                                        &mut self.settings.input_device,
+                                        Some(n.clone()),
+                                        n.as_str(),
+                                    );
+                                }
+                            });
+                        ui.label(RichText::new("Наушники / динамики").color(pal.muted));
+                        #[allow(deprecated)]
+                        egui::ComboBox::from_id_source("output_device")
+                            .width(390.0)
+                            .selected_text(
+                                self.settings
+                                    .output_device
+                                    .clone()
+                                    .unwrap_or(default_name.clone()),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.output_device,
+                                    None,
+                                    default_name.as_str(),
+                                );
+                                for n in &outs {
+                                    ui.selectable_value(
+                                        &mut self.settings.output_device,
+                                        Some(n.clone()),
+                                        n.as_str(),
+                                    );
+                                }
+                            });
+                        if ui.small_button("Обновить список устройств").clicked()
+                        {
+                            refresh_devices = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Громкость микрофона").color(pal.muted));
+                        level_meter(ui, &pal, test_level, self.settings.mic_threshold, 10.0);
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.mic_threshold, 0.001..=0.06)
+                                .logarithmic(true)
+                                .show_value(false)
+                                .text("порог чувствительности"),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Когда вы говорите, полоска должна заходить за белую отметку, \
+                                 а в тишине оставаться левее неё.",
+                            )
+                            .small()
+                            .color(pal.faint),
+                        );
+                        ui.checkbox(
+                            &mut self.settings.always_transmit,
+                            "Передавать всегда (без детектора речи)",
+                        );
+                        ui.checkbox(
+                            &mut self.settings.echo_guard,
+                            "Подавлять эхо (если вы без наушников)",
+                        );
+                        let label = if testing {
+                            "■ Остановить проверку"
+                        } else {
+                            "▶ Проверить микрофон (вы услышите себя)"
+                        };
+                        if ui.button(label).clicked() {
+                            toggle_test = true;
+                        }
 
                         section(ui, &pal, "Память");
                         ui.add(
@@ -2521,6 +2784,24 @@ impl App {
             });
 
         self.settings_open = open;
+        if refresh_devices {
+            self.devices = None;
+        }
+        let devices_changed = before.input_device != self.settings.input_device
+            || before.output_device != self.settings.output_device;
+        if toggle_test || (testing && devices_changed) || !open {
+            let was = self.mic_test.take().is_some();
+            if open && (!was || devices_changed) {
+                match audio::Audio::start(
+                    self.settings.input_device.clone(),
+                    self.settings.output_device.clone(),
+                    true,
+                ) {
+                    Ok(a) => self.mic_test = Some(a),
+                    Err(e) => self.toast(format!("Проверка микрофона: {e}"), true),
+                }
+            }
+        }
         if apply_zoom {
             self.settings.zoom = self.pending_zoom;
             ctx.set_zoom_factor(self.settings.zoom);
@@ -2545,6 +2826,7 @@ impl App {
             self.toast = None;
         }
         let pal = self.pal;
+        let solid = self.solid();
         let slide = self.toast.as_ref().map_or(0.0, |(_, at, _)| {
             let k = (at.elapsed().as_secs_f32() / 0.22).min(1.0);
             let ease = 1.0 - (1.0 - k).powi(3);
@@ -2560,7 +2842,7 @@ impl App {
                 .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::none()
-                        .fill(pal.elevated)
+                        .fill(solid)
                         .rounding(10.0)
                         .stroke(Stroke::new(
                             1.0,
@@ -2580,6 +2862,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
+        if let Some(bd) = theme::backdrop(self.settings.theme) {
+            paint_backdrop(ctx, &bd, self.settings.animate_background);
+        }
         self.refresh_memory(ctx);
         match self.screen {
             Screen::Login => self.login_ui(ctx),
@@ -3939,4 +4224,252 @@ fn voice_button(
     );
     resp.on_hover_text(tip)
         .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn voice_opts(s: &Settings) -> voice::VoiceOpts {
+    voice::VoiceOpts {
+        input: s.input_device.clone(),
+        output: s.output_device.clone(),
+        threshold: s.mic_threshold,
+        always: s.always_transmit,
+        echo_guard: s.echo_guard,
+    }
+}
+
+/// Мягкое светящееся пятно (радиальный градиент).
+fn glow(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    let segments = 48u32;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    let mid = color.gamma_multiply(0.45);
+    for i in 0..segments {
+        let a = i as f32 / segments as f32 * std::f32::consts::TAU;
+        let dir = vec2(a.cos(), a.sin());
+        mesh.colored_vertex(center + dir * radius * 0.5, mid);
+        mesh.colored_vertex(center + dir * radius, Color32::TRANSPARENT);
+    }
+    for i in 0..segments {
+        let a = 1 + 2 * i;
+        let b = 1 + 2 * ((i + 1) % segments);
+        mesh.add_triangle(0, a, b);
+        mesh.add_triangle(a, a + 1, b + 1);
+        mesh.add_triangle(a, b + 1, b);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Живой фон анимированных тем: медленно плывущие цветные пятна под полупрозрачными панелями.
+fn paint_backdrop(ctx: &egui::Context, bd: &theme::Backdrop, animate: bool) {
+    let screen = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    painter.rect_filled(screen, 0.0, bd.base);
+    let t = if animate { ctx.input(|i| i.time) } else { 40.0 };
+    let size = screen.size();
+    let m = size.x.max(size.y);
+    for (i, c) in bd.glows.iter().enumerate() {
+        let fi = i as f64;
+        let speed = 0.05 + 0.025 * fi;
+        let cx = 0.5 + 0.38 * (t * speed + fi * 2.1).sin();
+        let cy = 0.5 + 0.36 * (t * speed * 0.8 + fi * 1.3).cos();
+        let r = m * (0.42 + 0.08 * (t * 0.21 + fi).sin() as f32);
+        glow(
+            &painter,
+            screen.min + vec2(cx as f32 * size.x, cy as f32 * size.y),
+            r,
+            c.gamma_multiply(0.55),
+        );
+    }
+    if animate {
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+/// Полоска громкости микрофона с отметкой порога.
+fn level_meter(ui: &mut egui::Ui, pal: &Palette, level: f32, threshold: f32, height: f32) {
+    let scale = |x: f32| ((x.max(1e-5).log10() + 4.0) / 3.0).clamp(0.0, 1.0);
+    let width = ui.available_width().min(390.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter().rect_filled(rect, height / 2.0, pal.elevated);
+    let v = scale(level);
+    let fill = Rect::from_min_size(rect.min, vec2(rect.width() * v, rect.height()));
+    let color = if level > threshold { pal.ok } else { pal.muted };
+    ui.painter().rect_filled(fill, height / 2.0, color);
+    let x = rect.left() + rect.width() * scale(threshold);
+    ui.painter().vline(
+        x,
+        rect.top() - 2.0..=rect.bottom() + 2.0,
+        Stroke::new(2.0, pal.text),
+    );
+}
+
+struct Tile {
+    id: u64,
+    name: String,
+    tex: Option<(TextureId, Vec2)>,
+    muted: bool,
+    deafened: bool,
+    speaking: bool,
+}
+
+/// Окно звонка: плитки участников и панель управления.
+fn draw_stage(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    rect: Rect,
+    tiles: &[Tile],
+    mute: bool,
+    deaf: bool,
+    actions: &mut Vec<Action>,
+) {
+    let bar_h = 60.0;
+    let area = Rect::from_min_max(rect.min + vec2(14.0, 12.0), rect.max - vec2(14.0, bar_h));
+    let n = tiles.len().max(1);
+    let gap = 10.0;
+    // подбираем сетку, при которой плитки 16:9 получаются самыми крупными
+    let mut best = (1usize, 0.0f32, 0.0f32);
+    for cols in 1..=n {
+        let rows = (n + cols - 1) / cols;
+        let w = (area.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        let h = (area.height() - gap * (rows as f32 - 1.0)) / rows as f32;
+        let (tw, th) = if w / h > 16.0 / 9.0 {
+            (h * 16.0 / 9.0, h)
+        } else {
+            (w, w * 9.0 / 16.0)
+        };
+        if tw > best.1 {
+            best = (cols, tw, th);
+        }
+    }
+    let (cols, tw, th) = best;
+    let rows = (n + cols - 1) / cols;
+    let total_h = rows as f32 * th + (rows as f32 - 1.0) * gap;
+    for (i, t) in tiles.iter().enumerate() {
+        let row = i / cols;
+        let col = i % cols;
+        let in_row = if row == rows - 1 {
+            n - row * cols
+        } else {
+            cols
+        };
+        let row_w = in_row as f32 * tw + (in_row as f32 - 1.0) * gap;
+        let x = area.center().x - row_w / 2.0 + col as f32 * (tw + gap);
+        let y = area.center().y - total_h / 2.0 + row as f32 * (th + gap);
+        let tile = Rect::from_min_size(pos2(x, y), vec2(tw, th));
+        let r = pal.radius + 2.0;
+        let bg = mix(
+            Color32::from_gray(if pal.light { 210 } else { 34 }),
+            name_color(t.id),
+            0.4,
+        );
+        ui.painter().rect_filled(tile, r, bg);
+        let d = (th * 0.42).min(120.0);
+        let ar = Rect::from_center_size(tile.center() - vec2(0.0, th * 0.04), vec2(d, d));
+        paint_avatar(ui, ar, t.tex, t.id, &t.name);
+        // имя в «таблетке» снизу слева
+        let galley =
+            ui.painter()
+                .layout_no_wrap(t.name.clone(), FontId::proportional(13.5), Color32::WHITE);
+        let pill = Rect::from_min_size(
+            tile.left_bottom() + vec2(10.0, -galley.size().y - 18.0),
+            galley.size() + vec2(16.0, 8.0),
+        );
+        ui.painter()
+            .rect_filled(pill, 8.0, Color32::from_black_alpha(150));
+        ui.painter()
+            .galley(pill.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+        let icon = match (t.deafened, t.muted) {
+            (true, _) => "🎧",
+            (false, true) => "🔇",
+            _ => "",
+        };
+        if !icon.is_empty() {
+            let ir = Rect::from_min_size(tile.right_top() + vec2(-38.0, 10.0), vec2(28.0, 28.0));
+            ui.painter()
+                .circle_filled(ir.center(), 14.0, Color32::from_black_alpha(150));
+            ui.painter().text(
+                ir.center(),
+                Align2::CENTER_CENTER,
+                icon,
+                FontId::proportional(14.0),
+                pal.danger,
+            );
+        }
+        let g =
+            ui.ctx()
+                .animate_bool_with_time(egui::Id::new(("stage_talk", t.id)), t.speaking, 0.15);
+        if g > 0.01 {
+            ui.painter()
+                .rect_stroke(tile, r, Stroke::new(3.0, pal.ok.gamma_multiply(g)));
+        }
+    }
+
+    // панель управления
+    let buttons: [(&str, &str, bool, Color32); 4] = [
+        (
+            if mute { "🔇" } else { "🎤" },
+            if mute {
+                "Включить микрофон"
+            } else {
+                "Выключить микрофон"
+            },
+            mute,
+            pal.danger,
+        ),
+        (
+            "🎧",
+            if deaf {
+                "Включить звук"
+            } else {
+                "Выключить звук"
+            },
+            deaf,
+            pal.danger,
+        ),
+        ("🖥", "Демонстрация экрана — скоро", false, pal.faint),
+        ("✆", "Отключиться", true, pal.danger),
+    ];
+    let bw = 52.0;
+    let total = buttons.len() as f32 * bw + (buttons.len() as f32 - 1.0) * 12.0;
+    let mut x = rect.center().x - total / 2.0;
+    let y = rect.bottom() - bar_h / 2.0 - 4.0;
+    for (i, (glyph, tip, active, color)) in buttons.iter().enumerate() {
+        let r = Rect::from_center_size(pos2(x + bw / 2.0, y), vec2(bw, 44.0));
+        let resp = ui.interact(r, ui.id().with(("stage_btn", i)), Sense::click());
+        let fill = if i == 3 || *active {
+            if resp.hovered() {
+                mix(*color, Color32::WHITE, 0.15)
+            } else {
+                *color
+            }
+        } else if resp.hovered() {
+            pal.hover
+        } else {
+            pal.elevated
+        };
+        ui.painter().rect_filled(r, 22.0, fill);
+        let fg = if i == 3 || *active {
+            Color32::WHITE
+        } else {
+            pal.text
+        };
+        ui.painter().text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            *glyph,
+            FontId::proportional(18.0),
+            fg,
+        );
+        let resp = resp
+            .on_hover_text(*tip)
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            match i {
+                0 => actions.push(Action::ToggleMute),
+                1 => actions.push(Action::ToggleDeaf),
+                3 => actions.push(Action::LeaveVoice),
+                _ => {}
+            }
+        }
+        x += bw + 12.0;
+    }
 }

@@ -5,7 +5,7 @@
 //! (в Windows они не переносятся между потоками), наружу отдаются только очереди.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,6 +66,7 @@ pub struct Audio {
     pub playback: Playback,
     pub has_mic: bool,
     stop: Arc<AtomicBool>,
+    level: Arc<AtomicU32>,
 }
 
 impl Drop for Audio {
@@ -106,6 +107,8 @@ fn pick_config(
 fn build_input(
     device: &cpal::Device,
     capture: Arc<Mutex<VecDeque<f32>>>,
+    level: Arc<AtomicU32>,
+    monitor: Option<Playback>,
 ) -> Result<cpal::Stream, String> {
     let fallback = device.default_input_config().map_err(|e| e.to_string())?;
     let configs: Vec<_> = device
@@ -136,6 +139,16 @@ fn build_input(
         }
         out.clear();
         resampler.process(&mono, &mut out);
+        if !out.is_empty() {
+            let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+            level.store(rms.to_bits(), Ordering::Relaxed);
+        }
+        if let Some(pb) = &monitor {
+            // проверка микрофона: слышите себя
+            let stereo: Vec<f32> = out.iter().flat_map(|s| [*s, *s]).collect();
+            push_playback(pb, 0, &stereo);
+            return;
+        }
         if let Ok(mut q) = capture.lock() {
             q.extend(out.iter().copied());
             while q.len() > MAX_CAPTURE {
@@ -280,20 +293,68 @@ fn build_output(device: &cpal::Device, playback: Playback) -> Result<cpal::Strea
     Ok(stream)
 }
 
+/// Названия микрофонов и устройств вывода.
+pub fn list_devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let inputs = host
+        .input_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    let outputs = host
+        .output_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    (inputs, outputs)
+}
+
+fn find_input(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let Some(n) = name {
+        if let Ok(mut it) = host.input_devices() {
+            if let Some(d) = it.find(|d| d.name().map(|x| x == n).unwrap_or(false)) {
+                return Some(d);
+            }
+        }
+    }
+    host.default_input_device()
+}
+
+fn find_output(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
+    if let Some(n) = name {
+        if let Ok(mut it) = host.output_devices() {
+            if let Some(d) = it.find(|d| d.name().map(|x| x == n).unwrap_or(false)) {
+                return Some(d);
+            }
+        }
+    }
+    host.default_output_device()
+}
+
 impl Audio {
     /// Запускает микрофон и динамики. Без микрофона звонок работает только на приём.
-    pub fn start() -> Result<Audio, String> {
+    /// monitor = проверка микрофона: звук с микрофона сразу идёт в наушники.
+    pub fn start(
+        input: Option<String>,
+        output: Option<String>,
+        monitor: bool,
+    ) -> Result<Audio, String> {
         let capture = Arc::new(Mutex::new(VecDeque::new()));
         let playback: Playback = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let level = Arc::new(AtomicU32::new(0));
         let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
 
-        let (cap, pb, st) = (capture.clone(), playback.clone(), stop.clone());
+        let (cap, pb, st, lv) = (
+            capture.clone(),
+            playback.clone(),
+            stop.clone(),
+            level.clone(),
+        );
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
                 let host = cpal::default_host();
-                let output = match host.default_output_device() {
+                let monitor_pb = monitor.then(|| pb.clone());
+                let output = match find_output(&host, output.as_deref()) {
                     Some(d) => d,
                     None => {
                         let _ = tx.send(Err("не найдено устройство вывода звука".into()));
@@ -309,14 +370,15 @@ impl Audio {
                 };
                 let _ = out_stream.play();
                 let in_stream =
-                    host.default_input_device()
-                        .and_then(|d| match build_input(&d, cap) {
+                    find_input(&host, input.as_deref()).and_then(|d| {
+                        match build_input(&d, cap, lv, monitor_pb) {
                             Ok(s) => Some(s),
                             Err(e) => {
                                 crate::store::log(&format!("микрофон недоступен: {e}"));
                                 None
                             }
-                        });
+                        }
+                    });
                 if let Some(s) = &in_stream {
                     let _ = s.play();
                 }
@@ -337,7 +399,13 @@ impl Audio {
             playback,
             has_mic,
             stop,
+            level,
         })
+    }
+
+    /// Текущая громкость микрофона (RMS, 0..1).
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     /// Забирает ровно 960 сэмплов (20 мс) с микрофона, если они накопились.
