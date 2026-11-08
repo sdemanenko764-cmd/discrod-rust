@@ -11,6 +11,9 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # Новый CMake не собирает старый CMakeLists кодека Opus без этой настройки
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
