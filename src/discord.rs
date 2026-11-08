@@ -67,6 +67,7 @@ pub struct VoiceMember {
     pub channel_id: u64,
     pub muted: bool,
     pub deafened: bool,
+    pub streaming: bool,
     pub name: Option<String>,
     pub avatar: Option<String>,
 }
@@ -93,6 +94,19 @@ pub(crate) enum VoiceSignal {
     Server {
         token: String,
         endpoint: String,
+    },
+    StreamCreate {
+        key: String,
+        rtc_server_id: u64,
+    },
+    StreamServer {
+        key: String,
+        token: String,
+        endpoint: String,
+    },
+    StreamDelete {
+        key: String,
+        reason: Option<String>,
     },
 }
 
@@ -298,6 +312,10 @@ pub enum Cmd {
     RingCall(u64),
     DeclineCall(u64),
     VoiceOptions(crate::voice::VoiceOpts),
+    StartStream(crate::stream::SendCfg),
+    StopStream,
+    WatchStream(String),
+    StopWatching,
     Login(Auth),
     Logout,
     FetchMessages {
@@ -426,6 +444,18 @@ pub enum Event {
     CallEnded {
         channel_id: u64,
     },
+    /// Наша трансляция пошла в эфир (отправлен первый кадр).
+    StreamLive {
+        key: String,
+    },
+    StreamFrame {
+        key: String,
+        image: egui::ColorImage,
+    },
+    StreamEnded {
+        key: String,
+        error: Option<String>,
+    },
     Info(String),
     Error(String),
     Fatal(String),
@@ -529,6 +559,8 @@ struct RawVoiceState {
     #[serde(default)]
     deaf: bool,
     #[serde(default)]
+    self_stream: bool,
+    #[serde(default)]
     member: Option<RawTypingMember>,
 }
 
@@ -550,10 +582,25 @@ impl RawVoiceState {
             channel_id,
             muted: self.self_mute || self.mute,
             deafened: self.self_deaf || self.deaf,
+            streaming: self.self_stream,
             name,
             avatar,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct RawStream {
+    #[serde(default)]
+    stream_key: String,
+    #[serde(default)]
+    rtc_server_id: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1304,6 +1351,12 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
             Cmd::SetMute(m) => voice.set_flags(Some(m), None, &gateway_out),
             Cmd::SetDeaf(d) => voice.set_flags(None, Some(d), &gateway_out),
             Cmd::VoiceOptions(o) => voice.set_options(o),
+            Cmd::StartStream(cfg) => {
+                voice.start_stream(cfg, &gateway_out, &sink, proxy_now.clone())
+            }
+            Cmd::StopStream => voice.stop_stream(&gateway_out, &sink),
+            Cmd::WatchStream(key) => voice.watch(key, &gateway_out, &sink),
+            Cmd::StopWatching => voice.stop_watching(&gateway_out, &sink),
             Cmd::RingCall(channel_id) | Cmd::DeclineCall(channel_id) if auth.is_some() => {
                 let ring = matches!(cmd, Cmd::RingCall(_));
                 let a = auth.clone().unwrap();
@@ -2199,6 +2252,7 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 channel_id: 0,
                 muted: false,
                 deafened: false,
+                streaming: false,
                 name: None,
                 avatar: None,
             });
@@ -2235,6 +2289,32 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 ringing: c.ringing.iter().any(|id| sid(id) == me),
             });
         }
+        "STREAM_CREATE" => {
+            let v: RawStream = serde_json::from_str(d)?;
+            if let Some(rtc) = v.rtc_server_id.as_deref().map(sid) {
+                voice_signal(VoiceSignal::StreamCreate {
+                    key: v.stream_key,
+                    rtc_server_id: rtc,
+                });
+            }
+        }
+        "STREAM_SERVER_UPDATE" => {
+            let v: RawStream = serde_json::from_str(d)?;
+            if let Some(endpoint) = v.endpoint.filter(|e| !e.is_empty()) {
+                voice_signal(VoiceSignal::StreamServer {
+                    key: v.stream_key,
+                    token: v.token.unwrap_or_default(),
+                    endpoint,
+                });
+            }
+        }
+        "STREAM_DELETE" => {
+            let v: RawStream = serde_json::from_str(d)?;
+            voice_signal(VoiceSignal::StreamDelete {
+                key: v.stream_key,
+                reason: v.reason,
+            });
+        }
         "CALL_DELETE" => {
             let c: RawCall = serde_json::from_str(d)?;
             sink.send(Event::CallEnded {
@@ -2267,6 +2347,42 @@ struct VoiceManager {
     mute: bool,
     deaf: bool,
     opts: Option<crate::voice::VoiceOpts>,
+    /// Наша трансляция.
+    outgoing: Option<StreamSlot>,
+    /// Трансляция, которую мы смотрим.
+    watching: Option<StreamSlot>,
+}
+
+struct StreamSlot {
+    key: String,
+    send: Option<crate::stream::SendCfg>,
+    rtc_server_id: Option<u64>,
+    server: Option<(String, String)>,
+    conn: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamSlot {
+    fn new(key: String, send: Option<crate::stream::SendCfg>) -> Self {
+        Self {
+            key,
+            send,
+            rtc_server_id: None,
+            server: None,
+            conn: None,
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(h) = self.conn.take() {
+            h.abort();
+        }
+    }
+}
+
+fn gw_send(out: &Option<UnboundedSender<String>>, v: serde_json::Value) {
+    if let Some(out) = out {
+        let _ = out.send(v.to_string());
+    }
 }
 
 impl VoiceManager {
@@ -2323,6 +2439,8 @@ impl VoiceManager {
     }
 
     fn leave(&mut self, out: &Option<UnboundedSender<String>>, sink: &Sink) {
+        self.stop_watching(out, sink);
+        self.stop_stream(out, sink);
         self.stop_conn();
         if let Some((guild, _)) = self.target.take() {
             self.send_state(out, guild, None);
@@ -2353,7 +2471,195 @@ impl VoiceManager {
         }
     }
 
+    fn stream_key(&self) -> Option<String> {
+        let (guild, channel) = self.target?;
+        let me = ME.load(std::sync::atomic::Ordering::Relaxed);
+        Some(match guild {
+            Some(g) => format!("guild:{g}:{channel}:{me}"),
+            None => format!("call:{channel}:{me}"),
+        })
+    }
+
+    fn start_stream(
+        &mut self,
+        cfg: crate::stream::SendCfg,
+        out: &Option<UnboundedSender<String>>,
+        sink: &Sink,
+        proxy: Option<Proxy>,
+    ) {
+        let (Some((guild, channel)), Some(key)) = (self.target, self.stream_key()) else {
+            sink.send(Event::Error(
+                "Сначала зайдите в голосовой канал или звонок".into(),
+            ));
+            return;
+        };
+        if let Some(slot) = &mut self.outgoing {
+            if slot.key == key {
+                // трансляция уже идёт — перезапускаем только захват с новыми настройками
+                slot.send = Some(cfg);
+                slot.stop();
+                self.spawn_streams(sink, proxy);
+                return;
+            }
+        }
+        self.stop_stream(out, sink);
+        gw_send(
+            out,
+            json!({
+                "op": 18,
+                "d": {
+                    "type": if guild.is_some() { "guild" } else { "call" },
+                    "guild_id": guild.map(|g| g.to_string()),
+                    "channel_id": channel.to_string(),
+                    "preferred_region": null
+                }
+            }),
+        );
+        gw_send(
+            out,
+            json!({ "op": 22, "d": { "stream_key": key, "paused": false } }),
+        );
+        self.outgoing = Some(StreamSlot::new(key, Some(cfg)));
+    }
+
+    fn stop_stream(&mut self, out: &Option<UnboundedSender<String>>, sink: &Sink) {
+        if let Some(mut slot) = self.outgoing.take() {
+            slot.stop();
+            gw_send(out, json!({ "op": 19, "d": { "stream_key": slot.key } }));
+            sink.send(Event::StreamEnded {
+                key: slot.key,
+                error: None,
+            });
+        }
+    }
+
+    fn watch(&mut self, key: String, out: &Option<UnboundedSender<String>>, sink: &Sink) {
+        if self.target.is_none() {
+            sink.send(Event::Error(
+                "Чтобы смотреть трансляцию, зайдите в этот голосовой канал".into(),
+            ));
+            return;
+        }
+        if self.watching.as_ref().map_or(false, |w| w.key == key) {
+            return;
+        }
+        self.stop_watching(out, sink);
+        gw_send(out, json!({ "op": 20, "d": { "stream_key": key } }));
+        self.watching = Some(StreamSlot::new(key, None));
+    }
+
+    fn stop_watching(&mut self, out: &Option<UnboundedSender<String>>, sink: &Sink) {
+        if let Some(mut slot) = self.watching.take() {
+            slot.stop();
+            gw_send(out, json!({ "op": 19, "d": { "stream_key": slot.key } }));
+            sink.send(Event::StreamEnded {
+                key: slot.key,
+                error: None,
+            });
+        }
+    }
+
+    fn spawn_streams(&mut self, sink: &Sink, proxy: Option<Proxy>) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let me = ME.load(std::sync::atomic::Ordering::Relaxed);
+        for slot in [self.outgoing.as_mut(), self.watching.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if slot.conn.is_some() {
+                continue;
+            }
+            let (Some(rtc), Some((token, endpoint))) = (slot.rtc_server_id, slot.server.clone())
+            else {
+                continue;
+            };
+            let params = crate::stream::StreamParams {
+                key: slot.key.clone(),
+                rtc_server_id: rtc,
+                user_id: me,
+                session_id: session_id.clone(),
+                token,
+                endpoint,
+            };
+            let role = match slot.send {
+                Some(cfg) => crate::stream::Role::Send(cfg),
+                None => crate::stream::Role::Watch,
+            };
+            slot.conn = Some(tokio::spawn(crate::stream::run(
+                params,
+                role,
+                proxy.clone(),
+                sink.clone(),
+            )));
+        }
+    }
+
+    fn on_stream_signal(&mut self, sig: VoiceSignal, sink: &Sink, proxy: Option<Proxy>) {
+        let key = match &sig {
+            VoiceSignal::StreamCreate { key, .. }
+            | VoiceSignal::StreamServer { key, .. }
+            | VoiceSignal::StreamDelete { key, .. } => key.clone(),
+            _ => return,
+        };
+        let is_out = self.outgoing.as_ref().map_or(false, |s| s.key == key);
+        let is_watch = self.watching.as_ref().map_or(false, |s| s.key == key);
+        if !is_out && !is_watch {
+            return;
+        }
+        let slot = if is_out {
+            self.outgoing.as_mut()
+        } else {
+            self.watching.as_mut()
+        };
+        let Some(slot) = slot else { return };
+        match sig {
+            VoiceSignal::StreamCreate { rtc_server_id, .. } => {
+                if slot.rtc_server_id != Some(rtc_server_id) {
+                    slot.stop();
+                }
+                slot.rtc_server_id = Some(rtc_server_id);
+            }
+            VoiceSignal::StreamServer {
+                token, endpoint, ..
+            } => {
+                slot.stop();
+                slot.server = Some((token, endpoint));
+            }
+            VoiceSignal::StreamDelete { reason, .. } => {
+                slot.stop();
+                if is_out {
+                    self.outgoing = None;
+                } else {
+                    self.watching = None;
+                }
+                let error = match reason.as_deref() {
+                    None | Some("user_requested") | Some("stream_ended") => None,
+                    Some("unauthorized") => {
+                        Some("нет прав на трансляцию в этом канале".to_string())
+                    }
+                    Some("stream_full") => Some("трансляция заполнена".to_string()),
+                    Some(other) => Some(other.to_string()),
+                };
+                sink.send(Event::StreamEnded { key, error });
+                return;
+            }
+            _ => {}
+        }
+        self.spawn_streams(sink, proxy);
+    }
+
     fn on_signal(&mut self, sig: VoiceSignal, sink: &Sink, proxy: Option<Proxy>) {
+        if matches!(
+            sig,
+            VoiceSignal::StreamCreate { .. }
+                | VoiceSignal::StreamServer { .. }
+                | VoiceSignal::StreamDelete { .. }
+        ) {
+            self.on_stream_signal(sig, sink, proxy);
+            return;
+        }
         let Some((guild, channel)) = self.target else {
             return;
         };
@@ -2364,6 +2670,17 @@ impl VoiceManager {
             } => {
                 if channel_id.is_none() {
                     // нас отключили от канала (или мы вышли с другого устройства)
+                    for slot in [self.outgoing.take(), self.watching.take()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let mut slot = slot;
+                        slot.stop();
+                        sink.send(Event::StreamEnded {
+                            key: slot.key,
+                            error: None,
+                        });
+                    }
                     self.stop_conn();
                     self.target = None;
                     sink.send(Event::Voice(VoiceUi::Disconnected(None)));
@@ -2376,6 +2693,7 @@ impl VoiceManager {
                 self.stop_conn();
                 self.server = Some((token, endpoint));
             }
+            _ => {}
         }
         if self.conn.is_none() {
             if let (Some(session_id), Some((token, endpoint))) = (&self.session_id, &self.server) {
@@ -2390,7 +2708,7 @@ impl VoiceManager {
                 let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
                 let handle = tokio::spawn(crate::voice::run(
                     params,
-                    proxy,
+                    proxy.clone(),
                     sink.clone(),
                     ctl_rx,
                     self.mute,
@@ -2406,5 +2724,6 @@ impl VoiceManager {
                 self.conn = Some((handle, ctl_tx));
             }
         }
+        self.spawn_streams(sink, proxy);
     }
 }

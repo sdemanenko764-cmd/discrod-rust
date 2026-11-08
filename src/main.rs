@@ -20,6 +20,7 @@ mod media;
 mod net;
 mod settings;
 mod store;
+mod stream;
 mod theme;
 mod voice;
 
@@ -141,6 +142,11 @@ enum Action {
     CallDm(u64),
     AcceptCall(u64),
     DeclineCall(u64),
+    OpenStreamPicker,
+    StartStream,
+    StopStream,
+    WatchStream(u64),
+    StopWatching,
     SelectGuild(Option<u64>),
     OpenChannel(u64),
     ToggleCategory(u64),
@@ -210,6 +216,14 @@ struct App {
     mic_level: f32,
     devices: Option<(Vec<String>, Vec<String>)>,
     mic_test: Option<audio::Audio>,
+    /// мы транслируем экран (и пошли ли уже кадры)
+    streaming: bool,
+    stream_live: bool,
+    /// чью трансляцию смотрим: (ключ, id автора)
+    watching: Option<(String, u64)>,
+    stream_tex: Option<egui::TextureHandle>,
+    stream_picker: bool,
+    monitors: Vec<(String, u32, u32)>,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -276,6 +290,12 @@ impl App {
             mic_level: 0.0,
             devices: None,
             mic_test: None,
+            streaming: false,
+            stream_live: false,
+            watching: None,
+            stream_tex: None,
+            stream_picker: false,
+            monitors: Vec::new(),
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
@@ -759,6 +779,43 @@ impl App {
             Event::CallEnded { channel_id } => {
                 if self.incoming_call == Some(channel_id) {
                     self.incoming_call = None;
+                }
+            }
+            Event::StreamLive { .. } => {
+                if self.streaming && !self.stream_live {
+                    self.stream_live = true;
+                    self.toast("Вы в эфире — участники видят ваш экран", false);
+                }
+            }
+            Event::StreamFrame { key, image } => {
+                if self.watching.as_ref().map_or(false, |(k, _)| *k == key) {
+                    match &mut self.stream_tex {
+                        Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                        None => {
+                            self.stream_tex = Some(ctx.load_texture(
+                                "go_live",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ))
+                        }
+                    }
+                }
+            }
+            Event::StreamEnded { key, error } => {
+                let mine = key.ends_with(&format!(":{}", self.me_id));
+                if self.watching.as_ref().map_or(false, |(k, _)| *k == key) {
+                    self.watching = None;
+                    self.stream_tex = None;
+                    if let Some(e) = &error {
+                        self.toast(format!("Трансляция: {e}"), true);
+                    }
+                } else if mine && self.streaming {
+                    self.streaming = false;
+                    self.stream_live = false;
+                    match &error {
+                        Some(e) => self.toast(format!("Демонстрация экрана: {e}"), true),
+                        None => self.toast("Демонстрация экрана остановлена", false),
+                    }
                 }
             }
             Event::Info(t) => self.toast(t, false),
@@ -1845,7 +1902,19 @@ impl App {
 
         // --- сцена звонка ---
         let stage = self.stage_tiles(ctx);
-        let (self_mute, self_deaf) = (self.self_mute, self.self_deaf);
+        let stage_state = StageState {
+            mute: self.self_mute,
+            deaf: self.self_deaf,
+            me: self.me_id,
+            streaming: self.streaming,
+            live: self.stream_live,
+            watch: self.watching.as_ref().map(|(_, uid)| {
+                (
+                    *uid,
+                    self.stream_tex.as_ref().map(|t| (t.id(), t.size_vec2())),
+                )
+            }),
+        };
 
         // --- сообщения ---
         let force_bottom = self.scroll_until.map_or(false, |t| Instant::now() < t);
@@ -1877,10 +1946,15 @@ impl App {
             )
             .show(ctx, |ui| {
                 if let Some(tiles) = &stage {
-                    let h = (ui.available_height() * 0.55).clamp(240.0, 560.0);
+                    let share = if stage_state.watch.is_some() {
+                        0.78
+                    } else {
+                        0.55
+                    };
+                    let h = (ui.available_height() * share).clamp(240.0, 900.0);
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
-                    draw_stage(ui, &pal, rect, tiles, self_mute, self_deaf, &mut actions);
+                    draw_stage(ui, &pal, rect, tiles, &stage_state, &mut actions);
                 }
                 let Some(cid) = self.sel_channel else {
                     if stage.is_none() {
@@ -2144,6 +2218,59 @@ impl App {
                 let _ = self.cmd.send(Cmd::LeaveVoice);
                 self.voice = None;
                 self.speaking.clear();
+                self.streaming = false;
+                self.stream_live = false;
+                self.watching = None;
+                self.stream_tex = None;
+            }
+            Action::OpenStreamPicker => {
+                if self.pending.as_ref().map_or(false, |a| a.bot) {
+                    self.toast(
+                        "Discord не даёт ботам транслировать экран — войдите обычным аккаунтом",
+                        true,
+                    );
+                } else {
+                    self.monitors = stream::monitors();
+                    if self.monitors.is_empty() {
+                        self.toast("Не удалось найти мониторы для захвата", true);
+                    } else {
+                        if self.settings.stream_monitor >= self.monitors.len() {
+                            self.settings.stream_monitor = 0;
+                        }
+                        self.stream_picker = true;
+                    }
+                }
+            }
+            Action::StartStream => {
+                self.stream_picker = false;
+                settings::save(&self.settings);
+                self.streaming = true;
+                self.stream_live = false;
+                let _ = self.cmd.send(Cmd::StartStream(stream::SendCfg {
+                    monitor: self.settings.stream_monitor,
+                    height: self.settings.stream_height,
+                    fps: self.settings.stream_fps,
+                }));
+            }
+            Action::StopStream => {
+                let _ = self.cmd.send(Cmd::StopStream);
+            }
+            Action::WatchStream(user_id) => {
+                if let Some(vc) = &self.voice {
+                    let key = match vc.guild_id {
+                        Some(g) => format!("guild:{g}:{}:{user_id}", vc.channel_id),
+                        None => format!("call:{}:{user_id}", vc.channel_id),
+                    };
+                    self.stream_tex = None;
+                    self.watching = Some((key.clone(), user_id));
+                    self.stage_open = true;
+                    let _ = self.cmd.send(Cmd::WatchStream(key));
+                }
+            }
+            Action::StopWatching => {
+                self.watching = None;
+                self.stream_tex = None;
+                let _ = self.cmd.send(Cmd::StopWatching);
             }
             Action::ToggleMute => {
                 self.self_mute = !self.self_mute;
@@ -2365,6 +2492,7 @@ impl App {
                     channel_id: vc.channel_id,
                     muted: self.self_mute,
                     deafened: self.self_deaf,
+                    streaming: self.streaming,
                     name: Some(self.me_name.clone()),
                     avatar: self.me_avatar.clone(),
                 },
@@ -2405,9 +2533,138 @@ impl App {
                 muted: if me { self.self_mute } else { m.muted },
                 deafened: if me { self.self_deaf } else { m.deafened },
                 speaking: self.speaking.contains(&m.user_id),
+                streaming: if me { self.streaming } else { m.streaming },
             });
         }
         Some(tiles)
+    }
+
+    fn stream_picker_ui(&mut self, ctx: &egui::Context) {
+        if !self.stream_picker {
+            return;
+        }
+        let pal = self.pal;
+        let solid = self.solid();
+        let mut start = false;
+        let mut open = true;
+        egui::Window::new(RichText::new("Демонстрация экрана").strong())
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(solid)
+                    .rounding(pal.radius + 6.0)
+                    .inner_margin(Margin::same(20.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(RichText::new("ЭКРАН").size(11.5).strong().color(pal.muted));
+                ui.add_space(4.0);
+                for (i, (name, w, h)) in self.monitors.iter().enumerate() {
+                    let selected = self.settings.stream_monitor == i;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
+                    let hov = ui
+                        .ctx()
+                        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    let fill = if selected {
+                        pal.accent.gamma_multiply(0.22)
+                    } else {
+                        mix(pal.elevated, pal.hover, hov)
+                    };
+                    ui.painter().rect_filled(rect, 12.0, fill);
+                    if selected {
+                        ui.painter()
+                            .rect_stroke(rect, 12.0, Stroke::new(1.5, pal.accent));
+                    }
+                    draw_icon(
+                        ui.painter(),
+                        Icon::Screen,
+                        rect.left_center() + vec2(28.0, 0.0),
+                        24.0,
+                        if selected { pal.accent } else { pal.muted },
+                        false,
+                    );
+                    ui.painter().text(
+                        rect.left_center() + vec2(56.0, -8.0),
+                        Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(14.5),
+                        pal.text,
+                    );
+                    ui.painter().text(
+                        rect.left_center() + vec2(56.0, 10.0),
+                        Align2::LEFT_CENTER,
+                        format!("{w} × {h}"),
+                        FontId::proportional(12.0),
+                        pal.muted,
+                    );
+                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        self.settings.stream_monitor = i;
+                    }
+                    ui.add_space(6.0);
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("КАЧЕСТВО")
+                        .size(11.5)
+                        .strong()
+                        .color(pal.muted),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for (h, label) in [(480u32, "480p"), (720, "720p"), (1080, "1080p")] {
+                        let on = self.settings.stream_height == h;
+                        if toggle_chip(ui, &pal, label, on).clicked() {
+                            self.settings.stream_height = h;
+                        }
+                    }
+                    ui.add_space(12.0);
+                    for fps in [15u32, 30, 60] {
+                        let on = self.settings.stream_fps == fps;
+                        if toggle_chip(ui, &pal, &format!("{fps} к/с"), on).clicked() {
+                            self.settings.stream_fps = fps;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Кодирование идёт на процессоре. Если компьютер слабый или интернет \
+                         медленный — выберите 720p и 30 к/с.",
+                    )
+                    .size(12.0)
+                    .color(pal.faint),
+                );
+                ui.add_space(12.0);
+                ui.vertical_centered_justified(|ui| {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(
+                                RichText::new("Начать трансляцию")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(pal.accent)
+                            .rounding(20.0),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if start {
+            self.handle_action(ctx, Action::StartStream);
+        } else if !open {
+            self.stream_picker = false;
+        }
     }
 
     fn call_ui(&mut self, ctx: &egui::Context) {
@@ -2995,6 +3252,7 @@ impl eframe::App for App {
             Screen::Main => self.main_ui(ctx),
         }
         self.call_ui(ctx);
+        self.stream_picker_ui(ctx);
         self.picker_ui(ctx);
         self.delete_ui(ctx);
         self.settings_ui(ctx);
@@ -4004,6 +4262,29 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str, tip: &str) -> egui
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// Переключатель-«таблетка» (выбранный подсвечен акцентом).
+fn toggle_chip(ui: &mut egui::Ui, pal: &Palette, text: &str, on: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(13.0),
+        if on { Color32::WHITE } else { pal.text },
+    );
+    let size = galley.size() + vec2(22.0, 12.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let fill = if on {
+        pal.accent
+    } else {
+        mix(pal.elevated, pal.hover, h)
+    };
+    ui.painter().rect_filled(rect, size.y / 2.0, fill);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 fn chip(ui: &mut egui::Ui, pal: &Palette, text: &str, color: Color32) {
     egui::Frame::none()
         .fill(pal.elevated)
@@ -4445,6 +4726,18 @@ struct Tile {
     muted: bool,
     deafened: bool,
     speaking: bool,
+    streaming: bool,
+}
+
+/// Состояние сцены, которое нужно для её отрисовки.
+struct StageState {
+    mute: bool,
+    deaf: bool,
+    me: u64,
+    streaming: bool,
+    live: bool,
+    /// смотрим трансляцию: (id автора, кадр)
+    watch: Option<(u64, Option<(TextureId, Vec2)>)>,
 }
 
 /// Окно звонка: плитки участников и панель управления.
@@ -4453,12 +4746,37 @@ fn draw_stage(
     pal: &Palette,
     rect: Rect,
     tiles: &[Tile],
-    mute: bool,
-    deaf: bool,
+    st: &StageState,
     actions: &mut Vec<Action>,
 ) {
     let bar_h = 86.0;
-    let area = Rect::from_min_max(rect.min + vec2(14.0, 12.0), rect.max - vec2(14.0, bar_h));
+    let mut area = Rect::from_min_max(rect.min + vec2(14.0, 12.0), rect.max - vec2(14.0, bar_h));
+    if let Some((owner, frame)) = st.watch {
+        // большая трансляция сверху, участники — узкой полосой под ней
+        let strip_h = if tiles.len() > 1 {
+            (area.height() * 0.2).clamp(64.0, 120.0)
+        } else {
+            0.0
+        };
+        let video = Rect::from_min_max(
+            area.min,
+            pos2(
+                area.max.x,
+                area.max.y - strip_h - if strip_h > 0.0 { 10.0 } else { 0.0 },
+            ),
+        );
+        let name = tiles
+            .iter()
+            .find(|t| t.id == owner)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "Участник".into());
+        draw_stream_view(ui, pal, video, &name, frame, actions);
+        area = Rect::from_min_max(pos2(area.min.x, area.max.y - strip_h), area.max);
+        if strip_h <= 0.0 {
+            draw_stage_bar(ui, pal, rect, bar_h, st, actions);
+            return;
+        }
+    }
     let n = tiles.len().max(1);
     let gap = 10.0;
     // подбираем сетку, при которой плитки 16:9 получаются самыми крупными
@@ -4537,7 +4855,152 @@ fn draw_stage(
             ui.painter()
                 .rect_stroke(tile, r, Stroke::new(3.0, pal.ok.gamma_multiply(g)));
         }
+        if t.streaming {
+            live_badge(
+                ui,
+                tile.left_top() + vec2(10.0, 10.0),
+                if t.id == st.me {
+                    "ВЫ В ЭФИРЕ"
+                } else {
+                    "В ЭФИРЕ"
+                },
+            );
+            if t.id != st.me {
+                let watching_this = st.watch.map_or(false, |(o, _)| o == t.id);
+                let resp = ui
+                    .interact(tile, ui.id().with(("watch_tile", t.id)), Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(if watching_this {
+                        "Вы уже смотрите"
+                    } else {
+                        "Смотреть трансляцию"
+                    });
+                if resp.hovered() && !watching_this {
+                    ui.painter()
+                        .rect_filled(tile, r, Color32::from_black_alpha(90));
+                    ui.painter().text(
+                        tile.center(),
+                        Align2::CENTER_CENTER,
+                        "▶  Смотреть",
+                        FontId::proportional(16.0),
+                        Color32::WHITE,
+                    );
+                }
+                if resp.clicked() && !watching_this {
+                    actions.push(Action::WatchStream(t.id));
+                }
+            }
+        }
     }
+    draw_stage_bar(ui, pal, rect, bar_h, st, actions);
+}
+
+/// Красная плашка «В ЭФИРЕ».
+fn live_badge(ui: &egui::Ui, at: egui::Pos2, text: &str) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), FontId::proportional(11.5), Color32::WHITE);
+    let r = Rect::from_min_size(at, galley.size() + vec2(14.0, 6.0));
+    ui.painter()
+        .rect_filled(r, 6.0, Color32::from_rgb(237, 66, 69));
+    ui.painter()
+        .galley(r.min + vec2(7.0, 3.0), galley, Color32::WHITE);
+}
+
+/// Окно просмотра чужой трансляции.
+fn draw_stream_view(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    rect: Rect,
+    name: &str,
+    frame: Option<(TextureId, Vec2)>,
+    actions: &mut Vec<Action>,
+) {
+    let r = pal.radius + 2.0;
+    ui.painter().rect_filled(rect, r, Color32::from_gray(8));
+    match frame {
+        Some((tex, size)) if size.x > 0.0 && size.y > 0.0 => {
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let img = Rect::from_center_size(rect.center(), size * scale);
+            ui.painter().image(
+                tex,
+                img,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        _ => {
+            let t = ui.input(|i| i.time) as f32;
+            let c = rect.center();
+            for k in 0..8 {
+                let a = t * 4.0 + k as f32 * std::f32::consts::TAU / 8.0;
+                let alpha = ((k as f32 + 1.0) / 8.0 * 220.0) as u8;
+                ui.painter().circle_filled(
+                    c + vec2(a.cos(), a.sin()) * 18.0 - vec2(0.0, 14.0),
+                    3.5,
+                    Color32::from_white_alpha(alpha),
+                );
+            }
+            ui.painter().text(
+                c + vec2(0.0, 24.0),
+                Align2::CENTER_CENTER,
+                "Подключаюсь к трансляции…",
+                FontId::proportional(14.0),
+                Color32::from_gray(200),
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+    }
+    live_badge(ui, rect.left_top() + vec2(12.0, 12.0), "В ЭФИРЕ");
+    let galley = ui.painter().layout_no_wrap(
+        format!("Экран: {name}"),
+        FontId::proportional(13.5),
+        Color32::WHITE,
+    );
+    let pill = Rect::from_min_size(
+        rect.left_bottom() + vec2(12.0, -galley.size().y - 20.0),
+        galley.size() + vec2(16.0, 8.0),
+    );
+    ui.painter()
+        .rect_filled(pill, 8.0, Color32::from_black_alpha(160));
+    ui.painter()
+        .galley(pill.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+    // кнопка закрытия
+    let close = Rect::from_min_size(rect.right_top() + vec2(-46.0, 10.0), vec2(36.0, 36.0));
+    let resp = ui
+        .interact(close, ui.id().with("close_stream"), Sense::click())
+        .on_hover_text("Перестать смотреть")
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+    ui.painter().circle_filled(
+        close.center(),
+        18.0,
+        mix(Color32::from_black_alpha(160), pal.danger, h),
+    );
+    ui.painter().text(
+        close.center(),
+        Align2::CENTER_CENTER,
+        "✕",
+        FontId::proportional(16.0),
+        Color32::WHITE,
+    );
+    if resp.clicked() {
+        actions.push(Action::StopWatching);
+    }
+}
+
+/// Панель управления звонком — «таблетка» под плитками.
+fn draw_stage_bar(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    rect: Rect,
+    bar_h: f32,
+    st: &StageState,
+    actions: &mut Vec<Action>,
+) {
+    let (mute, deaf) = (st.mute, st.deaf);
 
     // панель управления — отдельная «таблетка» под плитками
     let buttons: [(Icon, &str, bool, bool); 4] = [
@@ -4561,7 +5024,16 @@ fn draw_stage(
             deaf,
             false,
         ),
-        (Icon::Screen, "Демонстрация экрана — скоро", false, false),
+        (
+            Icon::Screen,
+            if st.streaming {
+                "Остановить демонстрацию"
+            } else {
+                "Демонстрация экрана"
+            },
+            false,
+            false,
+        ),
         (Icon::HangUp, "Отключиться", false, true),
     ];
     let bw = 56.0;
@@ -4591,6 +5063,8 @@ fn draw_stage(
                 pal.danger.gamma_multiply(0.45),
                 h,
             )
+        } else if i == 2 && st.streaming {
+            mix(pal.accent, Color32::WHITE, 0.12 * h)
         } else {
             mix(pal.elevated, pal.hover, h)
         };
@@ -4599,11 +5073,21 @@ fn draw_stage(
             Color32::WHITE
         } else if *active {
             pal.danger
-        } else if i == 2 {
-            pal.faint
+        } else if i == 2 && st.streaming {
+            Color32::WHITE
         } else {
             pal.text
         };
+        if i == 2 && st.streaming && !st.live {
+            // ждём первый кадр — пульсирующая обводка
+            let t = (ui.input(|i| i.time) * 4.0).sin() as f32 * 0.5 + 0.5;
+            ui.painter().rect_stroke(
+                r.expand(2.0),
+                25.0,
+                Stroke::new(2.0, pal.accent.gamma_multiply(t)),
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
         draw_icon(ui.painter(), *icon, r.center(), 20.0, fg, *active);
         let resp = resp
             .on_hover_text(*tip)
@@ -4612,6 +5096,8 @@ fn draw_stage(
             match i {
                 0 => actions.push(Action::ToggleMute),
                 1 => actions.push(Action::ToggleDeaf),
+                2 if st.streaming => actions.push(Action::StopStream),
+                2 => actions.push(Action::OpenStreamPicker),
                 3 => actions.push(Action::LeaveVoice),
                 _ => {}
             }

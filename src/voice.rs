@@ -52,12 +52,12 @@ pub enum Ctl {
 
 // ======================= DAVE =======================
 
-enum Out {
+pub(crate) enum Out {
     Json(String),
     Bin(Vec<u8>),
 }
 
-fn bin(op: u8, payload: &[u8]) -> Out {
+pub(crate) fn bin(op: u8, payload: &[u8]) -> Out {
     let mut v = Vec::with_capacity(payload.len() + 1);
     v.push(op);
     v.extend_from_slice(payload);
@@ -70,11 +70,11 @@ fn ready_json(transition_id: u16) -> Out {
 
 /// Состояние сквозного шифрования. Порядок обработки — по описанию протокола DAVE
 /// и документации davey.
-struct Dave {
-    session: Option<davey::DaveSession>,
-    version: u16,
+pub(crate) struct Dave {
+    pub(crate) session: Option<davey::DaveSession>,
+    pub(crate) version: u16,
     pending: HashMap<u16, u16>,
-    downgraded: bool,
+    pub(crate) downgraded: bool,
     user_id: u64,
     channel_id: u64,
 }
@@ -83,7 +83,7 @@ struct Dave {
 unsafe impl Send for Dave {}
 
 impl Dave {
-    fn new(user_id: u64, channel_id: u64) -> Self {
+    pub(crate) fn new(user_id: u64, channel_id: u64) -> Self {
         Self {
             session: None,
             version: 0,
@@ -94,7 +94,7 @@ impl Dave {
         }
     }
 
-    fn reinit(&mut self, out: &mut Vec<Out>) {
+    pub(crate) fn reinit(&mut self, out: &mut Vec<Out>) {
         if let Some(v) = NonZeroU16::new(self.version) {
             match &mut self.session {
                 Some(s) => {
@@ -125,7 +125,7 @@ impl Dave {
         }
     }
 
-    fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         self.version != 0
             && !self.downgraded
             && self.session.as_ref().map_or(false, |s| s.is_ready())
@@ -154,7 +154,7 @@ impl Dave {
         }
     }
 
-    fn on_json(&mut self, op: u64, d: &Value, out: &mut Vec<Out>) {
+    pub(crate) fn on_json(&mut self, op: u64, d: &Value, out: &mut Vec<Out>) {
         let tid = d["transition_id"].as_u64().unwrap_or(0) as u16;
         match op {
             21 => {
@@ -187,7 +187,7 @@ impl Dave {
         }
     }
 
-    fn on_binary(&mut self, op: u8, payload: &[u8], users: &[u64], out: &mut Vec<Out>) {
+    pub(crate) fn on_binary(&mut self, op: u8, payload: &[u8], users: &[u64], out: &mut Vec<Out>) {
         let version = self.version;
         let mut failed_transition: Option<u16> = None;
         {
@@ -360,7 +360,7 @@ fn open_rtp(cipher: &Aes256Gcm, pkt: &[u8]) -> Option<(u32, Vec<u8>)> {
 
 // ======================= подключение =======================
 
-fn parse_endpoint(endpoint: &str) -> (String, u16) {
+pub(crate) fn parse_endpoint(endpoint: &str) -> (String, u16) {
     let e = endpoint.trim_start_matches("wss://").trim_end_matches('/');
     match e.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
@@ -368,7 +368,7 @@ fn parse_endpoint(endpoint: &str) -> (String, u16) {
     }
 }
 
-async fn udp_recv(udp: Option<&UdpSocket>, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(crate) async fn udp_recv(udp: Option<&UdpSocket>, buf: &mut [u8]) -> std::io::Result<usize> {
     match udp {
         Some(u) => u.recv(buf).await,
         None => std::future::pending().await,
@@ -376,7 +376,7 @@ async fn udp_recv(udp: Option<&UdpSocket>, buf: &mut [u8]) -> std::io::Result<us
 }
 
 /// Случайное начальное значение для RTP (без лишних зависимостей).
-fn seed() -> u64 {
+pub(crate) fn seed() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -384,7 +384,7 @@ fn seed() -> u64 {
     nanos ^ (nanos >> 29) ^ 0xA076_1D64_78BD_642F
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

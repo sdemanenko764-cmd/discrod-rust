@@ -36,6 +36,9 @@ pub struct Settings {
     pub mic_threshold: f32,
     pub always_transmit: bool,
     pub echo_guard: bool,
+    pub stream_monitor: usize,
+    pub stream_height: u32,
+    pub stream_fps: u32,
 }
 
 impl Default for Settings {
@@ -57,6 +60,9 @@ impl Default for Settings {
             mic_threshold: 0.006,
             always_transmit: false,
             echo_guard: true,
+            stream_monitor: 0,
+            stream_height: 720,
+            stream_fps: 30,
         }
     }
 }
@@ -70,6 +76,8 @@ pub fn load() -> Settings {
     s.cached_channels = s.cached_channels.clamp(2, 20);
     s.messages_per_channel = s.messages_per_channel.clamp(50, 500);
     s.mic_threshold = s.mic_threshold.clamp(0.001, 0.08);
+    s.stream_height = s.stream_height.clamp(360, 1440);
+    s.stream_fps = s.stream_fps.clamp(5, 60);
     s
 }
 
