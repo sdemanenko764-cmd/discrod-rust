@@ -15,6 +15,16 @@ pub enum Theme {
     Dark,
     Midnight,
     Light,
+    Classic,
+    TokyoNight,
+    Dracula,
+    RosePine,
+    Gruvbox,
+    Sakura,
+    Mint,
+    Lavender,
+    Forest,
+    Cosmos,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

@@ -41,6 +41,7 @@ use discord::{
     Attachment, Auth, Channel, Cmd, Dm, Embed, Emoji, Event, Guild, ListItem, ListOp, Msg,
     Reaction, Status, VoiceMember, VoiceUi, DISCORD_EPOCH,
 };
+use eframe::egui::epaint::Shadow;
 use media::MediaCache;
 use settings::{Settings, Theme};
 use theme::{Palette, ACCENTS};
@@ -289,6 +290,8 @@ struct App {
     toast: Option<(String, Instant, bool)>,
     mem_mb: f64,
     mem_checked: Instant,
+    /// Есть сохранённый вход (можно войти снова одной кнопкой).
+    has_saved: bool,
 }
 
 impl App {
@@ -383,6 +386,7 @@ impl App {
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
+            has_saved: store::load().is_some(),
         };
         let _ = app.cmd.send(Cmd::VoiceOptions(voice_opts(&app.settings)));
         if let Some((token, bot)) = store::load() {
@@ -425,9 +429,14 @@ impl App {
         let _ = self.cmd.send(Cmd::Login(auth));
     }
 
-    fn logout(&mut self, error: Option<String>) {
+    /// `forget` — удалить сохранённый вход. Делается только по кнопке «Выйти»
+    /// или когда Discord сам отклонил токен; из-за проблем со связью вход не теряется.
+    fn logout(&mut self, error: Option<String>, forget: bool) {
         let _ = self.cmd.send(Cmd::Logout);
-        store::clear();
+        if forget {
+            store::clear();
+        }
+        self.has_saved = store::load().is_some();
         self.guilds = Vec::new();
         self.dms = Vec::new();
         self.cache = HashMap::new();
@@ -956,7 +965,16 @@ impl App {
             Event::Api { tag, result } => self.on_api(ctx, tag, result),
             Event::Info(t) => self.toast(t, false),
             Event::Error(e) => self.toast(e, true),
-            Event::Fatal(e) => self.logout(Some(e)),
+            Event::Trouble(e) => {
+                if self.screen == Screen::Login {
+                    self.login_error = Some(e);
+                } else {
+                    crate::store::log(&e);
+                }
+            }
+            // Токен отклонён — только тогда забываем сохранённый вход.
+            Event::AuthFailed(e) => self.logout(Some(e), true),
+            Event::Fatal(e) => self.logout(Some(e), false),
         }
     }
 
@@ -1068,6 +1086,7 @@ impl App {
         let pal = self.pal;
         let mut submit = false;
         let mut cancel = false;
+        let mut resume_saved = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
@@ -1135,7 +1154,19 @@ impl App {
                                     });
                                 } else {
                                     let width = ui.available_width();
-                                    if accent_button(ui, &pal, "Войти", width, 40.0).clicked() {
+                                    if self.has_saved {
+                                        if accent_button(ui, &pal, "Войти в сохранённый аккаунт", width, 40.0).clicked() {
+                                            resume_saved = true;
+                                        }
+                                        ui.add_space(6.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                RichText::new("или вставьте новый токен выше и нажмите Enter")
+                                                    .small()
+                                                    .color(pal.faint),
+                                            );
+                                        });
+                                    } else if accent_button(ui, &pal, "Войти", width, 40.0).clicked() {
                                         submit = true;
                                     }
                                 }
@@ -1186,7 +1217,13 @@ impl App {
                 });
             });
         if cancel {
-            self.logout(None);
+            self.logout(None, false);
+        } else if resume_saved {
+            if let Some((token, bot)) = store::load() {
+                let proxy = self.proxy_input.trim().to_string();
+                store::save_proxy(&proxy);
+                self.start_login(Auth { token, bot, proxy });
+            }
         } else if submit && !self.logging_in {
             self.login_from_input();
         }
@@ -2575,7 +2612,7 @@ impl App {
             }
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::OpenSettings => self.settings_open = true,
-            Action::Logout => self.logout(None),
+            Action::Logout => self.logout(None, true),
             a @ (Action::OpenProfile(_)
             | Action::MessageUser(_)
             | Action::OpenStatusMenu
@@ -3310,105 +3347,20 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(410.0);
                         section(ui, &pal, "Внешний вид");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-                            for (theme, label) in theme::THEMES {
-                                let preview = theme::palette_for(theme, pal.accent);
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(vec2(124.0, 80.0), Sense::click());
-                                let selected = self.settings.theme == theme;
-                                let t = ui.ctx().animate_bool_with_time(
-                                    resp.id.with("sel"),
-                                    selected || resp.hovered(),
-                                    0.15,
-                                );
-                                let rr = 10.0;
-                                let p = ui.painter();
-                                match theme::backdrop(theme) {
-                                    Some(bd) => {
-                                        p.rect_filled(rect, rr, bd.base);
-                                        let pc = ui.painter_at(rect);
-                                        for (k, c) in bd.glows.iter().enumerate() {
-                                            let pos = rect.min
-                                                + vec2(
-                                                    20.0 + k as f32 * 42.0,
-                                                    24.0 + (k % 2) as f32 * 30.0,
-                                                );
-                                            glow(&pc, pos, 46.0, c.gamma_multiply(0.7));
-                                        }
-                                    }
-                                    None => {
-                                        p.rect_filled(rect, rr, preview.main);
+                        for (group, themes) in theme::THEME_GROUPS {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(group).size(12.5).color(pal.muted));
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                                for &(theme, label) in themes {
+                                    let selected = self.settings.theme == theme;
+                                    if theme_card(ui, &pal, theme, label, selected).clicked() {
+                                        self.settings.theme = theme;
                                     }
                                 }
-                                p.rect_filled(
-                                    Rect::from_min_size(rect.min, vec2(30.0, rect.height())),
-                                    Rounding {
-                                        nw: rr,
-                                        sw: rr,
-                                        ne: 0.0,
-                                        se: 0.0,
-                                    },
-                                    preview.side,
-                                );
-                                p.rect_filled(
-                                    Rect::from_min_size(
-                                        rect.min + vec2(30.0, 0.0),
-                                        vec2(rect.width() - 30.0, 14.0),
-                                    ),
-                                    Rounding {
-                                        nw: 0.0,
-                                        sw: 0.0,
-                                        ne: rr,
-                                        se: 0.0,
-                                    },
-                                    preview.header,
-                                );
-                                for k in 0..3 {
-                                    p.circle_filled(
-                                        rect.min + vec2(15.0, 16.0 + k as f32 * 16.0),
-                                        5.5,
-                                        if k == 0 {
-                                            preview.accent
-                                        } else {
-                                            preview.elevated
-                                        },
-                                    );
-                                }
-                                p.rect_filled(
-                                    Rect::from_min_size(
-                                        rect.min + vec2(40.0, 22.0),
-                                        vec2(64.0, 9.0),
-                                    ),
-                                    4.5,
-                                    preview.elevated,
-                                );
-                                p.rect_filled(
-                                    Rect::from_min_size(
-                                        rect.min + vec2(40.0, 36.0),
-                                        vec2(44.0, 9.0),
-                                    ),
-                                    4.5,
-                                    preview.accent,
-                                );
-                                p.text(
-                                    pos2(rect.left() + 40.0, rect.bottom() - 13.0),
-                                    Align2::LEFT_CENTER,
-                                    label,
-                                    FontId::proportional(12.0),
-                                    preview.text,
-                                );
-                                let stroke = if selected {
-                                    Stroke::new(2.5, pal.accent)
-                                } else {
-                                    Stroke::new(1.0 + t, mix(pal.border, pal.accent, t * 0.7))
-                                };
-                                p.rect_stroke(rect, rr, stroke);
-                                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                    self.settings.theme = theme;
-                                }
-                            }
-                        });
+                            });
+                        }
                         ui.add_space(6.0);
                         ui.label(RichText::new("Акцентный цвет").color(pal.muted));
                         ui.horizontal_wrapped(|ui| {
@@ -3656,7 +3608,7 @@ impl App {
             self.media.clear();
         }
         if logout {
-            self.logout(None);
+            self.logout(None, true);
         }
     }
 
@@ -3721,6 +3673,7 @@ impl eframe::App for App {
                         self.pal.link.gamma_multiply(0.10),
                         Color32::TRANSPARENT,
                     ],
+                    stars: false,
                 };
                 let animate = self.screen == Screen::Login && self.settings.animate_background;
                 paint_backdrop(ctx, &bd, animate);
@@ -4631,13 +4584,179 @@ fn nav_row(
     );
     if unread && !selected {
         ui.painter()
-            .circle_filled(pos2(rect.right() - 12.0, cy), 4.0, pal.text);
+            .circle_filled(pos2(rect.right() - 12.0, cy), 4.0, pal.accent);
+        ui.painter().rect_filled(
+            Rect::from_min_size(pos2(rect.left() - 4.0, cy - 4.0), vec2(4.0, 8.0)),
+            Rounding {
+                nw: 0.0,
+                sw: 0.0,
+                ne: 3.0,
+                se: 3.0,
+            },
+            pal.text,
+        );
     }
     if enabled {
         resp.on_hover_cursor(CursorIcon::PointingHand)
     } else {
         resp
     }
+}
+
+/// Карточка-превью темы в настройках: мини-окно с панелями, сообщениями и акцентом.
+fn theme_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    theme: Theme,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let preview = theme::palette_for(theme, pal.accent);
+    let (slot, resp) = ui.allocate_exact_size(vec2(126.0, 92.0), Sense::click());
+    if !ui.is_rect_visible(slot) {
+        return resp;
+    }
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("lift"), resp.hovered() || selected, 0.16);
+    // при наведении карточка слегка «приподнимается»
+    let rect = slot.translate(vec2(0.0, -3.0 * t));
+    let rr = 12.0;
+    let p = ui.painter();
+    p.add(
+        Shadow {
+            offset: vec2(0.0, 4.0 + 4.0 * t),
+            blur: 10.0 + 10.0 * t,
+            spread: 0.0,
+            color: Color32::from_black_alpha((30.0 + 50.0 * t) as u8),
+        }
+        .as_shape(rect, rr),
+    );
+    match theme::backdrop(theme) {
+        Some(bd) => {
+            p.rect_filled(rect, rr, bd.base);
+            let pc = ui.painter_at(rect);
+            for (k, c) in bd.glows.iter().enumerate() {
+                let pos = rect.min + vec2(18.0 + k as f32 * 44.0, 22.0 + (k % 2) as f32 * 34.0);
+                glow(&pc, pos, 50.0, c.gamma_multiply(0.75));
+            }
+            if bd.stars {
+                for k in 0..14u32 {
+                    let x = (k * 37 % 113) as f32 + 6.0;
+                    let y = (k * 53 % 80) as f32 + 6.0;
+                    pc.circle_filled(rect.min + vec2(x, y), 0.8, Color32::from_white_alpha(200));
+                }
+            }
+        }
+        None => {
+            p.rect_filled(rect, rr, preview.main);
+        }
+    }
+    let rail_w = 18.0;
+    let side_w = 30.0;
+    p.rect_filled(
+        Rect::from_min_size(rect.min, vec2(rail_w, rect.height())),
+        Rounding {
+            nw: rr,
+            sw: rr,
+            ne: 0.0,
+            se: 0.0,
+        },
+        preview.rail,
+    );
+    p.rect_filled(
+        Rect::from_min_size(rect.min + vec2(rail_w, 0.0), vec2(side_w, rect.height())),
+        0.0,
+        preview.side,
+    );
+    for k in 0..3 {
+        p.circle_filled(
+            rect.min + vec2(rail_w / 2.0, 13.0 + k as f32 * 15.0),
+            5.0,
+            if k == 0 {
+                preview.accent
+            } else {
+                preview.elevated
+            },
+        );
+    }
+    for k in 0..4 {
+        let w = if k == 1 { 22.0 } else { 18.0 - k as f32 * 2.0 };
+        p.rect_filled(
+            Rect::from_min_size(
+                rect.min + vec2(rail_w + 5.0, 10.0 + k as f32 * 10.0),
+                vec2(w, 5.0),
+            ),
+            2.5,
+            if k == 1 {
+                preview.selected
+            } else {
+                preview.elevated
+            },
+        );
+    }
+    // сообщения: аватарка + строки текста
+    let mx = rect.left() + rail_w + side_w + 7.0;
+    for k in 0..2 {
+        let y = rect.top() + 12.0 + k as f32 * 22.0;
+        p.circle_filled(pos2(mx + 5.0, y + 5.0), 5.0, name_color(k as u64 * 7 + 3));
+        p.rect_filled(
+            Rect::from_min_size(pos2(mx + 14.0, y), vec2(26.0, 4.0)),
+            2.0,
+            preview.text.gamma_multiply(0.8),
+        );
+        p.rect_filled(
+            Rect::from_min_size(pos2(mx + 14.0, y + 7.0), vec2(48.0 - k as f32 * 14.0, 4.0)),
+            2.0,
+            preview.muted.gamma_multiply(0.7),
+        );
+    }
+    // поле ввода
+    p.rect_filled(
+        Rect::from_min_size(
+            pos2(mx, rect.top() + 56.0),
+            vec2(rect.right() - mx - 7.0, 9.0),
+        ),
+        4.5,
+        preview.elevated,
+    );
+    // подпись
+    let label_rect = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 20.0), rect.max);
+    p.rect_filled(
+        label_rect,
+        Rounding {
+            nw: 0.0,
+            ne: 0.0,
+            sw: rr,
+            se: rr,
+        },
+        Color32::from_black_alpha(if preview.light { 0 } else { 70 }),
+    );
+    p.text(
+        label_rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.0),
+        preview.text,
+    );
+    let stroke = if selected {
+        Stroke::new(2.5, pal.accent)
+    } else {
+        Stroke::new(1.0, mix(pal.border, pal.accent, t * 0.8))
+    };
+    p.rect_stroke(rect, rr, stroke);
+    if selected {
+        let c = pos2(rect.right() - 11.0, rect.top() + 11.0);
+        p.circle_filled(c, 8.0, pal.accent);
+        p.text(
+            c,
+            Align2::CENTER_CENTER,
+            "✓",
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn paint_avatar(ui: &egui::Ui, rect: Rect, tex: Option<(TextureId, Vec2)>, id: u64, name: &str) {
@@ -4689,17 +4808,44 @@ fn accent_button(
     width: f32,
     height: f32,
 ) -> egui::Response {
-    ui.add_sized(
-        [width, height],
-        egui::Button::new(
-            RichText::new(text)
-                .strong()
-                .size(15.5)
-                .color(Color32::WHITE),
-        )
-        .fill(pal.accent)
-        .rounding(10.0),
-    )
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.15);
+        let pressed = resp.is_pointer_button_down_on();
+        let r = rect.shrink(if pressed { 1.0 } else { 0.0 });
+        let p = ui.painter();
+        p.add(
+            Shadow {
+                offset: vec2(0.0, 3.0 + 3.0 * t),
+                blur: 8.0 + 10.0 * t,
+                spread: 0.0,
+                color: pal.accent.gamma_multiply(0.25 + 0.25 * t),
+            }
+            .as_shape(r, 10.0),
+        );
+        p.rect_filled(r, 10.0, mix(pal.accent, Color32::WHITE, 0.10 * t));
+        // светлый блик сверху — кнопка выглядит объёмной
+        p.rect_filled(
+            Rect::from_min_size(r.min, vec2(r.width(), r.height() / 2.0)),
+            Rounding {
+                nw: 10.0,
+                ne: 10.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            Color32::from_white_alpha(14),
+        );
+        p.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(15.5),
+            Color32::WHITE,
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn round_button(
@@ -4710,13 +4856,19 @@ fn round_button(
     bg: Color32,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    let fill = if resp.hovered() {
-        bg.gamma_multiply(1.2)
-    } else {
-        bg
-    };
-    let _ = pal;
-    ui.painter().circle_filled(rect.center(), 15.0, fill);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let fill = mix(
+        bg,
+        if pal.light {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        },
+        0.12 * t,
+    );
+    ui.painter().circle_filled(rect.center(), 15.0 + t, fill);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -4729,10 +4881,17 @@ fn round_button(
 
 fn icon_button(ui: &mut egui::Ui, pal: &Palette, glyph: &str, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 6.0, pal.hover);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    if t > 0.01 {
+        ui.painter().rect_filled(
+            rect.shrink(2.0 * (1.0 - t)),
+            8.0,
+            pal.hover.gamma_multiply(t),
+        );
     }
-    let color = if resp.hovered() { pal.text } else { pal.muted };
+    let color = mix(pal.muted, pal.text, t);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -5189,6 +5348,22 @@ fn paint_backdrop(ctx: &egui::Context, bd: &theme::Backdrop, animate: bool) {
             r,
             c.gamma_multiply(0.55),
         );
+    }
+    if bd.stars {
+        // мерцающие звёзды: положения фиксированы, яркость медленно «дышит»
+        for k in 0..90u64 {
+            let h = k.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+            let x = (h % 10_000) as f32 / 10_000.0;
+            let y = ((h / 10_000) % 10_000) as f32 / 10_000.0;
+            let phase = (h % 628) as f64 / 100.0;
+            let a = 0.35 + 0.65 * (0.5 + 0.5 * (t * 0.9 + phase).sin()) as f32;
+            let r = if k % 9 == 0 { 1.6 } else { 0.9 };
+            painter.circle_filled(
+                screen.min + vec2(x * size.x, y * size.y),
+                r,
+                Color32::from_white_alpha((a * 210.0) as u8),
+            );
+        }
     }
     if animate {
         ctx.request_repaint_after(Duration::from_millis(50));

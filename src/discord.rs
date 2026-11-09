@@ -520,6 +520,11 @@ pub enum Event {
     },
     Info(String),
     Error(String),
+    /// Временные проблемы со связью: попытки продолжаются, вход сохраняется.
+    Trouble(String),
+    /// Токен отклонён Discord — только в этом случае сохранённый вход удаляется.
+    AuthFailed(String),
+    /// Остановились из-за ошибки, но токен в порядке и сохранённый вход остаётся.
     Fatal(String),
 }
 
@@ -1688,7 +1693,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                             .patch(url)
                             .header("Authorization", a.header())
                             .json(&json!({ "content": content }))
-                            .send()
+                            .send_rl()
                             .await;
                         match res {
                             Ok(r) if r.status().is_success() => sink.send(Event::MessageUpdate {
@@ -1718,7 +1723,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         let res = http
                             .delete(url)
                             .header("Authorization", a.header())
-                            .send()
+                            .send_rl()
                             .await;
                         match res {
                             Ok(r) if r.status().is_success() => sink.send(Event::MessageDelete {
@@ -1754,7 +1759,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         } else {
                             http.delete(url)
                         };
-                        match req.header("Authorization", a.header()).send().await {
+                        match req.header("Authorization", a.header()).send_rl().await {
                             Ok(r) if r.status().is_success() => {}
                             Ok(r) => sink.send(Event::Error(format!(
                                 "Реакция не поставлена: {}",
@@ -1854,6 +1859,67 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
 
 // ======================= REST =======================
 
+/// Сколько максимум ждать по ответу «слишком много запросов», прежде чем сдаться.
+const MAX_RATE_LIMIT_WAIT: f64 = 15.0;
+
+/// Отправка с учётом лимитов Discord: на ответ 429 ждём, сколько сказано, и повторяем.
+/// Если продолжать долбить запросами после 429, Discord (и Cloudflare перед ним)
+/// временно блокирует доступ — это выглядит как внезапный «вылет».
+async fn send_rl(mut req: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    for _ in 0..3 {
+        let retry = req.try_clone();
+        let resp = req.send().await?;
+        if resp.status().as_u16() != 429 {
+            return Ok(resp);
+        }
+        let Some(next) = retry else { return Ok(resp) };
+        let wait = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(1.0);
+        if wait > MAX_RATE_LIMIT_WAIT {
+            return Ok(resp);
+        }
+        crate::store::log(&format!("REST: лимит запросов, жду {wait:.1} с"));
+        tokio::time::sleep(Duration::from_secs_f64(wait.max(0.2) + 0.15)).await;
+        req = next;
+    }
+    req.send().await
+}
+
+trait SendRl {
+    fn send_rl(
+        self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send>,
+    >;
+}
+
+impl SendRl for reqwest::RequestBuilder {
+    fn send_rl(
+        self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send>,
+    > {
+        Box::pin(send_rl(self))
+    }
+}
+
+/// Уникальный nonce для отправки: Discord по нему отбрасывает дубликаты,
+/// если запрос пришлось повторить.
+fn nonce() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let seq = NONCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFFF;
+    (((ms.saturating_sub(DISCORD_EPOCH)) << 22) | seq).to_string()
+}
+
+static NONCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Универсальный запрос к REST API: тело ответа строкой или понятная ошибка.
 async fn api_call(
     http: &reqwest::Client,
@@ -1869,7 +1935,7 @@ async fn api_call(
         req = req.json(&b);
     }
     let r = req
-        .send()
+        .send_rl()
         .await
         .map_err(|e| format!("ошибка соединения: {e}"))?;
     let status = r.status();
@@ -1990,7 +2056,7 @@ async fn fetch_messages(
     let resp = http
         .get(&url)
         .header("Authorization", auth.header())
-        .send()
+        .send_rl()
         .await
         .map_err(|e| format!("Нет связи с Discord: {e}"))?;
     if !resp.status().is_success() {
@@ -2012,7 +2078,7 @@ async fn send_message(
     content: &str,
     reply_to: Option<u64>,
 ) -> Result<Msg, String> {
-    let mut body = json!({ "content": content });
+    let mut body = json!({ "content": content, "nonce": nonce(), "enforce_nonce": true });
     if let Some(id) = reply_to {
         body["message_reference"] =
             json!({ "message_id": id.to_string(), "fail_if_not_exists": false });
@@ -2021,7 +2087,7 @@ async fn send_message(
         .post(format!("{API}/channels/{channel_id}/messages"))
         .header("Authorization", auth.header())
         .json(&body)
-        .send()
+        .send_rl()
         .await
         .map_err(|e| format!("Не отправлено, нет связи: {e}"))?;
     if !resp.status().is_success() {
@@ -2203,13 +2269,52 @@ fn decode_image(bytes: &[u8], max_side: u32, animate: bool) -> Result<Vec<Frame>
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 enum End {
+    /// Переподключиться и продолжить прежнюю сессию (если она есть).
     Reconnect(String),
+    /// Переподключиться с новым входом: прежнюю сессию продолжить нельзя.
+    Restart(String),
+    /// Токен не принят — сохранённый вход нужно удалить.
+    AuthFailed(String),
+    /// Дальше пробовать бессмысленно, но токен в порядке.
     Fatal(String),
 }
 
-/// После стольких неудачных попыток подряд при ПЕРВОМ входе — показываем ошибку,
-/// а не крутим «Подключение…» бесконечно.
+/// После стольких неудачных попыток подряд при ПЕРВОМ входе — показываем подсказку
+/// про VPN/прокси. Попытки при этом продолжаются, а сохранённый вход не удаляется.
 const MAX_LOGIN_ATTEMPTS: u32 = 3;
+/// Самая долгая пауза между попытками переподключения.
+const MAX_RECONNECT_DELAY: u64 = 60;
+
+/// Всё, что нужно, чтобы продолжить прежнюю сессию (op 6 RESUME), а не входить заново.
+///
+/// Каждый новый вход (IDENTIFY) Discord считает отдельно, и частые входы — самая
+/// частая причина, по которой он сбрасывает сессию и «выкидывает» из аккаунта.
+/// Продолжение сессии этого не вызывает и к тому же досылает пропущенные события.
+#[derive(Clone, Debug)]
+struct Resume {
+    session_id: String,
+    /// Хост, который Discord выдал специально для продолжения сессии.
+    host: String,
+    seq: Option<u64>,
+}
+
+/// Псевдослучайное число 0..1 без отдельной зависимости — для разброса пауз.
+fn jitter() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000_000) as f64 / 1_000_000.0
+}
+
+fn gateway_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .unwrap_or(url);
+    let host = rest.split(['/', '?', ':']).next()?.trim();
+    (!host.is_empty()).then(|| host.to_string())
+}
 
 async fn gateway_loop(
     auth: Auth,
@@ -2220,6 +2325,7 @@ async fn gateway_loop(
     let mut delay: u64 = 1;
     let mut ever_ready = false;
     let mut failures: u32 = 0;
+    let mut resume: Option<Resume> = None;
     loop {
         sink.send(Event::Status(if ever_ready || failures > 0 {
             Status::Reconnecting
@@ -2227,17 +2333,41 @@ async fn gateway_loop(
             Status::Connecting
         }));
         let mut got_ready = false;
-        let reason = match session(&auth, proxy.as_ref(), &sink, &mut got_ready, &mut out_rx).await
-        {
+        let result = session(
+            &auth,
+            proxy.as_ref(),
+            &sink,
+            &mut got_ready,
+            &mut out_rx,
+            &mut resume,
+        )
+        .await;
+        let (reason, quick) = match result {
             Ok(End::Fatal(msg)) => {
                 crate::store::log(&format!("ФАТАЛЬНО: {msg}"));
                 sink.send(Event::Fatal(msg));
                 return;
             }
-            Ok(End::Reconnect(r)) => r,
-            Err(e) => format!("ошибка соединения: {e}"),
+            Ok(End::AuthFailed(msg)) => {
+                crate::store::log(&format!("токен отклонён: {msg}"));
+                sink.send(Event::AuthFailed(msg));
+                return;
+            }
+            Ok(End::Reconnect(r)) => (r, true),
+            Ok(End::Restart(r)) => {
+                resume = None;
+                (r, false)
+            }
+            Err(e) => (format!("ошибка соединения: {e}"), false),
         };
-        crate::store::log(&format!("gateway: {reason}"));
+        crate::store::log(&format!(
+            "gateway: {reason}{}",
+            if resume.is_some() {
+                " — продолжу прежнюю сессию"
+            } else {
+                ""
+            }
+        ));
         if got_ready {
             ever_ready = true;
             failures = 0;
@@ -2245,25 +2375,32 @@ async fn gateway_loop(
         } else {
             failures += 1;
         }
-        if !ever_ready {
-            if failures >= MAX_LOGIN_ATTEMPTS {
-                let hint = if proxy.is_none() {
-                    "\n\nПохоже, соединение с Discord блокируется. Включите VPN в режиме «весь трафик» \
-                     (TUN), либо укажите в поле «Прокси» локальный прокси вашего VPN-клиента, \
-                     например socks5://127.0.0.1:10808."
-                } else {
-                    "\n\nПроверьте, что VPN-клиент запущен и адрес прокси указан верно."
-                };
-                sink.send(Event::Fatal(format!(
-                    "Не удалось войти: {reason}.{hint}\n\nЛог: {}",
-                    crate::store::log_path_display()
-                )));
-                return;
-            }
-            sink.send(Event::Error(format!("Попытка {failures}: {reason}")));
+        if !ever_ready && failures >= MAX_LOGIN_ATTEMPTS {
+            let hint = if proxy.is_none() {
+                "\n\nПохоже, соединение с Discord блокируется. Включите VPN в режиме «весь трафик» \
+                 (TUN), либо укажите в поле «Прокси» локальный прокси вашего VPN-клиента, \
+                 например socks5://127.0.0.1:10808."
+            } else {
+                "\n\nПроверьте, что VPN-клиент запущен и адрес прокси указан верно."
+            };
+            sink.send(Event::Trouble(format!(
+                "Не удаётся подключиться: {reason}.{hint}\n\nПробую снова каждые {} с. Лог: {}",
+                delay.max(1),
+                crate::store::log_path_display()
+            )));
+        } else if failures > 0 {
+            sink.send(Event::Trouble(format!("Попытка {failures}: {reason}")));
         }
-        tokio::time::sleep(Duration::from_secs(delay)).await;
-        delay = (delay * 2).min(30);
+        // Discord сам попросил переподключиться и сессию можно продолжить — почти без паузы.
+        let wait = if quick && failures == 0 {
+            Duration::from_millis(300 + (jitter() * 700.0) as u64)
+        } else {
+            Duration::from_millis(delay * 1000 + (jitter() * 1000.0) as u64)
+        };
+        tokio::time::sleep(wait).await;
+        if !(quick && failures == 0) {
+            delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+        }
     }
 }
 
@@ -2282,6 +2419,19 @@ fn identify(auth: &Auth) -> String {
     json!({ "op": 2, "d": d }).to_string()
 }
 
+fn resume_packet(auth: &Auth, r: &Resume) -> String {
+    let token = if auth.bot {
+        format!("Bot {}", auth.token)
+    } else {
+        auth.token.clone()
+    };
+    json!({
+        "op": 6,
+        "d": { "token": token, "session_id": r.session_id, "seq": r.seq }
+    })
+    .to_string()
+}
+
 fn heartbeat(seq: Option<u64>) -> String {
     json!({ "op": 1, "d": seq }).to_string()
 }
@@ -2292,7 +2442,7 @@ fn close_end(frame: Option<CloseFrame<'_>>) -> End {
         .unwrap_or((1000, String::new()));
     crate::store::log(&format!("gateway закрыт: код {code} {text}"));
     match code {
-        4004 => End::Fatal(
+        4004 => End::AuthFailed(
             "Discord не принял токен (код 4004).\n\
              • Токен бота — поставьте галочку «Это токен бота».\n\
              • Токен аккаунта — галочку уберите.\n\
@@ -2306,9 +2456,21 @@ fn close_end(frame: Option<CloseFrame<'_>>) -> End {
                 .into(),
         ),
         4010..=4012 => End::Fatal(format!("Discord закрыл соединение (код {code}).")),
+        // Сессию продолжить нельзя: неверный номер события или она истекла — входим заново.
+        4007 | 4009 => End::Restart(format!("сессия истекла (код {code}), вхожу заново")),
+        // Слишком много входов подряд — Discord сам разрешит снова через какое-то время.
+        4008 => End::Restart("Discord просит снизить частоту запросов (код 4008)".into()),
         _ if text.is_empty() => End::Reconnect(format!("Discord закрыл соединение (код {code})")),
         _ => End::Reconnect(format!("Discord закрыл соединение (код {code}: {text})")),
     }
+}
+
+/// Минимум из READY, нужный для продолжения сессии.
+#[derive(Deserialize)]
+struct ReadyIds {
+    session_id: String,
+    #[serde(default)]
+    resume_gateway_url: Option<String>,
 }
 
 async fn session(
@@ -2317,53 +2479,108 @@ async fn session(
     sink: &Sink,
     got_ready: &mut bool,
     out_rx: &mut UnboundedReceiver<String>,
+    resume: &mut Option<Resume>,
 ) -> Result<End, BoxErr> {
-    let stream = crate::net::connect(proxy, "gateway.discord.gg", 443).await?;
-    let (ws, _) = tokio_tungstenite::client_async_tls(GATEWAY, stream).await?;
+    const MAIN_HOST: &str = "gateway.discord.gg";
+    let host = resume
+        .as_ref()
+        .map(|r| r.host.clone())
+        .unwrap_or_else(|| MAIN_HOST.to_string());
+    let url = if host == MAIN_HOST {
+        GATEWAY.to_string()
+    } else {
+        format!("wss://{host}/?v=10&encoding=json")
+    };
+    let connected = async {
+        let stream = crate::net::connect(proxy, &host, 443).await?;
+        let (ws, _) = tokio_tungstenite::client_async_tls(url.as_str(), stream).await?;
+        Ok::<_, BoxErr>(ws)
+    };
+    let ws = match tokio::time::timeout(Duration::from_secs(20), connected).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
+            // Не удалось достучаться до хоста продолжения — в следующий раз основной адрес.
+            if host != MAIN_HOST {
+                *resume = None;
+            }
+            return Err(e);
+        }
+        Err(_) => return Ok(End::Reconnect("Discord не отвечает (20 с)".into())),
+    };
     let (mut write, mut read) = ws.split();
 
     // 1. Ждём Hello с интервалом heartbeat.
-    let interval_ms = loop {
-        match read.next().await {
-            Some(Ok(WsMsg::Text(text))) => {
-                let p: Payload = serde_json::from_str(&text)?;
-                if p.op == 10 {
-                    let hello: Hello = serde_json::from_str(p.d.map(|d| d.get()).unwrap_or("{}"))?;
-                    break hello.heartbeat_interval;
+    let hello = async {
+        loop {
+            match read.next().await {
+                Some(Ok(WsMsg::Text(text))) => {
+                    let p: Payload = serde_json::from_str(&text)?;
+                    if p.op == 10 {
+                        let hello: Hello =
+                            serde_json::from_str(p.d.map(|d| d.get()).unwrap_or("{}"))?;
+                        return Ok::<_, BoxErr>(Ok(hello.heartbeat_interval));
+                    }
                 }
-            }
-            Some(Ok(WsMsg::Close(f))) => return Ok(close_end(f)),
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(e.into()),
-            None => {
-                return Ok(End::Reconnect(
-                    "соединение оборвалось до приветствия".into(),
-                ))
+                Some(Ok(WsMsg::Close(f))) => return Ok(Err(close_end(f))),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+                None => {
+                    return Ok(Err(End::Reconnect(
+                        "соединение оборвалось до приветствия".into(),
+                    )))
+                }
             }
         }
     };
+    let interval_ms = match tokio::time::timeout(Duration::from_secs(20), hello).await {
+        Ok(Ok(Ok(ms))) => ms,
+        Ok(Ok(Err(end))) => return Ok(end),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Ok(End::Reconnect("Discord не прислал приветствие".into())),
+    };
 
-    // 2. Представляемся.
-    write.send(WsMsg::Text(identify(auth))).await?;
+    // 2. Продолжаем прежнюю сессию или представляемся заново.
+    let resuming = resume.is_some();
+    let mut seq: Option<u64> = None;
+    match resume.as_ref() {
+        Some(r) => {
+            seq = r.seq;
+            crate::store::log("gateway: продолжаю сессию (RESUME)");
+            write.send(WsMsg::Text(resume_packet(auth, r))).await?;
+        }
+        None => write.send(WsMsg::Text(identify(auth))).await?,
+    }
 
     let period = Duration::from_millis(interval_ms.max(1000));
-    let mut hb = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    let mut seq: Option<u64> = None;
+    // Первый heartbeat — через случайную долю интервала, как требует Discord.
+    let first = Duration::from_millis((interval_ms.max(1000) as f64 * jitter()) as u64);
+    let mut hb = tokio::time::interval_at(tokio::time::Instant::now() + first, period);
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut acked = true;
-    let ready_timeout = tokio::time::sleep(Duration::from_secs(40));
+    let ready_timeout = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(ready_timeout);
 
     // 3. Основной цикл: heartbeat + события.
     loop {
         tokio::select! {
             _ = &mut ready_timeout, if !*got_ready => {
-                return Ok(End::Reconnect("Discord не ответил на вход за 40 секунд".into()));
+                if resuming {
+                    return Ok(End::Restart("Discord не продолжил сессию за 60 секунд".into()));
+                }
+                return Ok(End::Reconnect("Discord не ответил на вход за 60 секунд".into()));
             }
             Some(packet) = out_rx.recv(), if *got_ready => {
                 write.send(WsMsg::Text(packet)).await?;
             }
             _ = hb.tick() => {
                 if !acked {
+                    // «Зомби»-соединение: закрываем не кодом 1000, чтобы сессию можно было продолжить.
+                    let _ = write
+                        .send(WsMsg::Close(Some(CloseFrame {
+                            code: 4000.into(),
+                            reason: "heartbeat timeout".into(),
+                        })))
+                        .await;
                     return Ok(End::Reconnect("сервер перестал отвечать на heartbeat".into()));
                 }
                 acked = false;
@@ -2375,11 +2592,33 @@ async fn session(
                         Ok(p) => {
                             if let Some(s) = p.s {
                                 seq = Some(s);
+                                if let Some(r) = resume.as_mut() {
+                                    r.seq = Some(s);
+                                }
                             }
                             match p.op {
                                 0 => {
                                     let t = p.t.as_deref().unwrap_or("");
                                     let d = p.d.map(|d| d.get()).unwrap_or("null");
+                                    if t == "RESUMED" {
+                                        *got_ready = true;
+                                        crate::store::log("сессия продолжена (RESUMED)");
+                                        sink.send(Event::Status(Status::Online));
+                                        continue;
+                                    }
+                                    if t == "READY" {
+                                        if let Ok(ids) = serde_json::from_str::<ReadyIds>(d) {
+                                            *resume = Some(Resume {
+                                                session_id: ids.session_id,
+                                                host: ids
+                                                    .resume_gateway_url
+                                                    .as_deref()
+                                                    .and_then(gateway_host)
+                                                    .unwrap_or_else(|| MAIN_HOST.to_string()),
+                                                seq,
+                                            });
+                                        }
+                                    }
                                     match handle_dispatch(t, d, sink) {
                                         Ok(()) if t == "READY" => {
                                             *got_ready = true;
@@ -2388,17 +2627,32 @@ async fn session(
                                         Ok(()) => {}
                                         Err(e) if t == "READY" => {
                                             return Ok(End::Fatal(format!(
-                                                "Discord ответил на вход, но ответ не удалось разобрать: {e}"
+                                                "Discord ответил на вход, но ответ не удалось разобрать: {e}\n\
+                                                 Сохранённый вход не удалён — попробуйте ещё раз или обновите Rustcord."
                                             )));
                                         }
                                         Err(e) => crate::store::log(&format!("не удалось разобрать {t}: {e}")),
                                     }
                                 }
                                 1 => write.send(WsMsg::Text(heartbeat(seq))).await?,
-                                7 => return Ok(End::Reconnect("Discord попросил переподключиться".into())),
+                                7 => {
+                                    let _ = write
+                                        .send(WsMsg::Close(Some(CloseFrame {
+                                            code: 4000.into(),
+                                            reason: "reconnect".into(),
+                                        })))
+                                        .await;
+                                    return Ok(End::Reconnect("Discord попросил переподключиться".into()));
+                                }
                                 9 => {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                    return Ok(End::Reconnect("Discord отклонил сессию (invalid session)".into()));
+                                    let resumable = p.d.map(|d| d.get().trim() == "true").unwrap_or(false);
+                                    // По правилам Discord — подождать 1–5 секунд перед новой попыткой.
+                                    let wait = 1000 + (jitter() * 4000.0) as u64;
+                                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                                    if resumable && resume.is_some() {
+                                        return Ok(End::Reconnect("Discord попросил повторить (invalid session)".into()));
+                                    }
+                                    return Ok(End::Restart("Discord завершил сессию, вхожу заново".into()));
                                 }
                                 11 => acked = true,
                                 _ => {}

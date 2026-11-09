@@ -6,8 +6,8 @@ use eframe::egui::{
 
 use crate::settings::{Settings, Theme};
 
-/// Акцентные цвета: первый — фирменный цвет Rustcord, остальные — палитра акцентов GNOME.
-pub const ACCENTS: [(&str, Color32); 10] = [
+/// Акцентные цвета: первый — фирменный цвет Rustcord, дальше — палитра акцентов GNOME и ещё несколько.
+pub const ACCENTS: [(&str, Color32); 14] = [
     ("Ржавчина", Color32::from_rgb(232, 117, 58)),
     ("Синий", Color32::from_rgb(53, 132, 228)),
     ("Бирюзовый", Color32::from_rgb(33, 144, 164)),
@@ -18,21 +18,50 @@ pub const ACCENTS: [(&str, Color32); 10] = [
     ("Розовый", Color32::from_rgb(213, 97, 153)),
     ("Фиолетовый", Color32::from_rgb(145, 65, 172)),
     ("Сланец", Color32::from_rgb(111, 131, 150)),
+    ("Индиго", Color32::from_rgb(88, 101, 242)),
+    ("Мята", Color32::from_rgb(16, 185, 129)),
+    ("Коралл", Color32::from_rgb(255, 107, 107)),
+    ("Лаванда", Color32::from_rgb(167, 139, 250)),
 ];
 
-/// Темы в порядке показа в настройках.
-pub const THEMES: [(Theme, &str); 11] = [
-    (Theme::Aurora, "Аврора ✦"),
-    (Theme::Sunset, "Закат ✦"),
-    (Theme::Ocean, "Океан ✦"),
-    (Theme::Neon, "Неон ✦"),
-    (Theme::AdwaitaDark, "GNOME тёмная"),
-    (Theme::AdwaitaLight, "GNOME светлая"),
-    (Theme::Catppuccin, "Catppuccin"),
-    (Theme::Nord, "Nord"),
-    (Theme::Dark, "Rustcord"),
-    (Theme::Midnight, "AMOLED"),
-    (Theme::Light, "Светлая"),
+/// Темы в порядке показа в настройках, по группам.
+pub const THEME_GROUPS: [(&str, &[(Theme, &str)]); 3] = [
+    (
+        "Живые — с плавающим светящимся фоном",
+        &[
+            (Theme::Aurora, "Аврора"),
+            (Theme::Sunset, "Закат"),
+            (Theme::Ocean, "Океан"),
+            (Theme::Neon, "Неон"),
+            (Theme::Lavender, "Лаванда"),
+            (Theme::Forest, "Лес"),
+            (Theme::Cosmos, "Космос"),
+        ],
+    ),
+    (
+        "Тёмные",
+        &[
+            (Theme::Classic, "Классика"),
+            (Theme::AdwaitaDark, "GNOME тёмная"),
+            (Theme::Catppuccin, "Catppuccin"),
+            (Theme::TokyoNight, "Tokyo Night"),
+            (Theme::Dracula, "Dracula"),
+            (Theme::RosePine, "Rosé Pine"),
+            (Theme::Gruvbox, "Gruvbox"),
+            (Theme::Nord, "Nord"),
+            (Theme::Dark, "Rustcord"),
+            (Theme::Midnight, "AMOLED"),
+        ],
+    ),
+    (
+        "Светлые",
+        &[
+            (Theme::Light, "Светлая"),
+            (Theme::AdwaitaLight, "GNOME светлая"),
+            (Theme::Sakura, "Сакура"),
+            (Theme::Mint, "Мята"),
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy)]
@@ -72,6 +101,8 @@ pub fn palette(s: &Settings) -> Palette {
 pub struct Backdrop {
     pub base: Color32,
     pub glows: [Color32; 3],
+    /// Мерцающие звёзды поверх пятен (тема «Космос»).
+    pub stars: bool,
 }
 
 pub fn backdrop(theme: Theme) -> Option<Backdrop> {
@@ -79,18 +110,37 @@ pub fn backdrop(theme: Theme) -> Option<Backdrop> {
         Theme::Aurora => Backdrop {
             base: rgb(6, 10, 20),
             glows: [rgb(20, 184, 166), rgb(99, 102, 241), rgb(34, 197, 94)],
+            stars: false,
         },
         Theme::Sunset => Backdrop {
             base: rgb(18, 8, 20),
             glows: [rgb(249, 115, 22), rgb(236, 72, 153), rgb(139, 92, 246)],
+            stars: false,
         },
         Theme::Ocean => Backdrop {
             base: rgb(3, 14, 24),
             glows: [rgb(14, 165, 233), rgb(6, 182, 212), rgb(59, 90, 246)],
+            stars: false,
         },
         Theme::Neon => Backdrop {
             base: rgb(7, 6, 13),
             glows: [rgb(217, 70, 239), rgb(34, 211, 238), rgb(163, 230, 53)],
+            stars: false,
+        },
+        Theme::Lavender => Backdrop {
+            base: rgb(14, 10, 26),
+            glows: [rgb(167, 139, 250), rgb(244, 114, 182), rgb(96, 165, 250)],
+            stars: false,
+        },
+        Theme::Forest => Backdrop {
+            base: rgb(5, 14, 10),
+            glows: [rgb(34, 197, 94), rgb(20, 184, 166), rgb(234, 179, 8)],
+            stars: false,
+        },
+        Theme::Cosmos => Backdrop {
+            base: rgb(4, 3, 14),
+            glows: [rgb(124, 58, 237), rgb(37, 99, 235), rgb(219, 39, 119)],
+            stars: true,
         },
         _ => return None,
     })
@@ -132,8 +182,221 @@ fn glass(
     }
 }
 
+/// Обычная (непрозрачная) тёмная палитра по ключевым цветам.
+#[allow(clippy::too_many_arguments)]
+fn solid_dark(
+    rail: Color32,
+    side: Color32,
+    main: Color32,
+    elevated: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    link: Color32,
+    danger: Color32,
+    ok: Color32,
+    warn: Color32,
+    radius: f32,
+) -> Palette {
+    Palette {
+        rail,
+        side,
+        main,
+        header: main,
+        elevated,
+        hover: mix(elevated, text, 0.06),
+        selected: mix(elevated, text, 0.12),
+        msg_hover: mix(main, elevated, 0.45),
+        text,
+        muted,
+        faint: mix(muted, main, 0.35),
+        border: mix(main, text, 0.08),
+        accent,
+        link,
+        danger,
+        ok,
+        warn,
+        radius,
+        light: false,
+    }
+}
+
+/// Обычная светлая палитра по ключевым цветам.
+#[allow(clippy::too_many_arguments)]
+fn solid_light(
+    rail: Color32,
+    side: Color32,
+    main: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    link: Color32,
+    danger: Color32,
+    ok: Color32,
+    warn: Color32,
+    radius: f32,
+) -> Palette {
+    Palette {
+        rail,
+        side,
+        main,
+        header: main,
+        elevated: mix(side, main, 0.4),
+        hover: mix(side, text, 0.06),
+        selected: mix(side, text, 0.11),
+        msg_hover: mix(main, side, 0.5),
+        text,
+        muted,
+        faint: mix(muted, main, 0.35),
+        border: mix(side, text, 0.09),
+        accent,
+        link,
+        danger,
+        ok,
+        warn,
+        radius,
+        light: true,
+    }
+}
+
+/// Плавное смешивание двух цветов (t = 0 → a, t = 1 → b).
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        l(a.r(), b.r()),
+        l(a.g(), b.g()),
+        l(a.b(), b.b()),
+        l(a.a(), b.a()),
+    )
+}
+
 pub fn palette_for(theme: Theme, accent: Color32) -> Palette {
     match theme {
+        Theme::Lavender => glass(
+            (16, 12, 30),
+            accent,
+            rgb(196, 181, 253),
+            rgb(245, 243, 255),
+            rgb(190, 180, 220),
+        ),
+        Theme::Forest => glass(
+            (6, 18, 12),
+            accent,
+            rgb(134, 239, 172),
+            rgb(236, 253, 245),
+            rgb(160, 200, 180),
+        ),
+        Theme::Cosmos => glass(
+            (6, 5, 20),
+            accent,
+            rgb(165, 180, 252),
+            rgb(238, 240, 255),
+            rgb(170, 172, 210),
+        ),
+        Theme::Classic => Palette {
+            rail: rgb(30, 31, 34),
+            side: rgb(43, 45, 49),
+            main: rgb(49, 51, 56),
+            header: rgb(49, 51, 56),
+            elevated: rgb(56, 58, 64),
+            hover: rgb(53, 55, 60),
+            selected: rgb(64, 66, 73),
+            msg_hover: rgb(46, 48, 53),
+            text: rgb(242, 243, 245),
+            muted: rgb(181, 186, 193),
+            faint: rgb(128, 132, 142),
+            border: rgb(38, 40, 44),
+            accent,
+            link: rgb(0, 168, 252),
+            danger: rgb(242, 63, 66),
+            ok: rgb(35, 165, 90),
+            warn: rgb(240, 178, 50),
+            radius: 8.0,
+            light: false,
+        },
+        Theme::TokyoNight => solid_dark(
+            rgb(22, 22, 30),
+            rgb(26, 27, 38),
+            rgb(31, 33, 48),
+            rgb(41, 46, 66),
+            rgb(192, 202, 245),
+            rgb(154, 165, 206),
+            accent,
+            rgb(122, 162, 247),
+            rgb(247, 118, 142),
+            rgb(158, 206, 106),
+            rgb(224, 175, 104),
+            12.0,
+        ),
+        Theme::Dracula => solid_dark(
+            rgb(25, 26, 33),
+            rgb(33, 34, 44),
+            rgb(40, 42, 54),
+            rgb(55, 57, 74),
+            rgb(248, 248, 242),
+            rgb(189, 190, 210),
+            accent,
+            rgb(139, 233, 253),
+            rgb(255, 85, 85),
+            rgb(80, 250, 123),
+            rgb(241, 250, 140),
+            10.0,
+        ),
+        Theme::RosePine => solid_dark(
+            rgb(16, 14, 23),
+            rgb(25, 23, 36),
+            rgb(31, 29, 46),
+            rgb(38, 35, 58),
+            rgb(224, 222, 244),
+            rgb(144, 140, 170),
+            accent,
+            rgb(156, 207, 216),
+            rgb(235, 111, 146),
+            rgb(49, 116, 143),
+            rgb(246, 193, 119),
+            14.0,
+        ),
+        Theme::Gruvbox => solid_dark(
+            rgb(24, 24, 24),
+            rgb(32, 32, 32),
+            rgb(40, 40, 40),
+            rgb(60, 56, 54),
+            rgb(235, 219, 178),
+            rgb(189, 174, 147),
+            accent,
+            rgb(131, 165, 152),
+            rgb(251, 73, 52),
+            rgb(184, 187, 38),
+            rgb(250, 189, 47),
+            6.0,
+        ),
+        Theme::Sakura => solid_light(
+            rgb(246, 222, 230),
+            rgb(253, 236, 242),
+            rgb(255, 250, 252),
+            rgb(60, 32, 46),
+            rgb(128, 92, 110),
+            accent,
+            rgb(199, 54, 120),
+            rgb(208, 36, 72),
+            rgb(30, 150, 100),
+            rgb(176, 112, 0),
+            14.0,
+        ),
+        Theme::Mint => solid_light(
+            rgb(213, 238, 228),
+            rgb(232, 246, 240),
+            rgb(250, 254, 252),
+            rgb(20, 44, 36),
+            rgb(78, 110, 98),
+            accent,
+            rgb(4, 120, 87),
+            rgb(200, 40, 50),
+            rgb(16, 150, 100),
+            rgb(170, 110, 0),
+            12.0,
+        ),
         Theme::Aurora => glass(
             (8, 14, 26),
             accent,
@@ -325,8 +588,15 @@ pub fn apply(ctx: &egui::Context, pal: &Palette, _theme: Theme) {
     v.faint_bg_color = pal.elevated;
     v.code_bg_color = pal.elevated;
     v.hyperlink_color = pal.link;
-    v.selection.bg_fill = pal.accent.gamma_multiply(0.6);
+    v.selection.bg_fill = pal.accent.gamma_multiply(0.45);
     v.selection.stroke = Stroke::new(1.0, pal.text);
+    v.text_cursor.stroke = Stroke::new(2.0, pal.accent);
+    v.striped = false;
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Circle;
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    v.warn_fg_color = pal.warn;
+    v.error_fg_color = pal.danger;
     v.window_rounding = Rounding::same(pal.radius + 4.0);
     v.menu_rounding = Rounding::same(pal.radius);
     let shadow_alpha = if pal.light { 40 } else { 110 };
@@ -359,9 +629,9 @@ pub fn apply(ctx: &egui::Context, pal: &Palette, _theme: Theme) {
     v.widgets.hovered.rounding = r;
     v.widgets.hovered.bg_fill = pal.hover;
     v.widgets.hovered.weak_bg_fill = pal.hover;
-    v.widgets.hovered.bg_stroke = Stroke::NONE;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, mix(pal.hover, pal.accent, 0.35));
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, pal.text);
-    v.widgets.hovered.expansion = 0.0;
+    v.widgets.hovered.expansion = 1.0;
 
     v.widgets.active.rounding = r;
     v.widgets.active.bg_fill = pal.accent;
@@ -369,16 +639,26 @@ pub fn apply(ctx: &egui::Context, pal: &Palette, _theme: Theme) {
     v.widgets.active.bg_stroke = Stroke::NONE;
     v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
 
+    v.widgets.active.expansion = 0.5;
+
     v.widgets.open.rounding = r;
     v.widgets.open.bg_fill = pal.selected;
     v.widgets.open.weak_bg_fill = pal.selected;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, pal.accent.gamma_multiply(0.6));
 
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(14.0, 7.0);
         s.spacing.interact_size.y = 32.0;
-        s.animation_time = 0.16;
+        s.animation_time = 0.18;
+        // тонкие «плавающие» полосы прокрутки, как в современном Discord
+        s.spacing.scroll = egui::style::ScrollStyle::floating();
+        s.spacing.scroll.bar_width = 8.0;
+        s.spacing.scroll.floating_allocated_width = 0.0;
+        s.spacing.menu_margin = egui::Margin::same(8.0);
+        s.spacing.window_margin = egui::Margin::same(14.0);
+        s.spacing.text_edit_width = 280.0;
         s.text_styles
             .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
         s.text_styles.insert(
