@@ -319,6 +319,12 @@ pub struct Msg {
     pub pinned: bool,
     /// Ветка, созданная из сообщения: (id, название, сообщений).
     pub thread: Option<(u64, String, u32)>,
+    /// Метка отправки: по ней своё отправленное сообщение заменяет «черновик» в ленте.
+    pub nonce: Option<String>,
+    /// Своё сообщение ещё отправляется.
+    pub sending: bool,
+    /// Своё сообщение не отправилось: причина.
+    pub failed: Option<String>,
 }
 
 /// Один кадр картинки (у статичной — один, у GIF — много).
@@ -371,6 +377,7 @@ pub enum Cmd {
         channel_id: u64,
         content: String,
         reply_to: Option<u64>,
+        nonce: String,
     },
     Edit {
         channel_id: u64,
@@ -449,6 +456,12 @@ pub enum Event {
         id: u64,
     },
     MessageCreate(Msg),
+    /// Своё сообщение не отправилось (по метке nonce).
+    SendFailed {
+        channel_id: u64,
+        nonce: String,
+        error: String,
+    },
     MessageUpdate {
         id: u64,
         channel_id: u64,
@@ -1076,6 +1089,9 @@ struct RawMessage {
     pinned: bool,
     #[serde(default)]
     thread: Option<RawChannel>,
+    /// Discord присылает nonce строкой или числом.
+    #[serde(default)]
+    nonce: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1369,6 +1385,13 @@ fn convert_msg(m: RawMessage) -> Msg {
                 t.message_count.unwrap_or(0),
             )
         }),
+        nonce: m.nonce.as_ref().and_then(|n| match n {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(x) => Some(x.to_string()),
+            _ => None,
+        }),
+        sending: false,
+        failed: None,
     }
 }
 
@@ -1701,10 +1724,10 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                                 channel_id,
                                 content,
                             }),
-                            Ok(r) => sink.send(Event::Error(format!(
-                                "Не изменено: {}",
-                                http_error(r.status())
-                            ))),
+                            Ok(r) => {
+ let e = rest_error(r).await;
+ sink.send(Event::Error(format!("Не изменено: {e}")))
+ }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Не изменено, нет связи: {e}")))
                             }
@@ -1730,10 +1753,10 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                                 id: message_id,
                                 channel_id,
                             }),
-                            Ok(r) => sink.send(Event::Error(format!(
-                                "Не удалено: {}",
-                                http_error(r.status())
-                            ))),
+                            Ok(r) => {
+ let e = rest_error(r).await;
+ sink.send(Event::Error(format!("Не удалено: {e}")))
+ }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Не удалено, нет связи: {e}")))
                             }
@@ -1761,10 +1784,10 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         };
                         match req.header("Authorization", a.header()).send_rl().await {
                             Ok(r) if r.status().is_success() => {}
-                            Ok(r) => sink.send(Event::Error(format!(
-                                "Реакция не поставлена: {}",
-                                http_error(r.status())
-                            ))),
+                            Ok(r) => {
+ let e = rest_error(r).await;
+ sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
+ }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
                             }
@@ -1802,13 +1825,19 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                 channel_id,
                 content,
                 reply_to,
+                nonce,
             } => {
                 if let Some(a) = auth.clone() {
                     let (http, sink) = (http.clone(), sink.clone());
                     tokio::spawn(async move {
-                        match send_message(&http, &a, channel_id, &content, reply_to).await {
+                        match send_message(&http, &a, channel_id, &content, reply_to, &nonce).await
+                        {
                             Ok(m) => sink.send(Event::MessageCreate(m)),
-                            Err(e) => sink.send(Event::Error(e)),
+                            Err(error) => sink.send(Event::SendFailed {
+                                channel_id,
+                                nonce,
+                                error,
+                            }),
                         }
                     });
                 }
@@ -1909,7 +1938,7 @@ impl SendRl for reqwest::RequestBuilder {
 
 /// Уникальный nonce для отправки: Discord по нему отбрасывает дубликаты,
 /// если запрос пришлось повторить.
-fn nonce() -> String {
+pub fn nonce() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1946,17 +1975,8 @@ async fn api_call(
         }
         return Ok(text);
     }
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    if v.get("captcha_key").is_some() || v.get("captcha_sitekey").is_some() {
-        return Err(
-            "Discord требует капчу для этого действия — сделайте его один раз в официальном клиенте или браузере"
-                .into(),
-        );
-    }
-    match v.get("message").and_then(|m| m.as_str()) {
-        Some(msg) => Err(format!("{} ({msg})", http_error(status))),
-        None => Err(http_error(status)),
-    }
+    crate::store::log(&format!("REST {status} {path}: {}", text.chars().take(400).collect::<String>()));
+    Err(explain_error(status, &text))
 }
 
 /// Сообщения из ответа REST (массив).
@@ -2032,9 +2052,76 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
+/// Понятное объяснение отказа Discord: код ошибки из тела ответа, а не просто «HTTP 400».
+async fn rest_error(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    crate::store::log(&format!("REST {status}: {}", text.chars().take(400).collect::<String>()));
+    explain_error(status, &text)
+}
+
+fn explain_error(status: reqwest::StatusCode, text: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    if v.get("captcha_key").is_some() || v.get("captcha_sitekey").is_some() {
+        return "Discord требует пройти капчу. Rustcord не умеет её показывать: отправьте одно \
+                сообщение в этот чат из браузера (discord.com/app) или официального приложения, \
+                после этого отправка отсюда снова заработает."
+            .into();
+    }
+    let code = v.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+    let known = match code {
+        50006 => Some("Нельзя отправить пустое сообщение"),
+        50007 => Some("Этот пользователь не принимает личные сообщения от вас"),
+        50008 => Some("В этот канал нельзя отправлять сообщения"),
+        50013 => Some("Не хватает прав для этого действия"),
+        50001 => Some("Нет доступа к каналу"),
+        50035 => None, // ошибка в данных — ниже покажем подробности
+        40002 => Some("Discord требует подтвердить аккаунт (почту или телефон) в официальном приложении"),
+        20016 => Some("В канале включён медленный режим — подождите"),
+        20028 => Some("Слишком часто: в канале действует ограничение скорости"),
+        40005 => Some("Файл слишком большой"),
+        160002 => Some("Нельзя ответить на системное сообщение"),
+        240000 => Some("Сообщение заблокировано фильтром сервера (AutoMod)"),
+        200000 | 200001 => Some("Сообщение заблокировано автомодерацией сервера"),
+        _ => None,
+    };
+    if let Some(k) = known {
+        return k.into();
+    }
+    let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    // Подробности ошибки формы: первое поле и его причина.
+    fn first_error(v: &serde_json::Value, path: &mut Vec<String>) -> Option<String> {
+        if let Some(arr) = v.get("_errors").and_then(|e| e.as_array()) {
+            if let Some(m) = arr.first().and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                return Some(format!("{}: {m}", path.join(".")));
+            }
+        }
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if k == "_errors" {
+                    continue;
+                }
+                path.push(k.clone());
+                if let Some(r) = first_error(val, path) {
+                    return Some(r);
+                }
+                path.pop();
+            }
+        }
+        None
+    }
+    let detail = v.get("errors").and_then(|e| first_error(e, &mut Vec::new()));
+    match (msg.is_empty(), detail) {
+        (_, Some(d)) => format!("{} — {d}", http_error(status)),
+        (false, None) => format!("{} ({msg})", http_error(status)),
+        (true, None) => http_error(status),
+    }
+}
+
 fn http_error(status: reqwest::StatusCode) -> String {
     match status.as_u16() {
         401 => "Токен недействителен".into(),
+        400 => "Discord отклонил запрос".into(),
         403 => "Нет доступа к этому каналу".into(),
         404 => "Канал не найден".into(),
         413 => "Файл слишком большой для Discord".into(),
@@ -2077,8 +2164,15 @@ async fn send_message(
     channel_id: u64,
     content: &str,
     reply_to: Option<u64>,
+    nonce: &str,
 ) -> Result<Msg, String> {
-    let mut body = json!({ "content": content, "nonce": nonce(), "enforce_nonce": true });
+    if content.chars().count() > 2000 {
+        return Err(format!(
+            "Сообщение длиннее 2000 символов ({}), Discord такие не принимает",
+            content.chars().count()
+        ));
+    }
+    let mut body = json!({ "content": content, "nonce": nonce, "tts": false, "flags": 0 });
     if let Some(id) = reply_to {
         body["message_reference"] =
             json!({ "message_id": id.to_string(), "fail_if_not_exists": false });
@@ -2091,7 +2185,7 @@ async fn send_message(
         .await
         .map_err(|e| format!("Не отправлено, нет связи: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Не отправлено: {}", http_error(resp.status())));
+        return Err(rest_error(resp).await);
     }
     let raw: RawMessage = resp
         .json()
@@ -2138,7 +2232,7 @@ async fn upload_file(
         .await
         .map_err(|e| format!("Файл не отправлен, нет связи: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Файл не отправлен: {}", http_error(resp.status())));
+        return Err(format!("Файл не отправлен: {}", rest_error(resp).await));
     }
     let raw: RawMessage = resp
         .json()

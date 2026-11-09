@@ -155,6 +155,10 @@ enum Action {
     ToggleCategory(u64),
     LoadOlder(u64),
     Send(u64, String),
+    /// Повторить неотправленное сообщение (канал, nonce).
+    RetrySend(u64, String),
+    /// Убрать неотправленное сообщение из ленты.
+    DismissFailed(u64, String),
     Attach(u64),
     Download(String, String),
     OpenUrl(String),
@@ -684,6 +688,24 @@ impl App {
                     self.select_guild(self.sel_guild);
                 }
             }
+            Event::SendFailed {
+                channel_id,
+                nonce,
+                error,
+            } => {
+                let found = self.cache.get_mut(&channel_id).and_then(|c| {
+                    c.msgs
+                        .iter_mut()
+                        .find(|m| m.nonce.as_deref() == Some(nonce.as_str()))
+                });
+                match found {
+                    Some(m) => {
+                        m.sending = false;
+                        m.failed = Some(error);
+                    }
+                    None => self.toast(format!("Не отправлено: {error}"), true),
+                }
+            }
             Event::MessageCreate(m) => {
                 if let Some(list) = self.typing.get_mut(&m.channel_id) {
                     list.retain(|(uid, _, _)| *uid != m.author_id);
@@ -1013,6 +1035,16 @@ impl App {
         if let Some(c) = self.cache.get_mut(&cid) {
             if c.msgs.iter().rev().take(30).any(|x| x.id == m.id) {
                 return;
+            }
+            // Подтверждение своего сообщения: заменяем «черновик» с тем же nonce.
+            if let Some(n) = m.nonce.as_deref() {
+                if let Some(pos) = c
+                    .msgs
+                    .iter()
+                    .rposition(|x| (x.sending || x.failed.is_some()) && x.nonce.as_deref() == Some(n))
+                {
+                    c.msgs.remove(pos);
+                }
             }
             let pos = c
                 .msgs
@@ -2589,13 +2621,69 @@ impl App {
                         content,
                     });
                 } else {
-                    let reply_to = self.reply_to.take().map(|(id, _)| id);
+                    let reply = self.reply_to.take();
+                    let reply_to = reply.as_ref().map(|(id, _)| *id);
+                    let nonce = discord::nonce();
+                    // Сообщение сразу появляется в ленте (полупрозрачным), пока Discord не подтвердит.
+                    let local = Msg {
+                        id: nonce.parse().unwrap_or(u64::MAX - 1),
+                        channel_id,
+                        guild_id: self.sel_guild,
+                        author_id: self.me_id,
+                        author: self.me_name.clone(),
+                        author_avatar: self.me_avatar.clone(),
+                        content: content.clone(),
+                        time: chrono::Local::now().format("%d.%m.%Y %H:%M").to_string(),
+                        edited: false,
+                        system: false,
+                        attachments: Vec::new(),
+                        embeds: Vec::new(),
+                        reply: reply.map(|(_, author)| discord::Reply {
+                            author,
+                            content: String::new(),
+                        }),
+                        reactions: Vec::new(),
+                        mentions: Vec::new(),
+                        mention_everyone: false,
+                        mention_roles: Vec::new(),
+                        pinned: false,
+                        thread: None,
+                        nonce: Some(nonce.clone()),
+                        sending: true,
+                        failed: None,
+                    };
+                    if let Some(c) = self.cache.get_mut(&channel_id) {
+                        c.msgs.push_back(local);
+                    }
                     let _ = self.cmd.send(Cmd::Send {
                         channel_id,
                         content,
                         reply_to,
+                        nonce,
                     });
                     self.scroll_until = Some(Instant::now() + Duration::from_millis(1500));
+                }
+            }
+            Action::RetrySend(channel_id, nonce) => {
+                let found = self.cache.get_mut(&channel_id).and_then(|c| {
+                    c.msgs
+                        .iter_mut()
+                        .find(|m| m.nonce.as_deref() == Some(nonce.as_str()))
+                });
+                if let Some(m) = found {
+                    m.failed = None;
+                    m.sending = true;
+                    let _ = self.cmd.send(Cmd::Send {
+                        channel_id,
+                        content: m.content.clone(),
+                        reply_to: None,
+                        nonce,
+                    });
+                }
+            }
+            Action::DismissFailed(channel_id, nonce) => {
+                if let Some(c) = self.cache.get_mut(&channel_id) {
+                    c.msgs.retain(|m| m.nonce.as_deref() != Some(nonce.as_str()) || m.failed.is_none());
                 }
             }
             Action::Attach(cid) => {
@@ -3800,7 +3888,31 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
 
     let bg = ui.painter().add(egui::Shape::Noop);
     let full_width = ui.available_width();
+    // Плавное появление только что пришедших сообщений (история грузится без анимации).
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let fresh = m.sending || now_ms.saturating_sub(snowflake_ms(m.id)) < 8_000;
+    let appear = if fresh {
+        let id = egui::Id::new(("appear", m.channel_id, m.nonce.as_deref().unwrap_or(""), m.id));
+        let now = ui.input(|i| i.time);
+        let key = m.nonce.as_deref().map(|n| egui::Id::new(("appear-n", n))).unwrap_or(id);
+        let t0 = ui
+            .ctx()
+            .memory_mut(|mem| *mem.data.get_temp_mut_or_insert_with(key, || now));
+        let a = ((now - t0) / 0.22).clamp(0.0, 1.0) as f32;
+        if a < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        a
+    } else {
+        1.0
+    };
+    let opacity = if m.sending { 0.55 } else { 1.0 } * (0.25 + 0.75 * appear);
+    let slide = (1.0 - appear) * 6.0;
+    if slide > 0.0 {
+        ui.add_space(slide);
+    }
     let row = ui.horizontal_top(|ui| {
+        ui.multiply_opacity(opacity);
         ui.add_space(16.0);
         let gutter = if compact { 0.0 } else { 40.0 };
         if gutter > 0.0 {
@@ -3838,14 +3950,7 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             ui.set_max_width((full_width - gutter - 56.0).max(120.0));
             ui.spacing_mut().item_spacing.y = 3.0;
             if let Some(r) = &m.reply {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("↪ {}: {}", r.author, r.content))
-                            .small()
-                            .color(pal.muted),
-                    )
-                    .truncate(),
-                );
+                reply_preview(ui, &pal, r, gutter);
             }
             if !grouped {
                 ui.horizontal(|ui| {
@@ -3860,7 +3965,12 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                     if nr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         cx.actions.push(Action::OpenProfile(m.author_id));
                     }
-                    ui.label(RichText::new(m.time.as_str()).small().color(pal.faint));
+                    ui.label(
+                        RichText::new(pretty_time(&m.time))
+                            .size(11.5)
+                            .color(pal.faint),
+                    )
+                    .on_hover_text(m.time.as_str());
                     if m.pinned {
                         ui.label(RichText::new("📌").small().color(pal.faint))
                             .on_hover_text("Закреплено");
@@ -3882,6 +3992,39 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             }
             if m.edited {
                 ui.label(RichText::new("(изменено)").small().color(pal.faint));
+            }
+            if m.sending {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(11.0).color(pal.faint));
+                    ui.label(RichText::new("отправляется…").small().color(pal.faint));
+                });
+            }
+            if let Some(err) = &m.failed {
+                egui::Frame::none()
+                    .fill(pal.danger.gamma_multiply(0.12))
+                    .stroke(Stroke::new(1.0, pal.danger.gamma_multiply(0.5)))
+                    .rounding(8.0)
+                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("⚠ Не отправлено: {err}"))
+                                .size(13.0)
+                                .color(pal.danger),
+                        );
+                        ui.horizontal(|ui| {
+                            let nonce = m.nonce.clone().unwrap_or_default();
+                            if toggle_chip(ui, &pal, "↻ Повторить", true).clicked() {
+                                cx.actions
+                                    .push(Action::RetrySend(m.channel_id, nonce.clone()));
+                            }
+                            if toggle_chip(ui, &pal, "Убрать", false).clicked() {
+                                cx.actions.push(Action::DismissFailed(m.channel_id, nonce));
+                            }
+                            if toggle_chip(ui, &pal, "Копировать текст", false).clicked() {
+                                cx.actions.push(Action::CopyText(m.content.clone()));
+                            }
+                        });
+                    });
             }
             if m.content.is_empty() && m.attachments.is_empty() && m.embeds.is_empty() && !m.system
             {
@@ -3942,22 +4085,43 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
         pos2(ui.max_rect().right(), row.response.rect.bottom() + 2.0),
     );
     let hovered = ui.rect_contains_pointer(rect.expand2(vec2(0.0, 6.0)));
+    let hover_t = ui.ctx().animate_bool_with_time(
+        egui::Id::new(("msg-hover", m.channel_id, m.id)),
+        hovered,
+        0.10,
+    );
     let mentioned = m.author_id != cx.me_id
         && (m.mention_everyone || m.mentions.iter().any(|(id, _)| *id == cx.me_id));
+    let card = rect.shrink2(vec2(6.0, 0.0));
     if mentioned {
-        let tint = if hovered { 0.16 } else { 0.10 };
+        let tint = 0.10 + 0.06 * hover_t;
         ui.painter().set(
             bg,
-            egui::Shape::rect_filled(rect, 0.0, pal.warn.gamma_multiply(tint)),
+            egui::Shape::rect_filled(card, 6.0, pal.warn.gamma_multiply(tint)),
         );
         ui.painter().rect_filled(
-            Rect::from_min_size(rect.left_top(), vec2(2.5, rect.height())),
-            0.0,
+            Rect::from_min_size(card.left_top(), vec2(3.0, card.height())),
+            Rounding {
+                nw: 6.0,
+                sw: 6.0,
+                ne: 0.0,
+                se: 0.0,
+            },
             pal.warn,
         );
-    } else if hovered {
-        ui.painter()
-            .set(bg, egui::Shape::rect_filled(rect, 0.0, pal.msg_hover));
+    } else if m.failed.is_some() {
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(card, 6.0, pal.danger.gamma_multiply(0.05)),
+        );
+    } else if hover_t > 0.01 {
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(card, 6.0, pal.msg_hover.gamma_multiply(hover_t)),
+        );
+    }
+    if m.sending || m.failed.is_some() {
+        return;
     }
     if hovered && !m.system && ui.input(|i| i.pointer.secondary_clicked()) {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -3967,6 +4131,76 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
     }
     if hovered && cx.toolbar_allowed && !m.system {
         message_toolbar(ui, cx, m, rect);
+    }
+}
+
+/// Ответ на сообщение: «изгиб» от аватарки, мини-аватар, имя и начало текста — как в Discord.
+fn reply_preview(ui: &mut egui::Ui, pal: &Palette, r: &discord::Reply, gutter: f32) {
+    let h = 18.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    if gutter > 0.0 {
+        // линия-изгиб уходит в колонку аватарки
+        let x0 = rect.left() - gutter / 2.0 - 4.0;
+        let y0 = rect.bottom() + 4.0;
+        let x1 = rect.left() - 4.0;
+        let y1 = rect.center().y;
+        let stroke = Stroke::new(2.0, pal.faint.gamma_multiply(0.7));
+        let r6 = 6.0;
+        ui.painter()
+            .line_segment([pos2(x0, y0), pos2(x0, y1 + r6)], stroke);
+        ui.painter().add(egui::Shape::line(
+            arc(pos2(x0 + r6, y1 + r6), r6, std::f32::consts::PI, 1.5 * std::f32::consts::PI),
+            stroke,
+        ));
+        ui.painter()
+            .line_segment([pos2(x0 + r6, y1), pos2(x1, y1)], stroke);
+    }
+    let mut x = rect.left();
+    let cy = rect.center().y;
+    let id = r.author.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+    ui.painter()
+        .circle_filled(pos2(x + 8.0, cy), 8.0, name_color(id));
+    ui.painter().text(
+        pos2(x + 8.0, cy),
+        Align2::CENTER_CENTER,
+        initials(&r.author).chars().next().unwrap_or('?').to_string(),
+        FontId::proportional(9.0),
+        Color32::WHITE,
+    );
+    x += 21.0;
+    let name = ui.painter().text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        if r.author.is_empty() { "Сообщение" } else { r.author.as_str() },
+        FontId::new(13.0, egui::FontFamily::Name("bold".into())),
+        pal.muted,
+    );
+    x = name.right() + 6.0;
+    let clip = Rect::from_min_max(pos2(x, rect.top()), rect.max);
+    ui.painter_at(clip).text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        if r.content.is_empty() { "…" } else { r.content.as_str() },
+        FontId::proportional(13.0),
+        pal.faint,
+    );
+}
+
+/// «Сегодня в 08:19», «Вчера в 21:03» или полная дата для старых сообщений.
+fn pretty_time(time: &str) -> String {
+    // time: «dd.mm.yyyy HH:MM»
+    let (date, clock) = match time.split_once(' ') {
+        Some(x) => x,
+        None => return time.to_string(),
+    };
+    let today = chrono::Local::now();
+    let fmt = |d: chrono::DateTime<chrono::Local>| d.format("%d.%m.%Y").to_string();
+    if date == fmt(today) {
+        format!("Сегодня в {clock}")
+    } else if date == fmt(today - chrono::Duration::days(1)) {
+        format!("Вчера в {clock}")
+    } else {
+        format!("{date} {clock}")
     }
 }
 
