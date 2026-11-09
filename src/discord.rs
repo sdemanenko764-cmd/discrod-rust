@@ -1725,9 +1725,9 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                                 content,
                             }),
                             Ok(r) => {
- let e = rest_error(r).await;
- sink.send(Event::Error(format!("Не изменено: {e}")))
- }
+                                let e = rest_error(r).await;
+                                sink.send(Event::Error(format!("Не изменено: {e}")))
+                            }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Не изменено, нет связи: {e}")))
                             }
@@ -1754,9 +1754,9 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                                 channel_id,
                             }),
                             Ok(r) => {
- let e = rest_error(r).await;
- sink.send(Event::Error(format!("Не удалено: {e}")))
- }
+                                let e = rest_error(r).await;
+                                sink.send(Event::Error(format!("Не удалено: {e}")))
+                            }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Не удалено, нет связи: {e}")))
                             }
@@ -1785,9 +1785,9 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                         match req.header("Authorization", a.header()).send_rl().await {
                             Ok(r) if r.status().is_success() => {}
                             Ok(r) => {
- let e = rest_error(r).await;
- sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
- }
+                                let e = rest_error(r).await;
+                                sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
+                            }
                             Err(e) => {
                                 sink.send(Event::Error(format!("Реакция не поставлена: {e}")))
                             }
@@ -1975,7 +1975,10 @@ async fn api_call(
         }
         return Ok(text);
     }
-    crate::store::log(&format!("REST {status} {path}: {}", text.chars().take(400).collect::<String>()));
+    crate::store::log(&format!(
+        "REST {status} {path}: {}",
+        text.chars().take(400).collect::<String>()
+    ));
     Err(explain_error(status, &text))
 }
 
@@ -2056,7 +2059,10 @@ pub fn percent_encode(s: &str) -> String {
 async fn rest_error(resp: reqwest::Response) -> String {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    crate::store::log(&format!("REST {status}: {}", text.chars().take(400).collect::<String>()));
+    crate::store::log(&format!(
+        "REST {status}: {}",
+        text.chars().take(400).collect::<String>()
+    ));
     explain_error(status, &text)
 }
 
@@ -2076,7 +2082,9 @@ fn explain_error(status: reqwest::StatusCode, text: &str) -> String {
         50013 => Some("Не хватает прав для этого действия"),
         50001 => Some("Нет доступа к каналу"),
         50035 => None, // ошибка в данных — ниже покажем подробности
-        40002 => Some("Discord требует подтвердить аккаунт (почту или телефон) в официальном приложении"),
+        40002 => {
+            Some("Discord требует подтвердить аккаунт (почту или телефон) в официальном приложении")
+        }
         20016 => Some("В канале включён медленный режим — подождите"),
         20028 => Some("Слишком часто: в канале действует ограничение скорости"),
         40005 => Some("Файл слишком большой"),
@@ -2092,7 +2100,11 @@ fn explain_error(status: reqwest::StatusCode, text: &str) -> String {
     // Подробности ошибки формы: первое поле и его причина.
     fn first_error(v: &serde_json::Value, path: &mut Vec<String>) -> Option<String> {
         if let Some(arr) = v.get("_errors").and_then(|e| e.as_array()) {
-            if let Some(m) = arr.first().and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+            if let Some(m) = arr
+                .first()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
                 return Some(format!("{}: {m}", path.join(".")));
             }
         }
@@ -2110,7 +2122,9 @@ fn explain_error(status: reqwest::StatusCode, text: &str) -> String {
         }
         None
     }
-    let detail = v.get("errors").and_then(|e| first_error(e, &mut Vec::new()));
+    let detail = v
+        .get("errors")
+        .and_then(|e| first_error(e, &mut Vec::new()));
     match (msg.is_empty(), detail) {
         (_, Some(d)) => format!("{} — {d}", http_error(status)),
         (false, None) => format!("{} ({msg})", http_error(status)),
@@ -3278,6 +3292,10 @@ impl VoiceManager {
             return;
         }
         if self.watching.as_ref().map_or(false, |w| w.key == key) {
+            return;
+        }
+        // Свою трансляцию через сервер не смотрим: тот же ключ уже занят отправкой.
+        if self.outgoing.as_ref().map_or(false, |o| o.key == key) {
             return;
         }
         self.stop_watching(out, sink);

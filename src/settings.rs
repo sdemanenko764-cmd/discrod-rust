@@ -49,6 +49,8 @@ pub struct Settings {
     pub stream_monitor: usize,
     pub stream_height: u32,
     pub stream_fps: u32,
+    /// Качество трансляции: 0 — экономно, 1 — баланс, 2 — чётко.
+    pub stream_quality: u8,
     pub notifications: bool,
     pub status: String,
     pub custom_status: String,
@@ -76,6 +78,7 @@ impl Default for Settings {
             stream_monitor: 0,
             stream_height: 720,
             stream_fps: 30,
+            stream_quality: 1,
             notifications: true,
             status: "online".into(),
             custom_status: String::new(),
@@ -94,6 +97,7 @@ pub fn load() -> Settings {
     s.mic_threshold = s.mic_threshold.clamp(0.001, 0.08);
     s.stream_height = s.stream_height.clamp(360, 1440);
     s.stream_fps = s.stream_fps.clamp(5, 60);
+    s.stream_quality = s.stream_quality.min(2);
     s
 }
 

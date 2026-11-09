@@ -150,6 +150,8 @@ enum Action {
     StopStream,
     WatchStream(u64),
     StopWatching,
+    /// Развернуть трансляцию на всё окно / свернуть обратно.
+    ToggleStreamFullscreen,
     SelectGuild(Option<u64>),
     OpenChannel(u64),
     ToggleCategory(u64),
@@ -258,7 +260,14 @@ struct App {
     /// чью трансляцию смотрим: (ключ, id автора)
     watching: Option<(String, u64)>,
     stream_tex: Option<egui::TextureHandle>,
+    stream_fullscreen: bool,
     stream_picker: bool,
+    /// Окна для трансляции: (id, заголовок, приложение).
+    windows: Vec<(u32, String, String)>,
+    /// Вкладка выбора: false — экраны, true — окна.
+    stream_windows_tab: bool,
+    /// Выбранное окно (если транслируем окно, а не экран).
+    stream_window: Option<u32>,
     monitors: Vec<(String, u32, u32)>,
 
     // профили, статусы, друзья
@@ -361,7 +370,11 @@ impl App {
             stream_live: false,
             watching: None,
             stream_tex: None,
+            stream_fullscreen: false,
             stream_picker: false,
+            windows: Vec::new(),
+            stream_windows_tab: false,
+            stream_window: None,
             monitors: Vec::new(),
             users: HashMap::new(),
             presence: HashMap::new(),
@@ -1038,11 +1051,9 @@ impl App {
             }
             // Подтверждение своего сообщения: заменяем «черновик» с тем же nonce.
             if let Some(n) = m.nonce.as_deref() {
-                if let Some(pos) = c
-                    .msgs
-                    .iter()
-                    .rposition(|x| (x.sending || x.failed.is_some()) && x.nonce.as_deref() == Some(n))
-                {
+                if let Some(pos) = c.msgs.iter().rposition(|x| {
+                    (x.sending || x.failed.is_some()) && x.nonce.as_deref() == Some(n)
+                }) {
                     c.msgs.remove(pos);
                 }
             }
@@ -2683,7 +2694,9 @@ impl App {
             }
             Action::DismissFailed(channel_id, nonce) => {
                 if let Some(c) = self.cache.get_mut(&channel_id) {
-                    c.msgs.retain(|m| m.nonce.as_deref() != Some(nonce.as_str()) || m.failed.is_none());
+                    c.msgs.retain(|m| {
+                        m.nonce.as_deref() != Some(nonce.as_str()) || m.failed.is_none()
+                    });
                 }
             }
             Action::Attach(cid) => {
@@ -2823,7 +2836,14 @@ impl App {
                     );
                 } else {
                     self.monitors = stream::monitors();
-                    if self.monitors.is_empty() {
+                    self.windows = stream::windows();
+                    if self
+                        .stream_window
+                        .map_or(false, |id| !self.windows.iter().any(|w| w.0 == id))
+                    {
+                        self.stream_window = None;
+                    }
+                    if self.monitors.is_empty() && self.windows.is_empty() {
                         self.toast("Не удалось найти мониторы для захвата", true);
                     } else {
                         if self.settings.stream_monitor >= self.monitors.len() {
@@ -2840,8 +2860,14 @@ impl App {
                 self.stream_live = false;
                 let _ = self.cmd.send(Cmd::StartStream(stream::SendCfg {
                     monitor: self.settings.stream_monitor,
+                    window: if self.stream_windows_tab {
+                        self.stream_window
+                    } else {
+                        None
+                    },
                     height: self.settings.stream_height,
                     fps: self.settings.stream_fps,
+                    quality: self.settings.stream_quality,
                 }));
             }
             Action::StopStream => {
@@ -2856,13 +2882,28 @@ impl App {
                     self.stream_tex = None;
                     self.watching = Some((key.clone(), user_id));
                     self.stage_open = true;
-                    let _ = self.cmd.send(Cmd::WatchStream(key));
+                    // Свою трансляцию показываем из локального превью захвата:
+                    // «смотреть» себя через сервер нельзя, а запрос на просмотр
+                    // своего же ключа мог оборвать собственную трансляцию.
+                    if user_id != self.me_id {
+                        let _ = self.cmd.send(Cmd::WatchStream(key));
+                    }
                 }
             }
+            Action::ToggleStreamFullscreen => {
+                self.stream_fullscreen = !self.stream_fullscreen && self.watching.is_some();
+            }
             Action::StopWatching => {
+                self.stream_fullscreen = false;
+                let own = self
+                    .watching
+                    .as_ref()
+                    .map_or(false, |(_, u)| *u == self.me_id);
                 self.watching = None;
                 self.stream_tex = None;
-                let _ = self.cmd.send(Cmd::StopWatching);
+                if !own {
+                    let _ = self.cmd.send(Cmd::StopWatching);
+                }
             }
             Action::ToggleMute => {
                 self.self_mute = !self.self_mute;
@@ -3131,6 +3172,47 @@ impl App {
         Some(tiles)
     }
 
+    /// Трансляция на всё окно: Esc, двойной клик или кнопка — обратно.
+    fn stream_fullscreen_ui(&mut self, ctx: &egui::Context) {
+        if !self.stream_fullscreen {
+            return;
+        }
+        let Some((_, uid)) = self.watching.clone() else {
+            self.stream_fullscreen = false;
+            return;
+        };
+        let pal = self.pal;
+        let frame = self.stream_tex.as_ref().map(|t| (t.id(), t.size_vec2()));
+        let name = if uid == self.me_id {
+            "ваша трансляция".to_string()
+        } else {
+            self.users
+                .get(&uid)
+                .cloned()
+                .unwrap_or_else(|| "участник".into())
+        };
+        let mut actions = Vec::new();
+        egui::Area::new(egui::Id::new("stream_fullscreen"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let rect = ctx.screen_rect();
+                ui.allocate_rect(rect, Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+                draw_stream_view(ui, &pal, rect, &name, frame, true, &mut actions);
+                let r = ui.interact(rect, ui.id().with("fs_dbl"), Sense::click());
+                if r.double_clicked() {
+                    actions.push(Action::ToggleStreamFullscreen);
+                }
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            actions.push(Action::ToggleStreamFullscreen);
+        }
+        for a in actions {
+            self.handle_action(ctx, a);
+        }
+    }
+
     fn stream_picker_ui(&mut self, ctx: &egui::Context) {
         if !self.stream_picker {
             return;
@@ -3151,52 +3233,131 @@ impl App {
                     .inner_margin(Margin::same(20.0)),
             )
             .show(ctx, |ui| {
-                ui.set_width(440.0);
-                ui.label(RichText::new("ЭКРАН").size(11.5).strong().color(pal.muted));
-                ui.add_space(4.0);
-                for (i, (name, w, h)) in self.monitors.iter().enumerate() {
-                    let selected = self.settings.stream_monitor == i;
-                    let (rect, resp) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
-                    let hov = ui
-                        .ctx()
-                        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                    let fill = if selected {
-                        pal.accent.gamma_multiply(0.22)
-                    } else {
-                        mix(pal.elevated, pal.hover, hov)
-                    };
-                    ui.painter().rect_filled(rect, 12.0, fill);
-                    if selected {
-                        ui.painter()
-                            .rect_stroke(rect, 12.0, Stroke::new(1.5, pal.accent));
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    if toggle_chip(
+                        ui,
+                        &pal,
+                        &format!("🖥  Экраны · {}", self.monitors.len()),
+                        !self.stream_windows_tab,
+                    )
+                    .clicked()
+                    {
+                        self.stream_windows_tab = false;
                     }
-                    draw_icon(
-                        ui.painter(),
-                        Icon::Screen,
-                        rect.left_center() + vec2(28.0, 0.0),
-                        24.0,
-                        if selected { pal.accent } else { pal.muted },
-                        false,
-                    );
-                    ui.painter().text(
-                        rect.left_center() + vec2(56.0, -8.0),
-                        Align2::LEFT_CENTER,
-                        name,
-                        FontId::proportional(14.5),
-                        pal.text,
-                    );
-                    ui.painter().text(
-                        rect.left_center() + vec2(56.0, 10.0),
-                        Align2::LEFT_CENTER,
-                        format!("{w} × {h}"),
-                        FontId::proportional(12.0),
-                        pal.muted,
-                    );
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        self.settings.stream_monitor = i;
+                    if toggle_chip(
+                        ui,
+                        &pal,
+                        &format!("🗗  Окна · {}", self.windows.len()),
+                        self.stream_windows_tab,
+                    )
+                    .clicked()
+                    {
+                        self.stream_windows_tab = true;
+                        if self.stream_window.is_none() {
+                            self.stream_window = self.windows.first().map(|w| w.0);
+                        }
                     }
-                    ui.add_space(6.0);
+                });
+                ui.add_space(8.0);
+                if self.stream_windows_tab {
+                    if self.windows.is_empty() {
+                        ui.label(
+                            RichText::new("Нет открытых окон, которые можно показать.")
+                                .color(pal.muted),
+                        );
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for (id, title, app) in &self.windows {
+                                let selected = self.stream_window == Some(*id);
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), 46.0),
+                                    Sense::click(),
+                                );
+                                let hov =
+                                    ui.ctx()
+                                        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                                let fill = if selected {
+                                    pal.accent.gamma_multiply(0.22)
+                                } else {
+                                    mix(pal.elevated, pal.hover, hov)
+                                };
+                                ui.painter().rect_filled(rect, 10.0, fill);
+                                if selected {
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        10.0,
+                                        Stroke::new(1.5, pal.accent),
+                                    );
+                                }
+                                let clip = rect.shrink2(vec2(14.0, 0.0));
+                                ui.painter_at(clip).text(
+                                    rect.left_center() + vec2(14.0, -8.0),
+                                    Align2::LEFT_CENTER,
+                                    title,
+                                    FontId::proportional(14.0),
+                                    pal.text,
+                                );
+                                ui.painter_at(clip).text(
+                                    rect.left_center() + vec2(14.0, 10.0),
+                                    Align2::LEFT_CENTER,
+                                    app,
+                                    FontId::proportional(11.5),
+                                    pal.muted,
+                                );
+                                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    self.stream_window = Some(*id);
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                } else {
+                    for (i, (name, w, h)) in self.monitors.iter().enumerate() {
+                        let selected = self.settings.stream_monitor == i;
+                        let (rect, resp) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::click());
+                        let hov = ui
+                            .ctx()
+                            .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                        let fill = if selected {
+                            pal.accent.gamma_multiply(0.22)
+                        } else {
+                            mix(pal.elevated, pal.hover, hov)
+                        };
+                        ui.painter().rect_filled(rect, 12.0, fill);
+                        if selected {
+                            ui.painter()
+                                .rect_stroke(rect, 12.0, Stroke::new(1.5, pal.accent));
+                        }
+                        draw_icon(
+                            ui.painter(),
+                            Icon::Screen,
+                            rect.left_center() + vec2(28.0, 0.0),
+                            24.0,
+                            if selected { pal.accent } else { pal.muted },
+                            false,
+                        );
+                        ui.painter().text(
+                            rect.left_center() + vec2(56.0, -8.0),
+                            Align2::LEFT_CENTER,
+                            name,
+                            FontId::proportional(14.5),
+                            pal.text,
+                        );
+                        ui.painter().text(
+                            rect.left_center() + vec2(56.0, 10.0),
+                            Align2::LEFT_CENTER,
+                            format!("{w} × {h}"),
+                            FontId::proportional(12.0),
+                            pal.muted,
+                        );
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            self.settings.stream_monitor = i;
+                        }
+                        ui.add_space(6.0);
+                    }
                 }
                 ui.add_space(8.0);
                 ui.label(
@@ -3218,6 +3379,16 @@ impl App {
                         let on = self.settings.stream_fps == fps;
                         if toggle_chip(ui, &pal, &format!("{fps} к/с"), on).clicked() {
                             self.settings.stream_fps = fps;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (q, label) in [(0u8, "Экономно"), (1, "Баланс"), (2, "Чётко")]
+                    {
+                        if toggle_chip(ui, &pal, label, self.settings.stream_quality == q).clicked()
+                        {
+                            self.settings.stream_quality = q;
                         }
                     }
                 });
@@ -3775,6 +3946,7 @@ impl eframe::App for App {
         self.call_ui(ctx);
         self.extra_ui(ctx);
         self.stream_picker_ui(ctx);
+        self.stream_fullscreen_ui(ctx);
         self.picker_ui(ctx);
         self.delete_ui(ctx);
         self.settings_ui(ctx);
@@ -3892,9 +4064,18 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     let fresh = m.sending || now_ms.saturating_sub(snowflake_ms(m.id)) < 8_000;
     let appear = if fresh {
-        let id = egui::Id::new(("appear", m.channel_id, m.nonce.as_deref().unwrap_or(""), m.id));
+        let id = egui::Id::new((
+            "appear",
+            m.channel_id,
+            m.nonce.as_deref().unwrap_or(""),
+            m.id,
+        ));
         let now = ui.input(|i| i.time);
-        let key = m.nonce.as_deref().map(|n| egui::Id::new(("appear-n", n))).unwrap_or(id);
+        let key = m
+            .nonce
+            .as_deref()
+            .map(|n| egui::Id::new(("appear-n", n)))
+            .unwrap_or(id);
         let t0 = ui
             .ctx()
             .memory_mut(|mem| *mem.data.get_temp_mut_or_insert_with(key, || now));
@@ -4020,7 +4201,8 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                             if toggle_chip(ui, &pal, "Убрать", false).clicked() {
                                 cx.actions.push(Action::DismissFailed(m.channel_id, nonce));
                             }
-                            if toggle_chip(ui, &pal, "Копировать текст", false).clicked() {
+                            if toggle_chip(ui, &pal, "Копировать текст", false).clicked()
+                            {
                                 cx.actions.push(Action::CopyText(m.content.clone()));
                             }
                         });
@@ -4149,7 +4331,12 @@ fn reply_preview(ui: &mut egui::Ui, pal: &Palette, r: &discord::Reply, gutter: f
         ui.painter()
             .line_segment([pos2(x0, y0), pos2(x0, y1 + r6)], stroke);
         ui.painter().add(egui::Shape::line(
-            arc(pos2(x0 + r6, y1 + r6), r6, std::f32::consts::PI, 1.5 * std::f32::consts::PI),
+            arc(
+                pos2(x0 + r6, y1 + r6),
+                r6,
+                std::f32::consts::PI,
+                1.5 * std::f32::consts::PI,
+            ),
             stroke,
         ));
         ui.painter()
@@ -4157,13 +4344,20 @@ fn reply_preview(ui: &mut egui::Ui, pal: &Palette, r: &discord::Reply, gutter: f
     }
     let mut x = rect.left();
     let cy = rect.center().y;
-    let id = r.author.bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+    let id = r
+        .author
+        .bytes()
+        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
     ui.painter()
         .circle_filled(pos2(x + 8.0, cy), 8.0, name_color(id));
     ui.painter().text(
         pos2(x + 8.0, cy),
         Align2::CENTER_CENTER,
-        initials(&r.author).chars().next().unwrap_or('?').to_string(),
+        initials(&r.author)
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_string(),
         FontId::proportional(9.0),
         Color32::WHITE,
     );
@@ -4171,7 +4365,11 @@ fn reply_preview(ui: &mut egui::Ui, pal: &Palette, r: &discord::Reply, gutter: f
     let name = ui.painter().text(
         pos2(x, cy),
         Align2::LEFT_CENTER,
-        if r.author.is_empty() { "Сообщение" } else { r.author.as_str() },
+        if r.author.is_empty() {
+            "Сообщение"
+        } else {
+            r.author.as_str()
+        },
         FontId::new(13.0, egui::FontFamily::Name("bold".into())),
         pal.muted,
     );
@@ -4180,7 +4378,11 @@ fn reply_preview(ui: &mut egui::Ui, pal: &Palette, r: &discord::Reply, gutter: f
     ui.painter_at(clip).text(
         pos2(x, cy),
         Align2::LEFT_CENTER,
-        if r.content.is_empty() { "…" } else { r.content.as_str() },
+        if r.content.is_empty() {
+            "…"
+        } else {
+            r.content.as_str()
+        },
         FontId::proportional(13.0),
         pal.faint,
     );
@@ -5673,7 +5875,7 @@ fn draw_stage(
             .find(|t| t.id == owner)
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "Участник".into());
-        draw_stream_view(ui, pal, video, &name, frame, actions);
+        draw_stream_view(ui, pal, video, &name, frame, false, actions);
         area = Rect::from_min_max(pos2(area.min.x, area.max.y - strip_h), area.max);
         if strip_h <= 0.0 {
             draw_stage_bar(ui, pal, rect, bar_h, st, actions);
@@ -5817,9 +6019,10 @@ fn draw_stream_view(
     rect: Rect,
     name: &str,
     frame: Option<(TextureId, Vec2)>,
+    fullscreen: bool,
     actions: &mut Vec<Action>,
 ) {
-    let r = pal.radius + 2.0;
+    let r = if fullscreen { 0.0 } else { pal.radius + 2.0 };
     ui.painter().rect_filled(rect, r, Color32::from_gray(8));
     match frame {
         Some((tex, size)) if size.x > 0.0 && size.y > 0.0 => {
@@ -5891,6 +6094,39 @@ fn draw_stream_view(
     );
     if resp.clicked() {
         actions.push(Action::StopWatching);
+    }
+    // кнопка «на весь экран»
+    let fs = Rect::from_min_size(rect.right_top() + vec2(-90.0, 10.0), vec2(36.0, 36.0));
+    let fresp = ui
+        .interact(fs, ui.id().with("fs_stream"), Sense::click())
+        .on_hover_text(if fullscreen {
+            "Свернуть (Esc)"
+        } else {
+            "На весь экран"
+        })
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let fh = ui
+        .ctx()
+        .animate_bool_with_time(fresp.id.with("h"), fresp.hovered(), 0.12);
+    ui.painter().circle_filled(
+        fs.center(),
+        18.0,
+        mix(Color32::from_black_alpha(160), pal.accent, fh),
+    );
+    // рисуем четыре уголка
+    let c = fs.center();
+    let (a, b) = if fullscreen { (3.0, 8.0) } else { (8.0, 3.0) };
+    let st = Stroke::new(2.0, Color32::WHITE);
+    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let corner = c + vec2(sx * a, sy * a);
+        let tip = c + vec2(sx * b, sy * b);
+        ui.painter()
+            .line_segment([corner, pos2(tip.x, corner.y)], st);
+        ui.painter()
+            .line_segment([corner, pos2(corner.x, tip.y)], st);
+    }
+    if fresp.clicked() {
+        actions.push(Action::ToggleStreamFullscreen);
     }
 }
 

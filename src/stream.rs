@@ -43,8 +43,52 @@ pub struct StreamParams {
 #[derive(Clone, Copy, Debug)]
 pub struct SendCfg {
     pub monitor: usize,
+    /// Захватывать конкретное окно (id окна из `windows()`), а не весь монитор.
+    pub window: Option<u32>,
     pub height: u32,
     pub fps: u32,
+    /// Качество: 0 — экономное, 1 — сбалансированное, 2 — высокое.
+    pub quality: u8,
+}
+
+impl SendCfg {
+    /// Битрейт видео под разрешение и выбранное качество.
+    pub fn bitrate(&self, height: u32) -> u32 {
+        let base = match height {
+            0..=540 => 1_200_000,
+            541..=760 => 2_500_000,
+            761..=1100 => 4_500_000,
+            _ => 7_000_000,
+        };
+        let factor = match self.quality {
+            0 => 0.6,
+            2 => 1.7,
+            _ => 1.0,
+        };
+        let fps_factor = (self.fps.max(5) as f64 / 30.0).clamp(0.5, 1.6);
+        (base as f64 * factor * fps_factor) as u32
+    }
+}
+
+/// Окна, которые можно показать: (id, заголовок, приложение).
+pub fn windows() -> Vec<(u32, String, String)> {
+    let me = std::process::id();
+    let mut out: Vec<(u32, String, String)> = xcap::Window::all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| !w.is_minimized().unwrap_or(true))
+        .filter(|w| w.pid().map_or(true, |p| p != me))
+        .filter(|w| w.width().unwrap_or(0) >= 120 && w.height().unwrap_or(0) >= 80)
+        .filter_map(|w| {
+            let title = w.title().ok()?.trim().to_string();
+            if title.is_empty() {
+                return None;
+            }
+            Some((w.id().ok()?, title, w.app_name().unwrap_or_default()))
+        })
+        .collect();
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
 }
 
 pub enum Role {
@@ -340,46 +384,101 @@ impl Depacketizer {
 
 // ======================= захват и кодирование =======================
 
-/// Поток захвата экрана: снимает монитор, кодирует в H.264 и отдаёт кадры.
+/// Источник захвата: монитор или окно.
+enum Source {
+    Monitor(xcap::Monitor),
+    Window(xcap::Window),
+}
+
+impl Source {
+    fn open(cfg: &SendCfg) -> Option<Source> {
+        if let Some(id) = cfg.window {
+            if let Some(w) = xcap::Window::all()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|w| w.id().ok() == Some(id))
+            {
+                return Some(Source::Window(w));
+            }
+        }
+        let monitors = xcap::Monitor::all().unwrap_or_default();
+        let fallback = monitors.first().cloned();
+        monitors
+            .into_iter()
+            .nth(cfg.monitor)
+            .or(fallback)
+            .map(Source::Monitor)
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Source::Monitor(m) => (m.width().unwrap_or(1920), m.height().unwrap_or(1080)),
+            Source::Window(w) => (w.width().unwrap_or(1280), w.height().unwrap_or(720)),
+        }
+    }
+
+    fn capture(&self) -> Result<image::RgbaImage, String> {
+        match self {
+            Source::Monitor(m) => m.capture_image().map_err(|e| e.to_string()),
+            Source::Window(w) => {
+                if w.is_minimized().unwrap_or(false) {
+                    return Err("окно свёрнуто".into());
+                }
+                w.capture_image().map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+/// Размер кадра трансляции: высота не больше выбранной, обе стороны чётные.
+fn frame_size(src: (u32, u32), height: u32) -> (u32, u32) {
+    let (sw, sh) = (src.0.max(2), src.1.max(2));
+    let h = height.min(sh) & !1;
+    let w = (((sw as f64 * h as f64 / sh as f64).round() as u32).max(2)) & !1;
+    (w.max(2), h.max(2))
+}
+
+/// Поток захвата экрана: снимает монитор или окно, кодирует в H.264 и отдаёт кадры.
+/// Заодно шлёт в интерфейс уменьшенное превью — чтобы стример видел, что показывает.
 fn spawn_capture(
+    key: String,
     cfg: SendCfg,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     sink: Sink,
-) -> (u32, u32) {
-    let list = xcap::Monitor::all().unwrap_or_default();
-    let (mw, mh) = list
-        .get(cfg.monitor)
-        .or_else(|| list.first())
-        .map(|m| (m.width().unwrap_or(1920), m.height().unwrap_or(1080)))
-        .unwrap_or((1920, 1080));
-    let h = cfg.height.min(mh.max(2)) & !1;
-    let w = (((mw as f64 * h as f64 / mh.max(1) as f64).round() as u32).max(2)) & !1;
+) -> Result<(u32, u32), String> {
+    let is_window = cfg.window.is_some();
+    let not_found = move || {
+        if is_window {
+            "Окно для трансляции не найдено — возможно, оно закрыто".to_string()
+        } else {
+            "Монитор для трансляции не найден".to_string()
+        }
+    };
+    // Проверяем доступ к захвату заранее, чтобы сразу показать понятную ошибку.
+    // (Дескрипторы окон нельзя передавать между потоками — в потоке захвата откроем заново.)
+    let (w, h) = {
+        let source = Source::open(&cfg).ok_or_else(not_found)?;
+        source
+            .capture()
+            .map_err(|e| format!("Не удалось захватить экран: {e}"))?;
+        frame_size(source.size(), cfg.height)
+    };
 
     std::thread::Builder::new()
         .name("screen-capture".into())
         .spawn(move || {
+            let Some(source) = Source::open(&cfg) else {
+                sink.send(Event::Error(not_found()));
+                return;
+            };
             use openh264::encoder::{
                 BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType,
             };
             use openh264::formats::{RgbaSliceU8, YUVBuffer};
-            let monitors = xcap::Monitor::all().unwrap_or_default();
-            let Some(monitor) = monitors
-                .into_iter()
-                .nth(cfg.monitor)
-                .or_else(|| xcap::Monitor::all().ok().and_then(|l| l.into_iter().next()))
-            else {
-                sink.send(Event::Error("Монитор для трансляции не найден".into()));
-                return;
-            };
-            let bitrate = match h {
-                0..=540 => 1_200_000,
-                541..=760 => 2_500_000,
-                _ => 4_500_000,
-            };
             let config = EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
-                .bitrate(BitRate::from_bps(bitrate))
+                .bitrate(BitRate::from_bps(cfg.bitrate(h)))
                 .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
                 .rate_control_mode(RateControlMode::Bitrate)
                 .skip_frames(true);
@@ -392,11 +491,15 @@ fn spawn_capture(
                     }
                 };
             let frame_time = Duration::from_millis(1000 / cfg.fps.max(1) as u64);
+            let preview_every = Duration::from_millis(125);
+            let mut last_preview = Instant::now() - preview_every;
             let mut n: u64 = 0;
+            let mut failures = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                match monitor.capture_image() {
+                match source.capture() {
                     Ok(img) => {
+                        failures = 0;
                         let img = if img.width() != w || img.height() != h {
                             image::imageops::resize(
                                 &img,
@@ -407,12 +510,31 @@ fn spawn_capture(
                         } else {
                             img
                         };
+                        if last_preview.elapsed() >= preview_every {
+                            last_preview = Instant::now();
+                            let pw = 480u32.min(w);
+                            let ph = ((h as f64 * pw as f64 / w as f64) as u32).max(2);
+                            let small = image::imageops::resize(
+                                &img,
+                                pw,
+                                ph,
+                                image::imageops::FilterType::Nearest,
+                            );
+                            sink.send(Event::StreamFrame {
+                                key: key.clone(),
+                                image: egui::ColorImage::from_rgba_unmultiplied(
+                                    [pw as usize, ph as usize],
+                                    small.as_raw(),
+                                ),
+                            });
+                        }
                         let yuv = YUVBuffer::from_rgb_source(RgbaSliceU8::new(
                             img.as_raw(),
                             (w as usize, h as usize),
                         ));
-                        if n % (cfg.fps as u64 * 2) == 0 {
-                            encoder.force_intra_frame(); // ключевой кадр каждые ~2 с — для новых зрителей
+                        if n % (cfg.fps as u64 * 2) == 0 || FORCE_KEY.swap(false, Ordering::Relaxed)
+                        {
+                            encoder.force_intra_frame(); // ключевой кадр — для новых зрителей
                         }
                         match encoder.encode(&yuv) {
                             Ok(bits) => {
@@ -426,8 +548,14 @@ fn spawn_capture(
                         n += 1;
                     }
                     Err(e) => {
-                        crate::store::log(&format!("захват экрана: {e}"));
-                        std::thread::sleep(Duration::from_millis(500));
+                        failures += 1;
+                        if failures == 1 || failures % 20 == 0 {
+                            crate::store::log(&format!("захват экрана: {e}"));
+                        }
+                        if failures == 10 {
+                            sink.send(Event::Error(format!("Захват экрана не удаётся: {e}")));
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
                     }
                 }
                 if let Some(rest) = frame_time.checked_sub(started.elapsed()) {
@@ -435,8 +563,56 @@ fn spawn_capture(
                 }
             }
         })
-        .ok();
-    (w, h)
+        .map_err(|e| e.to_string())?;
+    Ok((w, h))
+}
+
+/// Зритель попросил ключевой кадр (RTCP PLI) — следующий кадр будет ключевым.
+static FORCE_KEY: AtomicBool = AtomicBool::new(false);
+
+/// Зашифрованный RTCP-пакет (режим rtpsize: первые 8 байт — открытые, в AAD).
+fn rtcp_packet(cipher: &Aes256Gcm, header8: &[u8; 8], body: &[u8], nonce: u32) -> Option<Vec<u8>> {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(&nonce.to_be_bytes());
+    let ct = cipher
+        .encrypt(
+            GenericArray::from_slice(&n),
+            Payload {
+                msg: body,
+                aad: header8,
+            },
+        )
+        .ok()?;
+    let mut pkt = Vec::with_capacity(8 + ct.len() + 4);
+    pkt.extend_from_slice(header8);
+    pkt.extend_from_slice(&ct);
+    pkt.extend_from_slice(&nonce.to_be_bytes());
+    Some(pkt)
+}
+
+/// RTCP PLI: «пришли ключевой кадр» для видеопотока `media_ssrc`.
+fn pli(cipher: &Aes256Gcm, sender_ssrc: u32, media_ssrc: u32, nonce: u32) -> Option<Vec<u8>> {
+    let mut h = [0u8; 8];
+    h[0] = 0x81; // V=2, FMT=1 (PLI)
+    h[1] = 206; // PSFB
+    h[2..4].copy_from_slice(&2u16.to_be_bytes());
+    h[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    rtcp_packet(cipher, &h, &media_ssrc.to_be_bytes(), nonce)
+}
+
+/// Пустой RTCP Receiver Report — держит UDP-«дырку» в NAT открытой.
+fn receiver_report(cipher: &Aes256Gcm, sender_ssrc: u32, nonce: u32) -> Option<Vec<u8>> {
+    let mut h = [0u8; 8];
+    h[0] = 0x80;
+    h[1] = 201;
+    h[2..4].copy_from_slice(&1u16.to_be_bytes());
+    h[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    rtcp_packet(cipher, &h, &[], nonce)
+}
+
+/// Автор трансляции из ключа: «guild:<сервер>:<канал>:<id>» или «call:<канал>:<id>».
+fn key_owner(key: &str) -> Option<u64> {
+    key.rsplit(':').next()?.parse().ok()
 }
 
 /// Поток декодирования: H.264 → RGBA → интерфейс.
@@ -553,6 +729,15 @@ async fn session(
     let mut rbuf = vec![0u8; 4096];
     let mut live_sent = false;
     let mut sent_frames = 0u64;
+    // Зритель: служебные RTCP-пакеты (PLI и keepalive) и статистика для лога.
+    let owner_hint = key_owner(&p.key);
+    let mut rtx_ssrcs: HashSet<u32> = HashSet::new();
+    let mut rtcp_nonce: u32 = 0;
+    let mut rtcp_tick = tokio::time::interval(Duration::from_millis(1000));
+    rtcp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rr = Instant::now();
+    let mut stats = (0u64, 0u64, 0u64, 0u64); // пакеты, кадры, ошибки DAVE, показано
+    let mut stats_logged = Instant::now();
 
     loop {
         let mut out: Vec<Out> = Vec::new();
@@ -628,10 +813,10 @@ async fn session(
                                     fps = c.fps.max(1);
                                     let (tx, rx2) = unbounded_channel::<Vec<u8>>();
                                     frame_rx = rx2;
-                                    let (w, h) = spawn_capture(c, tx, stop.clone(), sink.clone());
+                                    let (w, h) = spawn_capture(p.key.clone(), c, tx, stop.clone(), sink.clone())?;
                                     frame_tx = None;
                                     rtp = Some(VideoRtp { ssrc: video_ssrc, seq: (seed() & 0xFFFF) as u16, timestamp: (seed() >> 20) as u32, nonce: 0 });
-                                    let bitrate = if h <= 540 { 1_200_000 } else if h <= 760 { 2_500_000 } else { 4_500_000 };
+                                    let bitrate = c.bitrate(h);
                                     out.push(Out::Json(json!({
                                         "op": 12,
                                         "d": {
@@ -648,15 +833,32 @@ async fn session(
                                     out.push(Out::Json(json!({ "op": 5, "d": { "speaking": 2, "delay": 0, "ssrc": audio_ssrc } }).to_string()));
                                 } else {
                                     decoder_tx = Some(spawn_decoder(p.key.clone(), sink.clone()));
+                                    // Просим сервер присылать видео в лучшем качестве.
+                                    out.push(Out::Json(json!({ "op": 15, "d": { "any": 100 } }).to_string()));
                                 }
                             }
                             12 => {
                                 // кто какой видеопоток отправляет
                                 let uid: u64 = d["user_id"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
                                 let vs = d["video_ssrc"].as_u64().unwrap_or(0) as u32;
-                                if uid != 0 && vs != 0 {
-                                    ssrc_owner.insert(vs, uid);
+                                if uid != 0 {
                                     users.insert(uid);
+                                    if vs != 0 {
+                                        ssrc_owner.insert(vs, uid);
+                                    }
+                                    // В новых версиях протокола ssrc видео приходит в списке потоков.
+                                    if let Some(list) = d["streams"].as_array() {
+                                        for st in list {
+                                            let ss = st["ssrc"].as_u64().unwrap_or(0) as u32;
+                                            if ss != 0 {
+                                                ssrc_owner.insert(ss, uid);
+                                            }
+                                            let rtx = st["rtx_ssrc"].as_u64().unwrap_or(0) as u32;
+                                            if rtx != 0 {
+                                                rtx_ssrcs.insert(rtx);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             5 => {
@@ -744,31 +946,91 @@ async fn session(
                     r.timestamp = r.timestamp.wrapping_add(90_000 / fps);
                 }
             }
-            res = udp_recv(udp.as_ref(), &mut rbuf), if !sending => {
+            _ = rtcp_tick.tick(), if !sending && udp.is_some() && cipher.is_some() => {
+                let (Some(u), Some(c)) = (udp.as_ref(), cipher.as_ref()) else { continue };
+                // Пока нет ключевого кадра — просим его у стримера раз в секунду.
+                let mut want: Vec<u32> = depack
+                    .iter()
+                    .filter(|(_, d)| d.waiting_key)
+                    .map(|(ssrc, _)| *ssrc)
+                    .collect();
+                if depack.is_empty() {
+                    want.extend(ssrc_owner.keys().copied());
+                }
+                for media in want {
+                    rtcp_nonce = rtcp_nonce.wrapping_add(1);
+                    if let Some(pkt) = pli(c, audio_ssrc, media, rtcp_nonce) {
+                        let _ = u.send(&pkt).await;
+                    }
+                }
+                if last_rr.elapsed() >= Duration::from_secs(5) {
+                    last_rr = Instant::now();
+                    rtcp_nonce = rtcp_nonce.wrapping_add(1);
+                    if let Some(pkt) = receiver_report(c, audio_ssrc, rtcp_nonce) {
+                        let _ = u.send(&pkt).await;
+                    }
+                }
+                if stats_logged.elapsed() >= Duration::from_secs(10) {
+                    stats_logged = Instant::now();
+                    crate::store::log(&format!(
+                        "трансляция (просмотр): пакетов {}, кадров {}, ошибок DAVE {}, в декодер {}, DAVE={}",
+                        stats.0, stats.1, stats.2, stats.3, dave.active()
+                    ));
+                }
+            }
+            res = udp_recv(udp.as_ref(), &mut rbuf) => {
                 let n = res?;
+                if sending {
+                    // Сервер передаёт просьбы зрителей о ключевом кадре (RTCP PLI / FIR).
+                    if n >= 8 && rbuf[0] >> 6 == 2 && rbuf[1] == 206 {
+                        let fmt = rbuf[0] & 0x1F;
+                        if fmt == 1 || fmt == 4 {
+                            FORCE_KEY.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
                 let Some(c) = cipher.as_ref() else { continue };
                 let Some(pkt) = open_rtp(c, &rbuf[..n]) else { continue };
-                if pkt.pt != H264_PT {
-                    continue; // звук трансляции и повторы (RTX) пока пропускаем
+                stats.0 += 1;
+                // Звук трансляции (opus) и повторы (RTX) пропускаем, видео — любой другой тип.
+                if pkt.pt == 120 || pkt.pt == H264_RTX_PT || rtx_ssrcs.contains(&pkt.ssrc) {
+                    continue;
+                }
+                if pkt.pt != H264_PT && stats.0 < 5 {
+                    crate::store::log(&format!("трансляция: видео с типом {} (ждали {H264_PT})", pkt.pt));
                 }
                 let Some(frame) = depack
                     .entry(pkt.ssrc)
                     .or_insert_with(|| Depacketizer { waiting_key: true, ..Default::default() })
                     .push(&pkt) else { continue };
+                stats.1 += 1;
                 let mut data = frame;
-                if let Some(owner) = ssrc_owner.get(&pkt.ssrc).copied() {
+                // Автор потока: из сигнализации, а если её не было — из ключа трансляции.
+                let owner = ssrc_owner.get(&pkt.ssrc).copied().or(owner_hint);
+                if let Some(owner) = owner {
                     if let Some(s) = dave.session.as_mut() {
                         let can = s.is_ready() && (dave.version != 0 && !dave.downgraded || s.can_passthrough(owner));
                         if can {
                             match s.decrypt(owner, davey::MediaType::VIDEO, &data) {
                                 Ok(plain) => data = plain,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    stats.2 += 1;
+                                    if let Some(d) = depack.get_mut(&pkt.ssrc) {
+                                        d.waiting_key = true;
+                                    }
+                                    continue;
+                                }
                             }
+                        } else if dave.active() {
+                            stats.2 += 1;
+                            continue;
                         }
                     }
                 } else if dave.active() {
                     continue;
                 }
+                stats.3 += 1;
                 if let Some(tx) = &decoder_tx {
                     let _ = tx.send(data);
                 }
