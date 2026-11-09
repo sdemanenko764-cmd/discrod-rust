@@ -37,6 +37,14 @@ davey = "0.2"
 xcap = "0.9"
 openh264 = "0.9"
 notify-rust = "4"
+# Шумоподавление RNNoise (чистый Rust, BSD)
+nnnoiseless = { version = "0.5", default-features = false }
+# Эхоподавление AEC3, шумоподавление и автоусиление из WebRTC (порт на Rust, BSD)
+aec3 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# Клавиша рации, когда окно не в фокусе
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 opt-level = 3

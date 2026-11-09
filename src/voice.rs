@@ -42,6 +42,120 @@ pub struct VoiceOpts {
     pub always: bool,
     /// Простое подавление эха: не передавать тихий звук, пока говорят другие.
     pub echo_guard: bool,
+    /// Эхоподавление WebRTC AEC3 (вычитает звук собеседников из микрофона).
+    pub echo_cancel: bool,
+    /// Шумоподавление: 0 — выкл, 1 — стандартное (WebRTC NS), 2 — усиленное (RNNoise).
+    pub noise: u8,
+    /// Автоматическая регулировка усиления (WebRTC AGC2).
+    pub agc: bool,
+    /// Ручное усиление микрофона (0..3).
+    pub input_gain: f32,
+    /// Рация: передавать, только пока зажата клавиша.
+    pub ptt: bool,
+    /// Общая громкость собеседников (0..2).
+    pub output_volume: f32,
+    /// Громкость отдельных собеседников (0 = заглушён).
+    pub user_volumes: HashMap<u64, f32>,
+}
+
+/// Клавиша рации сейчас зажата (обновляет интерфейс / системный опрос клавиатуры).
+pub static PTT_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Обработка микрофона: эхоподавление, шумоподавление и автоусиление.
+///
+/// Цепочка WebRTC (HPF → AEC3 → NS → AGC2) работает кадрами по 10 мс, RNNoise —
+/// тоже по 480 сэмплов, поэтому кадр Discord (20 мс) обрабатывается в два шага.
+struct Processor {
+    pipeline: Option<SendPipeline>,
+    rnnoise: Option<Box<nnnoiseless::DenoiseState<'static>>>,
+    gain: f32,
+    /// Вероятность речи от RNNoise за последний кадр (для детектора речи).
+    voice_prob: f32,
+    render: [f32; 480],
+}
+
+/// Цепочка aec3 внутри держит `Rc`, но целиком принадлежит одному голосовому
+/// соединению и никогда не делится между потоками: переносить её вместе
+/// с задачей безопасно.
+struct SendPipeline(aec3::pipelines::linear::LinearPipeline);
+// SAFETY: все Rc/RefCell внутри конвейера — его собственные, наружу ссылки не выдаются,
+// а сам конвейер используется только из одной задачи за раз.
+unsafe impl Send for SendPipeline {}
+
+impl Processor {
+    fn new(o: &VoiceOpts) -> Processor {
+        let want_webrtc = o.echo_cancel || o.noise == 1 || o.agc;
+        let pipeline = if want_webrtc {
+            let format = aec3::nodes::audio::AudioFormat::ten_ms(audio::RATE, 1);
+            match aec3::pipelines::linear::builder(format, format)
+                .initial_delay_ms(80)
+                .enable_noise_suppression(o.noise == 1)
+                .enable_gain_controller2(o.agc)
+                .enable_high_pass_filter(true)
+                .build()
+            {
+                Ok(p) => Some(SendPipeline(p)),
+                Err(e) => {
+                    crate::store::log(&format!("обработка звука WebRTC не запустилась: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Processor {
+            pipeline,
+            rnnoise: (o.noise == 2).then(nnnoiseless::DenoiseState::new),
+            gain: o.input_gain.clamp(0.0, 3.0),
+            voice_prob: 1.0,
+            render: [0.0; 480],
+        }
+    }
+
+    fn process(&mut self, frame: &mut [f32; 960], a: &Audio, echo_cancel: bool) {
+        if (self.gain - 1.0).abs() > 0.01 {
+            for s in frame.iter_mut() {
+                *s = (*s * self.gain).clamp(-1.0, 1.0);
+            }
+        }
+        if let Some(SendPipeline(p)) = self.pipeline.as_mut() {
+            let mut out = [0f32; 480];
+            for half in 0..2 {
+                // образец того, что звучит из динамиков, — до обработки микрофона
+                if echo_cancel {
+                    let mut fed = 0;
+                    while fed < 4 && a.take_render(&mut self.render) {
+                        let _ = p.handle_render_frame(&self.render);
+                        fed += 1;
+                    }
+                }
+                let chunk = &mut frame[half * 480..half * 480 + 480];
+                if let Ok(true) = p.process_capture_frame(chunk, &mut out) {
+                    chunk.copy_from_slice(&out);
+                }
+            }
+        } else if let Ok(mut q) = a.render.lock() {
+            q.clear(); // образец не нужен — не копим его
+        }
+        if let Some(rn) = self.rnnoise.as_mut() {
+            let mut inp = [0f32; 480];
+            let mut out = [0f32; 480];
+            let mut prob = 0f32;
+            for half in 0..2 {
+                let chunk = &mut frame[half * 480..half * 480 + 480];
+                for (d, s) in inp.iter_mut().zip(chunk.iter()) {
+                    *d = *s * 32768.0;
+                }
+                prob = prob.max(rn.process_frame(&mut out, &inp));
+                for (d, s) in chunk.iter_mut().zip(out.iter()) {
+                    *d = (*s / 32768.0).clamp(-1.0, 1.0);
+                }
+            }
+            self.voice_prob = prob;
+        } else {
+            self.voice_prob = 1.0;
+        }
+    }
 }
 
 pub enum Ctl {
@@ -445,6 +559,8 @@ async fn session(
     let mut ssrc_users: HashMap<u32, u64> = HashMap::new();
     let mut audio_io: Option<Audio> = None;
     let mut codec = Codec::new()?;
+    let mut processor = Processor::new(&opts);
+    audio::set_output_volume(opts.output_volume);
     let mut speaking = false;
     let mut hangover = 0u32;
     let mut last_remote = Instant::now() - Duration::from_secs(10);
@@ -639,12 +755,22 @@ async fn session(
                     a.clear_capture();
                 } else {
                     while a.take_frame(&mut frame) {
+                        processor.process(&mut frame, a, opts.echo_cancel);
                         let rms = (frame.iter().map(|s| s * s).sum::<f32>() / 960.0).sqrt();
                         let echo = opts.echo_guard
+                            && !opts.echo_cancel
                             && last_remote.elapsed() < Duration::from_millis(250)
                             && rms < opts.threshold * 3.0;
-                        if opts.always || (rms > opts.threshold && !echo) {
-                            hangover = VAD_HANGOVER;
+                        // RNNoise сам оценивает, есть ли речь: шум клавиатуры и вентилятора не включит передачу
+                        let voice_like = processor.voice_prob > 0.35 || processor.rnnoise.is_none();
+                        let ptt_down = PTT_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+                        let transmit = if opts.ptt {
+                            ptt_down
+                        } else {
+                            opts.always || (rms > opts.threshold && !echo && voice_like)
+                        };
+                        if transmit {
+                            hangover = if opts.ptt { 3 } else { VAD_HANGOVER };
                         } else {
                             hangover = hangover.saturating_sub(1);
                         }
@@ -719,7 +845,18 @@ async fn session(
                                         last_remote = Instant::now();
                                     }
                                 }
-                                audio::push_playback(&a.playback, from, chunk);
+                                let vol = user
+                                    .and_then(|u| opts.user_volumes.get(&u).copied())
+                                    .unwrap_or(1.0);
+                                if vol <= 0.001 {
+                                    continue; // собеседник заглушён у нас
+                                }
+                                if (vol - 1.0).abs() > 0.01 {
+                                    let scaled: Vec<f32> = chunk.iter().map(|s| s * vol).collect();
+                                    audio::push_playback(&a.playback, from, &scaled);
+                                } else {
+                                    audio::push_playback(&a.playback, from, chunk);
+                                }
                             }
                         }
                     }
@@ -729,7 +866,15 @@ async fn session(
                 match c {
                     Some(Ctl::Options(o)) => {
                         let devices_changed = o.input != opts.input || o.output != opts.output;
+                        let dsp_changed = o.echo_cancel != opts.echo_cancel
+                            || o.noise != opts.noise
+                            || o.agc != opts.agc
+                            || (o.input_gain - opts.input_gain).abs() > 0.001;
                         opts = o;
+                        audio::set_output_volume(opts.output_volume);
+                        if dsp_changed {
+                            processor = Processor::new(&opts);
+                        }
                         if devices_changed && audio_io.is_some() {
                             audio_io = None; // старые потоки останавливаются
                             match Audio::start(opts.input.clone(), opts.output.clone(), false) {

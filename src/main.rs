@@ -188,6 +188,24 @@ enum Action {
     CreateGuild(String),
     // --- сообщения и каналы ---
     MessageMenu(u64, Box<Msg>, egui::Pos2),
+    /// Меню пользователя по правому клику.
+    UserMenu(u64, egui::Pos2),
+    /// Меню канала: (сервер, канал, позиция).
+    ChannelMenu(Option<u64>, u64, egui::Pos2),
+    SetUserVolume(u64, f32),
+    /// Заглушить / включить уведомления сервера или канала.
+    ToggleMuted(u64),
+    MarkRead(u64),
+    MarkUnread(u64, Option<u64>),
+    CreateThread(u64, u64, String),
+    AskRename(u64),
+    RenameChannel(u64, String),
+    ChannelInvite(u64),
+    /// Создать приглашение на сервер и отправить пользователю в личку.
+    InviteUser(u64, u64),
+    InsertMention(String),
+    /// Открыть профиль сразу на вкладке (1 — общие серверы, 2 — общие друзья).
+    OpenProfileTab(u64, u8),
     Pin(u64, u64, bool),
     OpenPins(u64),
     OpenSearch,
@@ -286,6 +304,11 @@ struct App {
     friend_input: String,
     // окна
     msg_menu: Option<(u64, Msg, egui::Pos2)>,
+    user_menu: Option<(u64, egui::Pos2)>,
+    /// Подменю «Пригласить на сервер» открыто.
+    user_menu_invite: bool,
+    channel_menu: Option<(Option<u64>, u64, egui::Pos2)>,
+    rename_channel: Option<(u64, String)>,
     guild_menu: Option<(u64, egui::Pos2)>,
     confirm_leave: Option<u64>,
     server_dialog: Option<(u8, String)>,
@@ -388,6 +411,10 @@ impl App {
             friends_tab: 0,
             friend_input: String::new(),
             msg_menu: None,
+            user_menu: None,
+            user_menu_invite: false,
+            channel_menu: None,
+            rename_channel: None,
             guild_menu: None,
             confirm_leave: None,
             server_dialog: None,
@@ -407,6 +434,15 @@ impl App {
             has_saved: store::load().is_some(),
         };
         let _ = app.cmd.send(Cmd::VoiceOptions(voice_opts(&app.settings)));
+        PTT_VK.store(
+            if app.settings.ptt {
+                app.settings.ptt_key
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        spawn_ptt_watcher(cc.egui_ctx.clone());
         if let Some((token, bot)) = store::load() {
             let proxy = app.proxy_input.clone();
             app.start_login(Auth { token, bot, proxy });
@@ -1041,7 +1077,10 @@ impl App {
         for (id, name) in &m.mentions {
             self.users.insert(*id, name.clone());
         }
-        if m.author_id != self.me_id && self.sel_channel != Some(cid) {
+        let muted = self.settings.muted.contains(&cid)
+            || m.guild_id
+                .map_or(false, |g| self.settings.muted.contains(&g));
+        if m.author_id != self.me_id && self.sel_channel != Some(cid) && !muted {
             self.unread.insert(cid, m.guild_id.unwrap_or(0));
         }
         self.notify_message(&m);
@@ -1113,6 +1152,14 @@ impl App {
         if voice_opts(before) != voice_opts(&self.settings) {
             let _ = self.cmd.send(Cmd::VoiceOptions(voice_opts(&self.settings)));
         }
+        PTT_VK.store(
+            if self.settings.ptt {
+                self.settings.ptt_key
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         settings::save(&self.settings);
     }
 
@@ -1683,6 +1730,11 @@ impl App {
                                                         &c.name,
                                                         if thread { 28.0 } else { 32.0 },
                                                     );
+                                                    if resp.secondary_clicked() {
+                                                        if let Some(p) = resp.interact_pointer_pos() {
+                                                            actions.push(Action::ChannelMenu(Some(g.id), c.id, p));
+                                                        }
+                                                    }
                                                     if let Some(n) = self.mentions.get(&c.id) {
                                                         extra::badge(
                                                             ui,
@@ -1744,7 +1796,7 @@ impl App {
                                                                         }
                                                                         _ => None,
                                                                     };
-                                                                voice_member_row(
+                                                                let vr = voice_member_row(
                                                                     ui,
                                                                     &pal,
                                                                     tex,
@@ -1753,6 +1805,14 @@ impl App {
                                                                     self.speaking
                                                                         .contains(&m.user_id),
                                                                 );
+                                                                if vr.secondary_clicked() {
+                                                                    if let Some(p) = vr.interact_pointer_pos() {
+                                                                        actions.push(Action::UserMenu(m.user_id, p));
+                                                                    }
+                                                                }
+                                                                if vr.clicked() {
+                                                                    actions.push(Action::OpenProfile(m.user_id));
+                                                                }
                                                             }
                                                         }
                                                     } else if forum && resp.clicked() {
@@ -1866,6 +1926,16 @@ impl App {
                                             }
                                             if resp.clicked() {
                                                 actions.push(Action::OpenChannel(d.id));
+                                            }
+                                            if resp.secondary_clicked() {
+                                                if let Some(p) = resp.interact_pointer_pos() {
+                                                    match (&d.avatar, d.group) {
+                                                        (Some((uid, _)), false) => {
+                                                            actions.push(Action::UserMenu(*uid, p))
+                                                        }
+                                                        _ => actions.push(Action::ChannelMenu(None, d.id, p)),
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -2068,6 +2138,11 @@ impl App {
                                     if resp.clicked() {
                                         actions.push(Action::OpenProfile(*id));
                                     }
+                                    if resp.secondary_clicked() {
+                                        if let Some(p) = resp.interact_pointer_pos() {
+                                            actions.push(Action::UserMenu(*id, p));
+                                        }
+                                    }
                                     if in_call.contains(id) {
                                         resp.on_hover_text("В звонке");
                                     }
@@ -2157,6 +2232,11 @@ impl App {
                                         );
                                         if resp.clicked() {
                                             actions.push(Action::OpenProfile(*id));
+                                        }
+                                        if resp.secondary_clicked() {
+                                            if let Some(p) = resp.interact_pointer_pos() {
+                                                actions.push(Action::UserMenu(*id, p));
+                                            }
                                         }
                                         resp.on_hover_cursor(CursorIcon::PointingHand);
                                     }
@@ -2715,6 +2795,120 @@ impl App {
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::OpenSettings => self.settings_open = true,
             Action::Logout => self.logout(None, true),
+            Action::UserMenu(uid, pos) => {
+                self.msg_menu = None;
+                self.user_menu = Some((uid, pos));
+                self.user_menu_invite = false;
+                self.menu_frame = self.frame_no;
+            }
+            Action::ChannelMenu(g, c, pos) => {
+                self.channel_menu = Some((g, c, pos));
+                self.menu_frame = self.frame_no;
+            }
+            Action::SetUserVolume(uid, v) => {
+                let before = self.settings.clone();
+                if (v - 1.0).abs() < 0.01 {
+                    self.settings.user_volumes.remove(&uid);
+                } else {
+                    self.settings.user_volumes.insert(uid, v.clamp(0.0, 2.0));
+                }
+                self.apply_settings(ctx, &before);
+            }
+            Action::ToggleMuted(id) => {
+                let before = self.settings.clone();
+                if !self.settings.muted.remove(&id) {
+                    self.settings.muted.insert(id);
+                    self.unread.remove(&id);
+                    self.unread.retain(|_, g| *g != id);
+                    self.toast("Уведомления выключены", false);
+                } else {
+                    self.toast("Уведомления включены", false);
+                }
+                self.apply_settings(ctx, &before);
+            }
+            Action::MarkRead(cid) => {
+                self.unread.remove(&cid);
+                self.mentions.remove(&cid);
+            }
+            Action::MarkUnread(cid, g) => {
+                self.unread.insert(cid, g.unwrap_or(0));
+                if self.sel_channel == Some(cid) {
+                    self.toast("Канал отмечен непрочитанным", false);
+                }
+            }
+            Action::CreateThread(cid, mid, name) => {
+                let name: String = name.trim().chars().take(90).collect();
+                let name = if name.is_empty() {
+                    "Обсуждение".to_string()
+                } else {
+                    name
+                };
+                self.api(
+                    "POST",
+                    format!("/channels/{cid}/messages/{mid}/threads"),
+                    Some(serde_json::json!({ "name": name, "auto_archive_duration": 1440 })),
+                    discord::ApiTag::Done(format!("Ветка «{name}» создана")),
+                );
+            }
+            Action::AskRename(cid) => {
+                let name = self
+                    .guilds
+                    .iter()
+                    .flat_map(|g| g.channels.iter())
+                    .find(|c| c.id == cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.rename_channel = Some((cid, name));
+            }
+            Action::RenameChannel(cid, name) => {
+                self.rename_channel = None;
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    self.api(
+                        "PATCH",
+                        format!("/channels/{cid}"),
+                        Some(serde_json::json!({ "name": name })),
+                        discord::ApiTag::Done("Канал переименован".into()),
+                    );
+                }
+            }
+            Action::ChannelInvite(cid) => self.api(
+                "POST",
+                format!("/channels/{cid}/invites"),
+                Some(serde_json::json!({ "max_age": 604800, "max_uses": 0, "temporary": false })),
+                discord::ApiTag::Invite,
+            ),
+            Action::InviteUser(uid, g) => {
+                let channel = self
+                    .guilds
+                    .iter()
+                    .find(|x| x.id == g)
+                    .and_then(|x| x.channels.iter().find(|c| c.kind == 0).map(|c| c.id));
+                match channel {
+                    Some(c) => self.api(
+                        "POST",
+                        format!("/channels/{c}/invites"),
+                        Some(serde_json::json!({ "max_age": 604800, "max_uses": 0, "temporary": false })),
+                        discord::ApiTag::InviteFor(uid),
+                    ),
+                    None => self.toast("На сервере нет текстового канала для приглашения", true),
+                }
+            }
+            Action::InsertMention(name) => {
+                if !self.draft.is_empty() && !self.draft.ends_with(' ') {
+                    self.draft.push(' ');
+                }
+                self.draft.push('@');
+                self.draft.push_str(&name);
+                self.draft.push(' ');
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("composer_input")));
+            }
+            Action::OpenProfileTab(uid, tab) => {
+                self.extra_action(ctx, Action::OpenProfile(uid));
+                if let Some(p) = self.profile.as_mut() {
+                    p.tab = tab;
+                }
+            }
             a @ (Action::OpenProfile(_)
             | Action::CloseProfile
             | Action::MessageUser(_)
@@ -3752,14 +3946,100 @@ impl App {
                             .small()
                             .color(pal.faint),
                         );
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.input_gain, 0.0..=3.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .text("усиление микрофона"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.settings.output_volume, 0.0..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .text("громкость собеседников"),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Режим передачи").color(pal.muted));
+                        ui.horizontal(|ui| {
+                            let vad = !self.settings.ptt && !self.settings.always_transmit;
+                            if toggle_chip(ui, &pal, "🎙 По голосу", vad).clicked() {
+                                self.settings.ptt = false;
+                                self.settings.always_transmit = false;
+                            }
+                            if toggle_chip(ui, &pal, "📻 Рация", self.settings.ptt).clicked() {
+                                self.settings.ptt = true;
+                                self.settings.always_transmit = false;
+                            }
+                            if toggle_chip(ui, &pal, "Всегда", self.settings.always_transmit && !self.settings.ptt).clicked() {
+                                self.settings.ptt = false;
+                                self.settings.always_transmit = true;
+                            }
+                        });
+                        if self.settings.ptt {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Клавиша рации:").color(pal.muted));
+                                let current = PTT_KEYS
+                                    .iter()
+                                    .find(|(_, vk)| *vk == self.settings.ptt_key)
+                                    .map(|(n, _)| *n)
+                                    .unwrap_or("?");
+                                #[allow(deprecated)]
+                                egui::ComboBox::from_id_source("ptt_key")
+                                    .selected_text(current)
+                                    .show_ui(ui, |ui| {
+                                        for (n, vk) in PTT_KEYS {
+                                            ui.selectable_value(&mut self.settings.ptt_key, vk, n);
+                                        }
+                                    });
+                                let down = voice::PTT_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+                                chip(ui, &pal, if down { "● передаю" } else { "○ отпущена" }, if down { pal.ok } else { pal.faint });
+                            });
+                            ui.label(
+                                RichText::new(if cfg!(windows) {
+                                    "Рация работает и когда окно Rustcord свёрнуто."
+                                } else {
+                                    "Рация работает, пока окно Rustcord в фокусе."
+                                })
+                                .small()
+                                .color(pal.faint),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Обработка звука").color(pal.muted));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Шумоподавление:").color(pal.text));
+                            for (n, label) in [(0u8, "Выкл"), (1, "Стандартное"), (2, "Усиленное (RNNoise)")] {
+                                if toggle_chip(ui, &pal, label, self.settings.noise == n).clicked() {
+                                    self.settings.noise = n;
+                                }
+                            }
+                        });
                         ui.checkbox(
-                            &mut self.settings.always_transmit,
-                            "Передавать всегда (без детектора речи)",
+                            &mut self.settings.echo_cancel,
+                            "Эхоподавление (WebRTC AEC3) — если вы без наушников",
                         );
                         ui.checkbox(
-                            &mut self.settings.echo_guard,
-                            "Подавлять эхо (если вы без наушников)",
+                            &mut self.settings.agc,
+                            "Автоматическая регулировка громкости микрофона",
                         );
+                        if !self.settings.echo_cancel {
+                            ui.checkbox(
+                                &mut self.settings.echo_guard,
+                                "Простое подавление эха (не передавать тихий звук, пока говорят другие)",
+                            );
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Krisp — закрытая технология Discord, сторонним клиентам она недоступна. \
+                                 Вместо неё — нейросетевое шумоподавление RNNoise и обработка из WebRTC, \
+                                 всё работает прямо на компьютере.",
+                            )
+                            .small()
+                            .color(pal.faint),
+                        );
+                        if ui.button("🔊 Проверить динамики").clicked() {
+                            if let Err(e) = audio::play_test_sound(self.settings.output_device.clone()) {
+                                self.toast(format!("Не удалось проиграть звук: {e}"), true);
+                            }
+                        }
                         let label = if testing {
                             "■ Остановить проверку"
                         } else {
@@ -3918,6 +4198,14 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
+        // Вне Windows клавишу рации слушаем, пока окно в фокусе.
+        #[cfg(not(windows))]
+        if self.settings.ptt {
+            if let Some(k) = ptt_egui_key(self.settings.ptt_key) {
+                let down = ctx.input(|i| i.key_down(k));
+                voice::PTT_DOWN.store(down, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         match theme::backdrop(self.settings.theme) {
             Some(bd) => paint_backdrop(ctx, &bd, self.settings.animate_background),
             None => {
@@ -4124,6 +4412,11 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                     _ => None,
                 };
                 paint_avatar(ui, rect, tex, m.author_id, &m.author);
+                if aresp.secondary_clicked() {
+                    if let Some(p) = aresp.interact_pointer_pos() {
+                        cx.actions.push(Action::UserMenu(m.author_id, p));
+                    }
+                }
                 if aresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     cx.actions.push(Action::OpenProfile(m.author_id));
                 }
@@ -4145,6 +4438,11 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                         )
                         .sense(Sense::click()),
                     );
+                    if nr.secondary_clicked() {
+                        if let Some(p) = nr.interact_pointer_pos() {
+                            cx.actions.push(Action::UserMenu(m.author_id, p));
+                        }
+                    }
                     if nr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         cx.actions.push(Action::OpenProfile(m.author_id));
                     }
@@ -5658,10 +5956,10 @@ fn voice_member_row(
     m: &VoiceMember,
     name: &str,
     speaking: bool,
-) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if !ui.is_rect_visible(rect) {
-        return;
+        return resp;
     }
     if resp.hovered() {
         ui.painter().rect_filled(rect, 6.0, pal.hover);
@@ -5704,6 +6002,7 @@ fn voice_member_row(
         FontId::proportional(14.0),
         if speaking { pal.text } else { pal.muted },
     );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn voice_button(
@@ -5741,7 +6040,73 @@ fn voice_opts(s: &Settings) -> voice::VoiceOpts {
         threshold: s.mic_threshold,
         always: s.always_transmit,
         echo_guard: s.echo_guard,
+        echo_cancel: s.echo_cancel,
+        noise: s.noise,
+        agc: s.agc,
+        input_gain: s.input_gain,
+        ptt: s.ptt,
+        output_volume: s.output_volume,
+        user_volumes: s.user_volumes.clone(),
     }
+}
+
+/// Клавиши для рации: (название, виртуальный код Windows).
+const PTT_KEYS: [(&str, u32); 10] = [
+    ("Ё / `", 0xC0),
+    ("Боковая кнопка мыши 1", 0x05),
+    ("Боковая кнопка мыши 2", 0x06),
+    ("Средняя кнопка мыши", 0x04),
+    ("V", 0x56),
+    ("B", 0x42),
+    ("Caps Lock", 0x14),
+    ("Левый Alt", 0xA4),
+    ("Правый Ctrl", 0xA3),
+    ("F8", 0x77),
+];
+
+/// Клавиша рации, которую слушает фоновый опрос (0 — рация выключена).
+static PTT_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Фоновый опрос клавиши рации: работает, даже когда окно Rustcord не в фокусе (Windows).
+#[cfg(windows)]
+fn spawn_ptt_watcher(ctx: egui::Context) {
+    use std::sync::atomic::Ordering;
+    let _ = std::thread::Builder::new()
+        .name("ptt".into())
+        .spawn(move || {
+            let mut last = false;
+            loop {
+                let vk = PTT_VK.load(Ordering::Relaxed);
+                let down = vk != 0 && {
+                    // SAFETY: GetAsyncKeyState только читает состояние клавиши.
+                    let state = unsafe {
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk as i32)
+                    };
+                    (state as u16 & 0x8000) != 0
+                };
+                if down != last {
+                    last = down;
+                    voice::PTT_DOWN.store(down, Ordering::Relaxed);
+                    ctx.request_repaint();
+                }
+                std::thread::sleep(Duration::from_millis(if vk == 0 { 250 } else { 15 }));
+            }
+        });
+}
+
+/// Вне Windows рация работает, пока окно в фокусе (клавиша опрашивается в интерфейсе).
+#[cfg(not(windows))]
+fn spawn_ptt_watcher(_ctx: egui::Context) {}
+
+/// Клавиша egui для кода рации (запасной путь, когда окно в фокусе).
+fn ptt_egui_key(vk: u32) -> Option<egui::Key> {
+    Some(match vk {
+        0xC0 => egui::Key::Backtick,
+        0x56 => egui::Key::V,
+        0x42 => egui::Key::B,
+        0x77 => egui::Key::F8,
+        _ => return None,
+    })
 }
 
 /// Мягкое светящееся пятно (радиальный градиент).

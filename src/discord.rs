@@ -121,6 +121,8 @@ fn voice_signal(sig: VoiceSignal) {
 
 #[derive(Clone, Debug)]
 pub struct Guild {
+    /// Владелец сервера (у него есть все права).
+    pub owner: u64,
     pub voice: Vec<VoiceMember>,
     pub id: u64,
     pub name: String,
@@ -148,6 +150,10 @@ pub enum ApiTag {
     Profile(u64),
     /// Общие друзья с пользователем.
     MutualFriends(u64),
+    /// Приглашение на сервер, которое нужно отправить пользователю в личку.
+    InviteFor(u64),
+    /// Открыли личку, чтобы отправить в неё этот текст.
+    DmThenSend(String),
     Pins(u64),
     Search,
     Threads(u64),
@@ -612,6 +618,8 @@ struct RawGuildProps {
     name: Option<String>,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    owner_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -725,6 +733,8 @@ struct RawGuild {
     emojis: Vec<RawEmoji>,
     #[serde(default)]
     unavailable: Option<bool>,
+    #[serde(default)]
+    owner_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1411,11 +1421,12 @@ fn convert_channel(c: &RawChannel) -> Channel {
 }
 
 fn convert_guild(g: RawGuild) -> Guild {
-    let (prop_name, prop_icon) = match g.properties {
-        Some(p) => (p.name, p.icon),
-        None => (None, None),
+    let (prop_name, prop_icon, prop_owner) = match g.properties {
+        Some(p) => (p.name, p.icon, p.owner_id),
+        None => (None, None, None),
     };
     Guild {
+        owner: g.owner_id.or(prop_owner).as_deref().map(sid).unwrap_or(0),
         id: sid(&g.id),
         name: g
             .name
@@ -3476,6 +3487,13 @@ impl VoiceManager {
                         threshold: 0.006,
                         always: false,
                         echo_guard: true,
+                        echo_cancel: true,
+                        noise: 2,
+                        agc: true,
+                        input_gain: 1.0,
+                        ptt: false,
+                        output_volume: 1.0,
+                        user_volumes: HashMap::new(),
                     }),
                 ));
                 self.conn = Some((handle, ctl_tx));

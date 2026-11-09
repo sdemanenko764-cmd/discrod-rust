@@ -64,10 +64,26 @@ pub struct Audio {
     pub capture: Arc<Mutex<VecDeque<f32>>>,
     /// Собеседники: ssrc -> стерео (L,R,L,R…), 48 кГц.
     pub playback: Playback,
+    /// То, что реально ушло в динамики (моно, 48 кГц) — образец для подавления эха.
+    pub render: Arc<Mutex<VecDeque<f32>>>,
     pub has_mic: bool,
     stop: Arc<AtomicBool>,
     level: Arc<AtomicU32>,
 }
+
+/// Общая громкость вывода (0..2), хранится битами f32.
+static OUTPUT_VOLUME: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
+
+pub fn set_output_volume(v: f32) {
+    OUTPUT_VOLUME.store(v.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+}
+
+fn output_volume() -> f32 {
+    f32::from_bits(OUTPUT_VOLUME.load(Ordering::Relaxed))
+}
+
+/// Сколько держать образца для эхоподавления (0,5 с).
+const MAX_RENDER: usize = RATE as usize / 2;
 
 impl Drop for Audio {
     fn drop(&mut self) {
@@ -199,12 +215,17 @@ fn mix(playback: &Playback, frames: usize, out: &mut Vec<f32>) {
         }
         map.retain(|_, q| !q.is_empty() || q.capacity() < 4096);
     }
+    let vol = output_volume();
     for s in out.iter_mut() {
-        *s = s.clamp(-1.0, 1.0);
+        *s = (*s * vol).clamp(-1.0, 1.0);
     }
 }
 
-fn build_output(device: &cpal::Device, playback: Playback) -> Result<cpal::Stream, String> {
+fn build_output(
+    device: &cpal::Device,
+    playback: Playback,
+    render: Option<Arc<Mutex<VecDeque<f32>>>>,
+) -> Result<cpal::Stream, String> {
     let fallback = device.default_output_config().map_err(|e| e.to_string())?;
     let configs: Vec<_> = device
         .supported_output_configs()
@@ -229,6 +250,14 @@ fn build_output(device: &cpal::Device, playback: Playback) -> Result<cpal::Strea
     let mut fill = move |frames: usize, write: &mut dyn FnMut(usize, f32)| {
         while fifo_l.len() < frames {
             mix(&playback, 480, &mut mixed); // 10 мс
+            if let Some(r) = &render {
+                if let Ok(mut q) = r.lock() {
+                    q.extend(mixed.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
+                    while q.len() > MAX_RENDER {
+                        q.pop_front();
+                    }
+                }
+            }
             src_l.clear();
             src_r.clear();
             for pair in mixed.chunks_exact(2) {
@@ -339,6 +368,8 @@ impl Audio {
     ) -> Result<Audio, String> {
         let capture = Arc::new(Mutex::new(VecDeque::new()));
         let playback: Playback = Arc::new(Mutex::new(HashMap::new()));
+        let render = Arc::new(Mutex::new(VecDeque::new()));
+        let render_tap = render.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicU32::new(0));
         let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
@@ -361,7 +392,7 @@ impl Audio {
                         return;
                     }
                 };
-                let out_stream = match build_output(&output, pb) {
+                let out_stream = match build_output(&output, pb, Some(render_tap)) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = tx.send(Err(format!("динамики: {e}")));
@@ -397,6 +428,7 @@ impl Audio {
         Ok(Audio {
             capture,
             playback,
+            render,
             has_mic,
             stop,
             level,
@@ -422,9 +454,65 @@ impl Audio {
         true
     }
 
+    /// Забирает 480 сэмплов (10 мс) образца вывода для эхоподавления.
+    pub fn take_render(&self, out: &mut [f32; 480]) -> bool {
+        let Ok(mut q) = self.render.lock() else {
+            return false;
+        };
+        if q.len() < 480 {
+            return false;
+        }
+        for (i, s) in q.drain(..480).enumerate() {
+            out[i] = s;
+        }
+        true
+    }
+
     pub fn clear_capture(&self) {
         if let Ok(mut q) = self.capture.lock() {
             q.clear();
         }
     }
+}
+
+/// Проверка динамиков: короткая мелодия из трёх нот на выбранном устройстве.
+pub fn play_test_sound(output: Option<String>) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("speaker-test".into())
+        .spawn(move || {
+            let host = cpal::default_host();
+            let Some(device) = find_output(&host, output.as_deref()) else {
+                crate::store::log("проверка динамиков: устройство не найдено");
+                return;
+            };
+            let playback: Playback = Arc::new(Mutex::new(HashMap::new()));
+            let stream = match build_output(&device, playback.clone(), None) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::store::log(&format!("проверка динамиков: {e}"));
+                    return;
+                }
+            };
+            let _ = stream.play();
+            // до-ми-соль с мягкой атакой и затуханием
+            let mut samples: Vec<f32> = Vec::new();
+            for (k, freq) in [523.25f32, 659.25, 783.99].iter().enumerate() {
+                let len = (RATE as f32 * if k == 2 { 0.55 } else { 0.28 }) as usize;
+                for i in 0..len {
+                    let t = i as f32 / RATE as f32;
+                    let env = (t * 60.0).min(1.0) * (-t * 5.0).exp();
+                    let v = (t * freq * std::f32::consts::TAU).sin() * 0.28 * env
+                        + (t * freq * 2.0 * std::f32::consts::TAU).sin() * 0.06 * env;
+                    samples.push(v);
+                    samples.push(v);
+                }
+            }
+            if let Ok(mut map) = playback.lock() {
+                map.insert(0, samples.into_iter().collect());
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(stream);
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

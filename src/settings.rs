@@ -1,5 +1,7 @@
 //! Настройки, сохраняются в %APPDATA%\Rustcord\settings.json
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -46,6 +48,24 @@ pub struct Settings {
     pub mic_threshold: f32,
     pub always_transmit: bool,
     pub echo_guard: bool,
+    /// Эхоподавление WebRTC AEC3.
+    pub echo_cancel: bool,
+    /// Шумоподавление: 0 — выкл, 1 — стандартное (WebRTC), 2 — усиленное (RNNoise).
+    pub noise: u8,
+    /// Автоматическая регулировка усиления микрофона.
+    pub agc: bool,
+    /// Ручное усиление микрофона (0..3).
+    pub input_gain: f32,
+    /// Рация (Push-to-Talk).
+    pub ptt: bool,
+    /// Клавиша рации: виртуальный код Windows (VK_*).
+    pub ptt_key: u32,
+    /// Общая громкость собеседников (0..2).
+    pub output_volume: f32,
+    /// Громкость отдельных собеседников: id → 0..2 (0 — заглушён).
+    pub user_volumes: HashMap<u64, f32>,
+    /// Заглушённые серверы и каналы: без уведомлений и меток непрочитанного.
+    pub muted: HashSet<u64>,
     pub stream_monitor: usize,
     pub stream_height: u32,
     pub stream_fps: u32,
@@ -75,6 +95,15 @@ impl Default for Settings {
             mic_threshold: 0.006,
             always_transmit: false,
             echo_guard: true,
+            echo_cancel: true,
+            noise: 2,
+            agc: true,
+            input_gain: 1.0,
+            ptt: false,
+            ptt_key: 0xC0,
+            output_volume: 1.0,
+            user_volumes: HashMap::new(),
+            muted: HashSet::new(),
             stream_monitor: 0,
             stream_height: 720,
             stream_fps: 30,
@@ -98,6 +127,12 @@ pub fn load() -> Settings {
     s.stream_height = s.stream_height.clamp(360, 1440);
     s.stream_fps = s.stream_fps.clamp(5, 60);
     s.stream_quality = s.stream_quality.min(2);
+    s.noise = s.noise.min(2);
+    s.input_gain = s.input_gain.clamp(0.0, 3.0);
+    s.output_volume = s.output_volume.clamp(0.0, 2.0);
+    for v in s.user_volumes.values_mut() {
+        *v = v.clamp(0.0, 2.0);
+    }
     s
 }
 

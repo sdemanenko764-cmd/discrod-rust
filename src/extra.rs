@@ -541,7 +541,13 @@ fn plain_preview(content: &str, n: usize) -> String {
 }
 
 impl App {
-    fn api(&self, method: &'static str, path: String, body: Option<Value>, tag: discord::ApiTag) {
+    pub(crate) fn api(
+        &self,
+        method: &'static str,
+        path: String,
+        body: Option<Value>,
+        tag: discord::ApiTag,
+    ) {
         let _ = self.cmd.send(Cmd::Api {
             method,
             path,
@@ -717,6 +723,57 @@ impl App {
                 }
                 Err(e) => self.toast(format!("Не удалось создать приглашение: {e}"), true),
             },
+            ApiTag::InviteFor(uid) => match result {
+                Ok(b) => {
+                    let v: Value = serde_json::from_str(&b).unwrap_or_default();
+                    if let Some(code) = v["code"].as_str() {
+                        let link = format!("https://discord.gg/{code}");
+                        let dm = self
+                            .dms
+                            .iter()
+                            .find(|d| {
+                                !d.group && d.recipients.len() == 1 && d.recipients[0].0 == uid
+                            })
+                            .map(|d| d.id);
+                        match dm {
+                            Some(cid) => {
+                                let _ = self.cmd.send(Cmd::Send {
+                                    channel_id: cid,
+                                    content: link,
+                                    reply_to: None,
+                                    nonce: discord::nonce(),
+                                });
+                                self.toast("Приглашение отправлено в личные сообщения", false);
+                            }
+                            None => self.api(
+                                "POST",
+                                "/users/@me/channels".into(),
+                                Some(serde_json::json!({ "recipients": [uid.to_string()] })),
+                                ApiTag::DmThenSend(link),
+                            ),
+                        }
+                    }
+                }
+                Err(e) => self.toast(format!("Не удалось создать приглашение: {e}"), true),
+            },
+            ApiTag::DmThenSend(text) => match result {
+                Ok(b) => {
+                    if let Some(dm) = discord::parse_dm(&b) {
+                        let cid = dm.id;
+                        if !self.dms.iter().any(|d| d.id == cid) {
+                            self.dms.insert(0, dm);
+                        }
+                        let _ = self.cmd.send(Cmd::Send {
+                            channel_id: cid,
+                            content: text,
+                            reply_to: None,
+                            nonce: discord::nonce(),
+                        });
+                        self.toast("Приглашение отправлено в личные сообщения", false);
+                    }
+                }
+                Err(e) => self.toast(format!("Не удалось открыть личку: {e}"), true),
+            },
             ApiTag::Done(text) => match result {
                 Ok(_) => self.toast(text, false),
                 Err(e) => self.toast(e, true),
@@ -744,6 +801,12 @@ impl App {
             return;
         }
         *self.mentions.entry(m.channel_id).or_default() += 1;
+        let muted = self.settings.muted.contains(&m.channel_id)
+            || m.guild_id
+                .map_or(false, |g| self.settings.muted.contains(&g));
+        if muted && !m.mentions.iter().any(|(id, _)| *id == self.me_id) {
+            return;
+        }
         if self.my_status == "dnd" || !self.settings.notifications || focused {
             return;
         }
@@ -969,6 +1032,10 @@ impl App {
                 );
             }
             Action::MessageMenu(cid, m, pos) => {
+                // Правый клик по аватарке/имени уже открыл меню пользователя.
+                if self.user_menu.is_some() && self.menu_frame == self.frame_no {
+                    return;
+                }
                 self.msg_menu = Some((cid, *m, pos));
                 self.menu_frame = self.frame_no;
             }
@@ -1255,6 +1322,9 @@ impl App {
         let mut actions: Vec<Action> = Vec::new();
         self.status_ui(ctx, &mut actions);
         self.msg_menu_ui(ctx, &mut actions);
+        self.user_menu_ui(ctx, &mut actions);
+        self.channel_menu_ui(ctx, &mut actions);
+        self.rename_ui(ctx, &mut actions);
         self.guild_menu_ui(ctx, &mut actions);
         self.profile_ui(ctx, &mut actions);
         self.pins_ui(ctx, &mut actions);
@@ -1388,14 +1458,62 @@ impl App {
         let solid = self.solid();
         let own = m.author_id == self.me_id;
         let guild = self.sel_guild;
+        // Модерировать можно точно, если вы владелец сервера (остальные права Discord проверит сам).
+        let can_moderate = guild
+            .and_then(|g| self.guilds.iter().find(|x| x.id == g))
+            .map_or(false, |g| g.owner == self.me_id && self.me_id != 0);
+        let appear = menu_appear(
+            ctx,
+            egui::Id::new("msg_menu_a"),
+            self.menu_frame,
+            self.frame_no,
+        );
         let mut close = false;
         let area = egui::Area::new(egui::Id::new("msg_menu"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pos)
+            .fixed_pos(pos + vec2(0.0, 4.0 * (1.0 - appear)))
             .constrain(true)
             .show(ctx, |ui| {
+                ui.multiply_opacity(appear);
                 menu_frame(&pal, solid).show(ui, |ui| {
-                    ui.set_width(210.0);
+                    ui.set_width(230.0);
+                    // быстрые реакции
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for e in ["👍", "❤", "😂", "🔥", "😮", "😢"] {
+                            let (r, resp) =
+                                ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                            let h = ui.ctx().animate_bool_with_time(
+                                resp.id.with("h"),
+                                resp.hovered(),
+                                0.1,
+                            );
+                            ui.painter().circle_filled(
+                                r.center(),
+                                15.0 + 2.0 * h,
+                                mix(pal.elevated, pal.hover, h),
+                            );
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                e,
+                                FontId::proportional(16.0 + 2.0 * h),
+                                pal.text,
+                            );
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                let emoji = Emoji::unicode(if e == "❤" { "❤️" } else { e });
+                                let mine = m.reactions.iter().any(|r| r.me && r.emoji == emoji);
+                                actions.push(Action::React {
+                                    channel_id: cid,
+                                    message_id: m.id,
+                                    emoji,
+                                    add: !mine,
+                                });
+                                close = true;
+                            }
+                        }
+                    });
+                    menu_sep(ui, &pal);
                     let mut item = |ui: &mut egui::Ui, text: &str, danger: bool| -> bool {
                         let r = menu_item(ui, &pal, text, danger);
                         if r {
@@ -1425,6 +1543,14 @@ impl App {
                     };
                     if item(ui, pin_text, false) {
                         actions.push(Action::Pin(cid, m.id, !m.pinned));
+                    }
+                    if m.thread.is_none() && guild.is_some() && item(ui, "🧵  Создать ветку", false)
+                    {
+                        let first_line = m.content.lines().next().unwrap_or("").to_string();
+                        actions.push(Action::CreateThread(cid, m.id, first_line));
+                    }
+                    if item(ui, "◉  Отметить непрочитанным", false) {
+                        actions.push(Action::MarkUnread(cid, guild));
                     }
                     if let Some((tid, name, _)) = &m.thread {
                         if item(ui, "🧵  Открыть ветку", false) {
@@ -1462,12 +1588,18 @@ impl App {
                         actions.push(Action::MessageUser(m.author_id));
                     }
                     ui.separator();
-                    if own {
-                        if item(ui, "🗑  Удалить", true) {
+                    if own || can_moderate {
+                        let label = if own {
+                            "🗑  Удалить"
+                        } else {
+                            "🗑  Удалить (модерация)"
+                        };
+                        if item(ui, label, true) {
                             let preview: String = m.content.chars().take(160).collect();
                             actions.push(Action::AskDelete(cid, m.id, preview));
                         }
-                    } else if item(ui, "⚑  Пожаловаться", true) {
+                    }
+                    if !own && item(ui, "⚑  Пожаловаться", true) {
                         let g = guild.map(|g| g.to_string()).unwrap_or_else(|| "@me".into());
                         actions.push(Action::Report(format!(
                             "https://discord.com/channels/{g}/{cid}/{}",
@@ -1478,6 +1610,336 @@ impl App {
             });
         if close || self.menu_should_close(ctx, &area.response) {
             self.msg_menu = None;
+        }
+    }
+
+    fn user_menu_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some((uid, pos)) = self.user_menu else {
+            return;
+        };
+        let pal = self.pal;
+        let solid = self.solid();
+        let me = uid == self.me_id;
+        let bot_session = self.is_bot();
+        let (name, _) = self.known_user(uid);
+        let friend = self.friends.iter().find(|f| f.id == uid).map(|f| f.kind);
+        let dm = self
+            .dms
+            .iter()
+            .find(|d| !d.group && d.recipients.len() == 1 && d.recipients[0].0 == uid)
+            .map(|d| d.id);
+        let in_voice = self.voice.is_some();
+        let volume = self.settings.user_volumes.get(&uid).copied().unwrap_or(1.0);
+        let guild = self.sel_guild;
+        let my_guilds: Vec<(u64, String)> =
+            self.guilds.iter().map(|g| (g.id, g.name.clone())).collect();
+        let appear = menu_appear(
+            ctx,
+            egui::Id::new("user_menu_a"),
+            self.menu_frame,
+            self.frame_no,
+        );
+        let mut close = false;
+        let mut new_volume = volume;
+        let mut invite_rect: Option<Rect> = None;
+        let mut toggle_invite = false;
+        let area = egui::Area::new(egui::Id::new("user_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos + vec2(0.0, 4.0 * (1.0 - appear)))
+            .constrain(true)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(appear);
+                menu_frame(&pal, solid).show(ui, |ui| {
+                    ui.set_width(236.0);
+                    menu_header(ui, &pal, &name);
+                    let mut item = |ui: &mut egui::Ui, text: &str, danger: bool| -> bool {
+                        let r = menu_item(ui, &pal, text, danger);
+                        if r {
+                            close = true;
+                        }
+                        r
+                    };
+                    if item(ui, "👤  Профиль", false) {
+                        actions.push(Action::OpenProfile(uid));
+                    }
+                    if !me {
+                        if item(ui, "💬  Написать сообщение", false) {
+                            actions.push(Action::MessageUser(uid));
+                        }
+                        if let Some(cid) = dm {
+                            if !bot_session && item(ui, "📞  Позвонить", false) {
+                                actions.push(Action::OpenChannel(cid));
+                                actions.push(Action::CallDm(cid));
+                            }
+                        }
+                    }
+                    if item(ui, "@  Упомянуть", false) {
+                        actions.push(Action::InsertMention(name.clone()));
+                    }
+                    if !me && !bot_session {
+                        menu_sep(ui, &pal);
+                        if item(ui, "🌐  Общие серверы", false) {
+                            actions.push(Action::OpenProfileTab(uid, 1));
+                        }
+                        if item(ui, "👥  Общие друзья", false) {
+                            actions.push(Action::OpenProfileTab(uid, 2));
+                        }
+                        let r =
+                            menu_item_resp(ui, &pal, "✉  Пригласить на сервер", false, Some("›"));
+                        if r.clicked() || r.hovered() {
+                            toggle_invite = r.clicked() || !self.user_menu_invite;
+                        }
+                        invite_rect = Some(r.rect);
+                    }
+                    if !me && in_voice {
+                        menu_sep(ui, &pal);
+                        ui.label(
+                            RichText::new("Громкость пользователя")
+                                .size(12.0)
+                                .color(pal.muted),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut new_volume, 0.0..=2.0)
+                                .show_value(true)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        );
+                        let muted = volume <= 0.001;
+                        if item(
+                            ui,
+                            if muted {
+                                "🔈  Включить звук"
+                            } else {
+                                "🔇  Заглушить для себя"
+                            },
+                            false,
+                        ) {
+                            actions.push(Action::SetUserVolume(uid, if muted { 1.0 } else { 0.0 }));
+                        }
+                    }
+                    if !me && !bot_session {
+                        menu_sep(ui, &pal);
+                        match friend {
+                            Some(1) => {
+                                if item(ui, "✖  Удалить из друзей", true) {
+                                    actions.push(Action::FriendRemove(uid));
+                                }
+                            }
+                            Some(3) => {
+                                if item(ui, "✓  Принять заявку в друзья", false)
+                                {
+                                    actions.push(Action::FriendAccept(uid));
+                                }
+                            }
+                            Some(4) => {
+                                if item(ui, "↺  Отменить заявку", false) {
+                                    actions.push(Action::FriendRemove(uid));
+                                }
+                            }
+                            Some(2) => {}
+                            _ => {
+                                if item(ui, "➕  Добавить в друзья", false) {
+                                    actions.push(Action::FriendRequest(uid));
+                                }
+                            }
+                        }
+                        if friend == Some(2) {
+                            if item(ui, "⊘  Разблокировать", false) {
+                                actions.push(Action::FriendRemove(uid));
+                            }
+                        } else if item(ui, "⊘  Заблокировать", true) {
+                            actions.push(Action::FriendBlock(uid));
+                        }
+                    }
+                    menu_sep(ui, &pal);
+                    if item(ui, "⧉  Копировать имя", false) {
+                        actions.push(Action::CopyText(name.clone()));
+                    }
+                    if item(ui, "#  Копировать ID пользователя", false) {
+                        actions.push(Action::CopyId(uid));
+                    }
+                    let _ = guild;
+                });
+            });
+        if (new_volume - volume).abs() > 0.001 {
+            actions.push(Action::SetUserVolume(uid, new_volume));
+        }
+        if toggle_invite {
+            self.user_menu_invite = true;
+        }
+        // подменю приглашения — рядом с пунктом
+        let mut sub_resp = None;
+        if self.user_menu_invite {
+            if let Some(r) = invite_rect {
+                let sub = egui::Area::new(egui::Id::new("user_menu_invite"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos2(r.right() + 10.0, r.top() - 6.0))
+                    .constrain(true)
+                    .show(ctx, |ui| {
+                        menu_frame(&pal, solid).show(ui, |ui| {
+                            ui.set_width(220.0);
+                            menu_header(ui, &pal, "Отправить приглашение в личку");
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
+                                .show(ui, |ui| {
+                                    if my_guilds.is_empty() {
+                                        ui.label(RichText::new("Нет серверов").color(pal.muted));
+                                    }
+                                    for (gid, gname) in &my_guilds {
+                                        if menu_item(ui, &pal, gname, false) {
+                                            actions.push(Action::InviteUser(uid, *gid));
+                                            close = true;
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                sub_resp = Some(sub.response);
+            }
+        }
+        let in_sub = sub_resp.as_ref().map_or(false, |r| r.contains_pointer());
+        if close || (!in_sub && self.menu_should_close(ctx, &area.response)) {
+            self.user_menu = None;
+            self.user_menu_invite = false;
+        }
+    }
+
+    fn channel_menu_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some((guild, cid, pos)) = self.channel_menu else {
+            return;
+        };
+        let pal = self.pal;
+        let solid = self.solid();
+        let g = guild.and_then(|g| self.guilds.iter().find(|x| x.id == g));
+        let chan = g
+            .and_then(|g| g.channels.iter().find(|c| c.id == cid))
+            .cloned();
+        let name = chan
+            .as_ref()
+            .map(|c| c.name.clone())
+            .or_else(|| {
+                self.dms
+                    .iter()
+                    .find(|d| d.id == cid)
+                    .map(|d| d.name.clone())
+            })
+            .unwrap_or_default();
+        let owner = g.map_or(false, |g| g.owner == self.me_id && self.me_id != 0);
+        let muted = self.settings.muted.contains(&cid);
+        let unread = self.unread.contains_key(&cid) || self.mentions.contains_key(&cid);
+        let text_like = chan
+            .as_ref()
+            .map_or(true, |c| is_text(c.kind) || is_thread(c.kind));
+        let appear = menu_appear(
+            ctx,
+            egui::Id::new("chan_menu_a"),
+            self.menu_frame,
+            self.frame_no,
+        );
+        let mut close = false;
+        let area = egui::Area::new(egui::Id::new("channel_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos + vec2(0.0, 4.0 * (1.0 - appear)))
+            .constrain(true)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(appear);
+                menu_frame(&pal, solid).show(ui, |ui| {
+                    ui.set_width(230.0);
+                    menu_header(ui, &pal, &name);
+                    let mut item = |ui: &mut egui::Ui, text: &str, danger: bool| -> bool {
+                        let r = menu_item(ui, &pal, text, danger);
+                        if r {
+                            close = true;
+                        }
+                        r
+                    };
+                    if unread && item(ui, "✓  Отметить прочитанным", false) {
+                        actions.push(Action::MarkRead(cid));
+                    }
+                    if item(
+                        ui,
+                        if muted {
+                            "🔔  Включить уведомления"
+                        } else {
+                            "🔕  Заглушить канал"
+                        },
+                        false,
+                    ) {
+                        actions.push(Action::ToggleMuted(cid));
+                    }
+                    if text_like {
+                        menu_sep(ui, &pal);
+                        if item(ui, "📌  Закреплённые сообщения", false) {
+                            actions.push(Action::OpenChannel(cid));
+                            actions.push(Action::OpenPins(cid));
+                        }
+                        if guild.is_some() && item(ui, "🧵  Ветки канала", false) {
+                            actions.push(Action::OpenThreads(cid));
+                        }
+                    }
+                    if guild.is_some() {
+                        menu_sep(ui, &pal);
+                        if item(ui, "✉  Пригласить в этот канал", false) {
+                            actions.push(Action::ChannelInvite(cid));
+                        }
+                        if owner && item(ui, "✏  Переименовать канал", false) {
+                            actions.push(Action::AskRename(cid));
+                        }
+                    }
+                    menu_sep(ui, &pal);
+                    if item(ui, "🔗  Копировать ссылку", false) {
+                        let gs = guild.map(|g| g.to_string()).unwrap_or_else(|| "@me".into());
+                        actions.push(Action::CopyText(format!(
+                            "https://discord.com/channels/{gs}/{cid}"
+                        )));
+                    }
+                    if item(ui, "#  Копировать ID канала", false) {
+                        actions.push(Action::CopyId(cid));
+                    }
+                });
+            });
+        if close || self.menu_should_close(ctx, &area.response) {
+            self.channel_menu = None;
+        }
+    }
+
+    fn rename_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some((cid, mut name)) = self.rename_channel.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let solid = self.solid();
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new(RichText::new("Переименовать канал").strong())
+            .id(egui::Id::new("rename_win"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(window_frame(ctx, &pal, solid))
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                r.request_focus();
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if accent_button(ui, &pal, "Сохранить", 120.0, 34.0).clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.rename_channel = None;
+                    }
+                });
+            });
+        if submit {
+            actions.push(Action::RenameChannel(cid, name));
+        } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.rename_channel = None;
+        } else if let Some(r) = self.rename_channel.as_mut() {
+            r.1 = name;
         }
     }
 
@@ -1526,6 +1988,27 @@ impl App {
                             for c in chans {
                                 self.mentions.remove(&c);
                             }
+                            close = true;
+                        }
+                        let muted = self.settings.muted.contains(&g);
+                        if menu_item(
+                            ui,
+                            &pal,
+                            if muted {
+                                "🔔  Включить уведомления"
+                            } else {
+                                "🔕  Заглушить сервер"
+                            },
+                            false,
+                        ) {
+                            actions.push(Action::ToggleMuted(g));
+                            close = true;
+                        }
+                        if menu_item(ui, &pal, "🔗  Копировать ссылку на сервер", false)
+                        {
+                            actions.push(Action::CopyText(format!(
+                                "https://discord.com/channels/{g}"
+                            )));
                             close = true;
                         }
                         if menu_item(ui, &pal, "#  Копировать ID сервера", false) {
@@ -2706,27 +3189,98 @@ fn menu_frame(pal: &Palette, solid: Color32) -> egui::Frame {
 }
 
 fn menu_item(ui: &mut egui::Ui, pal: &Palette, text: &str, danger: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-    let hovered = resp.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, 6.0, if danger { pal.danger } else { pal.accent });
-    }
-    let color = if hovered {
-        Color32::WHITE
-    } else if danger {
-        pal.danger
-    } else {
-        pal.text
+    menu_item_resp(ui, pal, text, danger, None).clicked()
+}
+
+/// Пункт меню: иконка в своей колонке, текст, необязательная подсказка справа
+/// («›» у подменю, сочетание клавиш); плавная подсветка при наведении.
+fn menu_item_resp(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &str,
+    danger: bool,
+    trailing: Option<&str>,
+) -> egui::Response {
+    let (icon, label) = match text.split_once("  ") {
+        Some((i, l)) if i.chars().count() <= 2 => (Some(i), l),
+        _ => (None, text),
     };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.08);
+    if t > 0.01 {
+        let fill = if danger { pal.danger } else { pal.accent };
+        ui.painter().rect_filled(
+            rect.shrink2(vec2(2.0 * (1.0 - t), 0.0)),
+            6.0,
+            fill.gamma_multiply(t),
+        );
+    }
+    let base = if danger { pal.danger } else { pal.text };
+    let color = mix(base, Color32::WHITE, t);
+    if let Some(i) = icon {
+        ui.painter().text(
+            rect.left_center() + vec2(18.0, 0.0),
+            Align2::CENTER_CENTER,
+            i,
+            FontId::proportional(14.0),
+            mix(
+                if danger { pal.danger } else { pal.muted },
+                Color32::WHITE,
+                t,
+            ),
+        );
+    }
     ui.painter().text(
-        rect.left_center() + vec2(10.0, 0.0),
+        rect.left_center() + vec2(if icon.is_some() { 36.0 } else { 10.0 }, 0.0),
         Align2::LEFT_CENTER,
-        text,
+        label,
         FontId::proportional(13.5),
         color,
     );
-    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+    if let Some(tr) = trailing {
+        ui.painter().text(
+            rect.right_center() - vec2(10.0, 0.0),
+            Align2::RIGHT_CENTER,
+            tr,
+            FontId::proportional(13.0),
+            mix(pal.faint, Color32::WHITE, t),
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Заголовок меню (мелкий, приглушённый).
+fn menu_header(ui: &mut egui::Ui, pal: &Palette, text: &str) {
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).strong().color(pal.muted)).truncate());
+    ui.add_space(2.0);
+}
+
+/// Тонкий разделитель между группами пунктов.
+fn menu_sep(ui: &mut egui::Ui, pal: &Palette) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            r.left_center() + vec2(6.0, 0.0),
+            r.right_center() - vec2(6.0, 0.0),
+        ],
+        Stroke::new(1.0, pal.border),
+    );
+}
+
+/// Плавное появление меню: прозрачность и небольшой сдвиг по первым кадрам.
+fn menu_appear(ctx: &egui::Context, id: egui::Id, opened_at: u64, frame_no: u64) -> f32 {
+    let key = id.with(opened_at);
+    let now = ctx.input(|i| i.time);
+    let t0 = ctx.memory_mut(|m| *m.data.get_temp_mut_or_insert_with(key, || now));
+    let a = ((now - t0) / 0.12).clamp(0.0, 1.0) as f32;
+    if a < 1.0 {
+        ctx.request_repaint();
+    }
+    let _ = frame_no;
+    a
 }
 
 pub fn is_thread(kind: u8) -> bool {
