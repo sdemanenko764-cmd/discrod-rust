@@ -283,6 +283,7 @@ struct App {
     window_focused: bool,
     attention: bool,
     menu_frame: u64,
+    frame_no: u64,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -378,6 +379,7 @@ impl App {
             window_focused: true,
             attention: false,
             menu_frame: 0,
+            frame_no: 0,
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),

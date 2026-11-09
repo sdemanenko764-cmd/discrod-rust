@@ -831,7 +831,7 @@ impl App {
             }
             Action::GuildMenu(g, pos) => {
                 self.guild_menu = Some((g, pos));
-                self.menu_frame = ctx.frame_nr();
+                self.menu_frame = self.frame_no;
             }
             Action::AskLeave(g) => self.confirm_leave = Some(g),
             Action::LeaveGuild(g) => {
@@ -889,7 +889,7 @@ impl App {
             }
             Action::MessageMenu(cid, m, pos) => {
                 self.msg_menu = Some((cid, *m, pos));
-                self.menu_frame = ctx.frame_nr();
+                self.menu_frame = self.frame_no;
             }
             Action::Pin(cid, mid, pin) => {
                 let method = if pin { "PUT" } else { "DELETE" };
@@ -1137,6 +1137,7 @@ impl App {
     // ---------- все дополнительные окна за кадр ----------
 
     pub(crate) fn extra_ui(&mut self, ctx: &egui::Context) {
+        self.frame_no += 1;
         self.window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if self.window_focused {
             // окно снова активно — упоминания в открытом канале прочитаны
@@ -1292,7 +1293,7 @@ impl App {
             });
         let clicked_outside = ctx.input(|i| i.pointer.any_pressed())
             && !area.response.contains_pointer()
-            && ctx.frame_nr() > self.menu_frame + 1;
+            && self.frame_no > self.menu_frame + 1;
         if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.status_menu = false;
         }
@@ -1401,7 +1402,7 @@ impl App {
 
     fn menu_should_close(&self, ctx: &egui::Context, resp: &egui::Response) -> bool {
         let pressed = ctx.input(|i| i.pointer.any_pressed());
-        (pressed && !resp.contains_pointer() && ctx.frame_nr() > self.menu_frame + 1)
+        (pressed && !resp.contains_pointer() && self.frame_no > self.menu_frame + 1)
             || ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
