@@ -362,7 +362,7 @@ fn rich_line(
                     let mut j = LayoutJob::default();
                     j.append(t, 0.0, format(st, false));
                     let r = ui
-                        .add(egui::Label::new(j).sense(Sense::click()))
+                        .add(egui::Label::new(j).sense(Sense::click()).selectable(false))
                         .on_hover_cursor(CursorIcon::PointingHand)
                         .on_hover_text("Спойлер — нажмите, чтобы показать");
                     if r.clicked() {
@@ -382,7 +382,8 @@ fn rich_line(
                                     .color(Color32::from_gray(20))
                                     .background_color(Color32::from_gray(20)),
                             )
-                            .sense(Sense::click()),
+                            .sense(Sense::click())
+                            .selectable(false),
                         )
                         .on_hover_cursor(CursorIcon::PointingHand);
                     if r.clicked() {
@@ -492,7 +493,8 @@ fn mention_pill(ui: &mut egui::Ui, text: &str, fg: Color32, size: f32) -> egui::
                 .color(fg)
                 .background_color(fg.gamma_multiply(0.22)),
         )
-        .sense(Sense::click()),
+        .sense(Sense::click())
+        .selectable(false),
     );
     r.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -1628,7 +1630,6 @@ impl App {
             .iter()
             .find(|d| !d.group && d.recipients.len() == 1 && d.recipients[0].0 == uid)
             .map(|d| d.id);
-        let in_voice = self.voice.is_some();
         let volume = self.settings.user_volumes.get(&uid).copied().unwrap_or(1.0);
         let guild = self.sel_guild;
         let my_guilds: Vec<(u64, String)> =
@@ -1677,6 +1678,19 @@ impl App {
                         actions.push(Action::InsertMention(name.clone()));
                     }
                     if !me && !bot_session {
+                        if item(ui, "✎  Добавить заметку", false) {
+                            actions.push(Action::AskNote(uid));
+                        }
+                        if friend == Some(1) && item(ui, "✎  Никнейм друга", false) {
+                            actions.push(Action::AskNickname(uid));
+                        }
+                    }
+                    if let Some(cid) = dm {
+                        if item(ui, "✕  Закрыть личные сообщения", false) {
+                            actions.push(Action::CloseDm(cid));
+                        }
+                    }
+                    if !me && !bot_session {
                         menu_sep(ui, &pal);
                         if item(ui, "🌐  Общие серверы", false) {
                             actions.push(Action::OpenProfileTab(uid, 1));
@@ -1691,7 +1705,7 @@ impl App {
                         }
                         invite_rect = Some(r.rect);
                     }
-                    if !me && in_voice {
+                    if !me {
                         menu_sep(ui, &pal);
                         ui.label(
                             RichText::new("Громкость пользователя")
@@ -1756,6 +1770,11 @@ impl App {
                     }
                     if item(ui, "#  Копировать ID пользователя", false) {
                         actions.push(Action::CopyId(uid));
+                    }
+                    if let Some(cid) = dm {
+                        if item(ui, "#  Копировать ID канала", false) {
+                            actions.push(Action::CopyId(cid));
+                        }
                     }
                     let _ = guild;
                 });
@@ -1903,14 +1922,19 @@ impl App {
     }
 
     fn rename_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let Some((cid, mut name)) = self.rename_channel.clone() else {
+        let Some((kind, cid, mut name)) = self.rename_channel.clone() else {
             return;
         };
         let pal = self.pal;
         let solid = self.solid();
         let mut open = true;
         let mut submit = false;
-        egui::Window::new(RichText::new("Переименовать канал").strong())
+        let (title, hint) = match kind {
+            1 => ("Заметка о пользователе", "Видна только вам"),
+            2 => ("Никнейм друга", "Пусто — вернуть обычное имя"),
+            _ => ("Переименовать канал", "Новое название"),
+        };
+        egui::Window::new(RichText::new(title).strong())
             .id(egui::Id::new("rename_win"))
             .open(&mut open)
             .collapsible(false)
@@ -1919,7 +1943,11 @@ impl App {
             .frame(window_frame(ctx, &pal, solid))
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                );
                 r.request_focus();
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
@@ -1935,11 +1963,15 @@ impl App {
                 });
             });
         if submit {
-            actions.push(Action::RenameChannel(cid, name));
+            actions.push(match kind {
+                1 => Action::SaveNote(cid, name),
+                2 => Action::SaveNickname(cid, name),
+                _ => Action::RenameChannel(cid, name),
+            });
         } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.rename_channel = None;
         } else if let Some(r) = self.rename_channel.as_mut() {
-            r.1 = name;
+            r.2 = name;
         }
     }
 
@@ -2431,66 +2463,57 @@ impl App {
                                             });
                                         }
                                     }
-                                    if mutual > 0 && !me {
+                                    // общие серверы — во вкладке сверху; у ботов вкладок нет
+                                    if mutual > 0 && !me && (bot || self.is_bot()) {
                                         section_title(ui, &pal, "ОБЩИЕ СЕРВЕРЫ");
-                                        let r = ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!(
-                                                    "{mutual} — показать список →"
-                                                ))
-                                                .color(pal.link),
-                                            )
-                                            .sense(Sense::click()),
-                                        );
-                                        if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                            new_tab = 1;
-                                        }
+                                        ui.label(RichText::new(mutual.to_string()).color(pal.text));
                                     }
                                 });
                         }
                         ui.add_space(12.0);
+                        // ряд кнопок одной высоты: главная растягивается, остальные — по содержимому
+                        let h = 38.0;
+                        let full = ui.available_width();
+                        let friend_label: Option<(&str, bool)> = if me || self.is_bot() {
+                            None
+                        } else {
+                            match friend {
+                                Some(1) | Some(2) => None,
+                                Some(3) => Some(("✓  Принять", true)),
+                                Some(4) => Some(("Заявка отправлена", false)),
+                                _ => Some(("＋  В друзья", true)),
+                            }
+                        };
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let side = h + friend_label.map_or(0.0, |_| 132.0 + 8.0) + 8.0;
                             if !me {
-                                if accent_button(ui, &pal, "💬 Написать", 150.0, 36.0).clicked()
+                                if accent_button(
+                                    ui,
+                                    &pal,
+                                    "Написать сообщение",
+                                    (full - side).max(120.0),
+                                    h,
+                                )
+                                .clicked()
                                 {
                                     actions.push(Action::MessageUser(uid));
                                 }
-                                match friend {
-                                    Some(1) => {}
-                                    Some(3) => {
-                                        if ui
-                                            .add_sized(
-                                                [150.0, 36.0],
-                                                egui::Button::new("✓ Принять заявку"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(Action::FriendAccept(uid));
-                                        }
+                                if let Some((label, enabled)) = friend_label {
+                                    if soft_button(ui, &pal, label, 132.0, h, enabled).clicked()
+                                        && enabled
+                                    {
+                                        actions.push(if friend == Some(3) {
+                                            Action::FriendAccept(uid)
+                                        } else {
+                                            Action::FriendRequest(uid)
+                                        });
                                     }
-                                    Some(4) => {
-                                        ui.add_enabled(
-                                            false,
-                                            egui::Button::new("Заявка отправлена")
-                                                .min_size(vec2(150.0, 36.0)),
-                                        );
-                                    }
-                                    _ if !self.is_bot() => {
-                                        if ui
-                                            .add_sized(
-                                                [150.0, 36.0],
-                                                egui::Button::new("➕ В друзья"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(Action::FriendRequest(uid));
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                            } else {
+                                ui.add_space(full - h - 8.0);
                             }
-                            if ui
-                                .add(egui::Button::new("#").min_size(vec2(36.0, 36.0)))
+                            if soft_button(ui, &pal, "⧉", h, h, true)
                                 .on_hover_text("Копировать ID")
                                 .clicked()
                             {
@@ -2572,7 +2595,8 @@ impl App {
                                                     .strong()
                                                     .color(pal.muted),
                                             )
-                                            .sense(Sense::click()),
+                                            .sense(Sense::click())
+                                            .selectable(false),
                                         )
                                         .on_hover_cursor(CursorIcon::PointingHand)
                                         .on_hover_text("Перейти в канал")
@@ -3131,6 +3155,45 @@ fn skeleton_row(ui: &mut egui::Ui, pal: &Palette, k: usize) {
     ui.add_space(6.0);
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(40));
+}
+
+/// Второстепенная кнопка в тон теме: мягкая заливка, плавная подсветка.
+fn soft_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &str,
+    w: f32,
+    h: f32,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered() && enabled, 0.12);
+    ui.painter()
+        .rect_filled(rect, 10.0, mix(pal.elevated, pal.hover, t));
+    ui.painter().rect_stroke(
+        rect,
+        10.0,
+        Stroke::new(1.0, mix(pal.border, pal.accent, 0.4 * t)),
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(14.0),
+        if enabled { pal.text } else { pal.faint },
+    );
+    if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    }
 }
 
 /// Вкладка в профиле: подчёркивание акцентом у выбранной.

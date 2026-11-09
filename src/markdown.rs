@@ -351,8 +351,30 @@ pub fn inline(line: &str) -> Vec<Inline<'_>> {
         }
         if rest.starts_with("http://") || rest.starts_with("https://") {
             let mut len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            // разметка вокруг ссылки (||спойлер||, **жирный**) — не часть адреса
+            for m in ["||", "**", "__", "~~", ">"] {
+                if let Some(p) = rest[..len].find(m) {
+                    len = len.min(p);
+                }
+            }
             // хвостовые знаки препинания не часть ссылки
-            while len > 0 && matches!(rest.as_bytes()[len - 1], b'.' | b',' | b')' | b'!' | b'?') {
+            while len > 0
+                && matches!(
+                    rest.as_bytes()[len - 1],
+                    b'.' | b','
+                        | b')'
+                        | b'!'
+                        | b'?'
+                        | b'*'
+                        | b'_'
+                        | b'~'
+                        | b'|'
+                        | b':'
+                        | b';'
+                        | b'"'
+                        | b'\''
+                )
+            {
                 len -= 1;
             }
             flush!(i);
@@ -559,5 +581,21 @@ mod tests {
         assert!(v.iter().any(|x| matches!(x, Inline::Channel(9, _))));
         assert!(v.iter().any(|x| matches!(x, Inline::Time(0, 'R', _))));
         assert!(v.iter().any(|x| matches!(x, Inline::Everyone(_, _))));
+    }
+
+    #[test]
+    fn link_inside_markup() {
+        // ссылка в спойлере и жирном: маркеры не должны попадать в адрес
+        let v = inline("**tg - ||https://t.me/heavenless97||**");
+        assert!(v.iter().any(
+            |x| matches!(x, Inline::Link { url, style, .. } if *url == "https://t.me/heavenless97" && style.spoiler && style.bold)
+        ));
+        assert!(!v
+            .iter()
+            .any(|x| matches!(x, Inline::Text(t, _) if t.contains('|') || t.contains('*'))));
+        let v = inline("смотри https://example.com/a_b.");
+        assert!(v
+            .iter()
+            .any(|x| matches!(x, Inline::Link { url, .. } if *url == "https://example.com/a_b")));
     }
 }

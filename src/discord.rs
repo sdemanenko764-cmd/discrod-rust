@@ -3487,7 +3487,7 @@ impl VoiceManager {
                         threshold: 0.006,
                         always: false,
                         echo_guard: true,
-                        echo_cancel: true,
+                        echo_cancel: false,
                         noise: 2,
                         agc: true,
                         input_gain: 1.0,

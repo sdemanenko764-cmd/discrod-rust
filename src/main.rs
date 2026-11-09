@@ -13,6 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod background;
 mod discord;
 mod emoji;
 mod extra;
@@ -201,6 +202,12 @@ enum Action {
     /// Новая ветка без исходного сообщения: (канал, название).
     CreateStandaloneThread(u64, String),
     AskRename(u64),
+    AskNote(u64),
+    AskNickname(u64),
+    SaveNote(u64, String),
+    SaveNickname(u64, String),
+    /// Закрыть личный диалог (убрать из списка).
+    CloseDm(u64),
     RenameChannel(u64, String),
     ChannelInvite(u64),
     /// Создать приглашение на сервер и отправить пользователю в личку.
@@ -282,6 +289,8 @@ struct App {
     watching: Option<(String, u64)>,
     stream_tex: Option<egui::TextureHandle>,
     stream_fullscreen: bool,
+    /// Свой фон (картинка или GIF).
+    background: background::Background,
     stream_picker: bool,
     /// Окна для трансляции: (id, заголовок, приложение).
     windows: Vec<(u32, String, String)>,
@@ -310,7 +319,8 @@ struct App {
     /// Подменю «Пригласить на сервер» открыто.
     user_menu_invite: bool,
     channel_menu: Option<(Option<u64>, u64, egui::Pos2)>,
-    rename_channel: Option<(u64, String)>,
+    /// Окно ввода текста: (что меняем: 0 — название канала, 1 — заметка, 2 — никнейм друга; id; текст).
+    rename_channel: Option<(u8, u64, String)>,
     /// Поле «Название новой ветки» в окне веток.
     thread_new_name: String,
     guild_menu: Option<(u64, egui::Pos2)>,
@@ -399,6 +409,7 @@ impl App {
             watching: None,
             stream_tex: None,
             stream_fullscreen: false,
+            background: background::Background::default(),
             stream_picker: false,
             windows: Vec::new(),
             stream_windows_tab: false,
@@ -1147,7 +1158,11 @@ impl App {
         if before.font_inter != self.settings.font_inter {
             fonts::install(ctx, self.settings.font_inter);
         }
-        if before.theme != self.settings.theme || before.accent != self.settings.accent {
+        if before.theme != self.settings.theme
+            || before.accent != self.settings.accent
+            || before.bg_image != self.settings.bg_image
+            || (before.panel_opacity - self.settings.panel_opacity).abs() > 0.001
+        {
             self.pal = theme::palette(&self.settings);
             theme::apply(ctx, &self.pal, self.settings.theme);
         }
@@ -1173,6 +1188,15 @@ impl App {
 
     /// Непрозрачный фон для всплывающих окон (у «стеклянных» тем панели полупрозрачные).
     fn solid(&self) -> Color32 {
+        if self.settings.bg_image.is_some() {
+            let mut s = self.settings.clone();
+            s.bg_image = None;
+            let p = theme::palette(&s);
+            return match theme::backdrop(s.theme) {
+                Some(b) => mix(b.base, Color32::WHITE, 0.06),
+                None => p.side,
+            };
+        }
         match theme::backdrop(self.settings.theme) {
             Some(b) => mix(b.base, Color32::WHITE, 0.06),
             None => self.pal.side,
@@ -1584,7 +1608,7 @@ impl App {
                                 let sr = ui.add(
                                     egui::Label::new(RichText::new(status).small().color(pal.muted))
                                         .truncate()
-                                        .sense(Sense::click()),
+                                        .sense(Sense::click()).selectable(false),
                                 );
                                 if sr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                     actions.push(Action::OpenStatusMenu);
@@ -1731,23 +1755,8 @@ impl App {
                                                     current_cat = Some(id);
                                                     ui.add_space(10.0);
                                                     let collapsed = self.collapsed.contains(&id);
-                                                    let arrow =
-                                                        if collapsed { "›" } else { "⌄" };
-                                                    let text = RichText::new(format!(
-                                                        "{arrow}  {}",
-                                                        name.to_uppercase()
-                                                    ))
-                                                    .size(11.5)
-                                                    .strong()
-                                                    .color(pal.faint);
-                                                    if ui
-                                                        .add(
-                                                            egui::Label::new(text)
-                                                                .sense(Sense::click())
-                                                                .truncate(),
-                                                        )
-                                                        .clicked()
-                                                    {
+                                                    let resp = category_header(ui, &pal, id, name, collapsed);
+                                                    if resp.clicked() {
                                                         actions.push(Action::ToggleCategory(id));
                                                     }
                                                 }
@@ -2927,7 +2936,44 @@ impl App {
                     .find(|c| c.id == cid)
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
-                self.rename_channel = Some((cid, name));
+                self.rename_channel = Some((0, cid, name));
+            }
+            Action::AskNote(uid) => self.rename_channel = Some((1, uid, String::new())),
+            Action::AskNickname(uid) => self.rename_channel = Some((2, uid, String::new())),
+            Action::SaveNote(uid, note) => {
+                self.rename_channel = None;
+                self.api(
+                    "PUT",
+                    format!("/users/@me/notes/{uid}"),
+                    Some(serde_json::json!({ "note": note.trim() })),
+                    discord::ApiTag::Done("Заметка сохранена (видна только вам)".into()),
+                );
+            }
+            Action::SaveNickname(uid, nick) => {
+                self.rename_channel = None;
+                let nick = nick.trim().to_string();
+                self.api(
+                    "PATCH",
+                    format!("/users/@me/relationships/{uid}"),
+                    Some(serde_json::json!({ "nickname": if nick.is_empty() { serde_json::Value::Null } else { nick.clone().into() } })),
+                    discord::ApiTag::Done("Никнейм друга сохранён".into()),
+                );
+                if !nick.is_empty() {
+                    self.users.insert(uid, nick);
+                }
+            }
+            Action::CloseDm(cid) => {
+                self.dms.retain(|d| d.id != cid);
+                if self.sel_channel == Some(cid) {
+                    self.sel_channel = None;
+                    self.friends_open = true;
+                }
+                self.api(
+                    "DELETE",
+                    format!("/channels/{cid}"),
+                    None,
+                    discord::ApiTag::Silent,
+                );
             }
             Action::RenameChannel(cid, name) => {
                 self.rename_channel = None;
@@ -3906,6 +3952,48 @@ impl App {
                             }
                         });
                         ui.add_space(6.0);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Свой фон — картинка или GIF").color(pal.muted));
+                        ui.horizontal(|ui| {
+                            if ui.button("🖼  Выбрать файл…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Картинка или GIF для фона")
+                                    .add_filter("Изображения", &["png", "jpg", "jpeg", "gif", "webp"])
+                                    .pick_file()
+                                {
+                                    self.settings.bg_image = Some(path.display().to_string());
+                                }
+                            }
+                            if self.settings.bg_image.is_some() && ui.button("Убрать фон").clicked() {
+                                self.settings.bg_image = None;
+                            }
+                            if self.background.loading() {
+                                ui.spinner();
+                            }
+                        });
+                        if let Some(path) = &self.settings.bg_image {
+                            let name = std::path::Path::new(path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            ui.label(RichText::new(name).small().color(pal.faint));
+                            if let Some(e) = self.background.error() {
+                                ui.label(RichText::new(format!("Не удалось загрузить: {e}")).small().color(pal.danger));
+                            }
+                            ui.add(
+                                egui::Slider::new(&mut self.settings.bg_dim, 0.0..=0.9)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .text("затемнение фона"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.settings.panel_opacity, 0.3..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .text("непрозрачность панелей"),
+                            );
+                            ui.checkbox(&mut self.settings.bg_blur, "Размыть фон (мягкий «стеклянный» вид)");
+                            ui.checkbox(&mut self.settings.animate_background, "Анимировать GIF");
+                        }
+                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Шрифт:").color(pal.muted));
                             if toggle_chip(ui, &pal, "Inter", self.settings.font_inter).clicked() {
@@ -4092,7 +4180,7 @@ impl App {
                         });
                         ui.checkbox(
                             &mut self.settings.echo_cancel,
-                            "Эхоподавление (WebRTC AEC3) — если вы без наушников",
+                            "Эхоподавление WebRTC AEC3 (экспериментально: может приглушать ваш голос, пока говорят другие)",
                         );
                         ui.checkbox(
                             &mut self.settings.agc,
@@ -4284,7 +4372,19 @@ impl eframe::App for App {
                 voice::PTT_DOWN.store(down, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        self.background.sync(
+            ctx,
+            self.settings.bg_image.as_deref(),
+            self.settings.bg_blur,
+        );
+        let base = theme::palette_for(self.settings.theme, self.pal.accent).rail;
         match theme::backdrop(self.settings.theme) {
+            _ if self.settings.bg_image.is_some() => self.background.paint(
+                ctx,
+                self.settings.bg_dim,
+                self.settings.animate_background,
+                base,
+            ),
             Some(bd) => paint_backdrop(ctx, &bd, self.settings.animate_background),
             None => {
                 // спокойный фон с лёгким акцентным свечением в углу
@@ -4514,7 +4614,8 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                                 .font(FontId::new(15.0, egui::FontFamily::Name("bold".into())))
                                 .color(name_color(m.author_id)),
                         )
-                        .sense(Sense::click()),
+                        .sense(Sense::click())
+                        .selectable(false),
                     );
                     if nr.secondary_clicked() {
                         if let Some(p) = nr.interact_pointer_pos() {
@@ -4692,6 +4793,42 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
     if hovered && cx.toolbar_allowed && !m.system {
         message_toolbar(ui, cx, m, rect);
     }
+}
+
+/// Заголовок категории каналов: стрелка плавно поворачивается, курсор — «рука».
+fn category_header(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    id: u64,
+    name: &str,
+    collapsed: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+    let open = ui
+        .ctx()
+        .animate_bool_with_time(egui::Id::new(("cat_open", id)), !collapsed, 0.15);
+    let color = mix(pal.faint, pal.text, h);
+    // стрелка: ▸ (свёрнуто) → ▾ (развёрнуто)
+    let c = pos2(rect.left() + 8.0, rect.center().y);
+    let a = open * std::f32::consts::FRAC_PI_2;
+    let rot = |x: f32, y: f32| c + vec2(x * a.cos() - y * a.sin(), x * a.sin() + y * a.cos());
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![rot(-2.5, -4.0), rot(3.5, 0.0), rot(-2.5, 4.0)],
+        color,
+        Stroke::NONE,
+    ));
+    let clip = Rect::from_min_max(pos2(rect.left() + 18.0, rect.top()), rect.max);
+    ui.painter_at(clip).text(
+        pos2(rect.left() + 18.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name.to_uppercase(),
+        FontId::new(11.5, egui::FontFamily::Name("bold".into())),
+        color,
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// Ответ на сообщение: «изгиб» от аватарки, мини-аватар, имя и начало текста — как в Discord.
@@ -5660,27 +5797,16 @@ fn accent_button(
                 offset: vec2(0.0, 3.0 + 3.0 * t),
                 blur: 8.0 + 10.0 * t,
                 spread: 0.0,
-                color: pal.accent.gamma_multiply(0.25 + 0.25 * t),
+                color: pal.accent.gamma_multiply(0.12 + 0.22 * t),
             }
             .as_shape(r, 10.0),
         );
         p.rect_filled(r, 10.0, mix(pal.accent, Color32::WHITE, 0.10 * t));
-        // светлый блик сверху — кнопка выглядит объёмной
-        p.rect_filled(
-            Rect::from_min_size(r.min, vec2(r.width(), r.height() / 2.0)),
-            Rounding {
-                nw: 10.0,
-                ne: 10.0,
-                sw: 0.0,
-                se: 0.0,
-            },
-            Color32::from_white_alpha(14),
-        );
         p.text(
             r.center(),
             Align2::CENTER_CENTER,
             text,
-            FontId::proportional(15.5),
+            FontId::new(15.0, egui::FontFamily::Name("bold".into())),
             Color32::WHITE,
         );
     }
@@ -6430,6 +6556,16 @@ fn draw_stage(
             ui.painter()
                 .rect_stroke(tile, r, Stroke::new(3.0, pal.ok.gamma_multiply(g)));
         }
+        // правый клик по плитке — меню пользователя (громкость, профиль и т.д.)
+        let tile_resp = ui.interact(tile, ui.id().with(("watch_tile", t.id)), Sense::click());
+        if tile_resp.secondary_clicked() && t.id != st.me {
+            if let Some(p) = tile_resp.interact_pointer_pos() {
+                actions.push(Action::UserMenu(t.id, p));
+            }
+        }
+        if !t.streaming && tile_resp.clicked() {
+            actions.push(Action::OpenProfile(t.id));
+        }
         if t.streaming {
             live_badge(
                 ui,
@@ -6440,15 +6576,18 @@ fn draw_stage(
                     "В ЭФИРЕ"
                 },
             );
-            if t.id != st.me {
+            {
                 let watching_this = st.watch.map_or(false, |(o, _)| o == t.id);
-                let resp = ui
-                    .interact(tile, ui.id().with(("watch_tile", t.id)), Sense::click())
+                let resp = tile_resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text(if watching_this {
                         "Вы уже смотрите"
                     } else {
-                        "Смотреть трансляцию"
+                        if t.id == st.me {
+                            "Показать превью своей трансляции"
+                        } else {
+                            "Смотреть трансляцию"
+                        }
                     });
                 if resp.hovered() && !watching_this {
                     ui.painter()

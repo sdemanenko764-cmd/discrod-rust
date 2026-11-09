@@ -33,6 +33,14 @@ pub enum Theme {
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
+    /// Свой фон: путь к картинке или GIF (пусто — фон темы).
+    pub bg_image: Option<String>,
+    /// Затемнение своего фона (0..0.9).
+    pub bg_dim: f32,
+    /// Размыть свой фон.
+    pub bg_blur: bool,
+    /// Непрозрачность панелей поверх своего фона (0.3..1).
+    pub panel_opacity: f32,
     /// Шрифт интерфейса: встроенный Inter (иначе системный Segoe UI).
     pub font_inter: bool,
     pub accent: usize,
@@ -66,6 +74,10 @@ pub struct Settings {
     pub output_volume: f32,
     /// Громкость отдельных собеседников: id → 0..2 (0 — заглушён).
     pub user_volumes: HashMap<u64, f32>,
+    /// Версия настроек звука (для безопасной миграции значений по умолчанию).
+    /// В старом файле поля нет — тогда 0, и миграция срабатывает.
+    #[serde(default)]
+    pub audio_rev: u32,
     /// Заглушённые серверы и каналы: без уведомлений и меток непрочитанного.
     pub muted: HashSet<u64>,
     pub stream_monitor: usize,
@@ -83,6 +95,10 @@ impl Default for Settings {
         Self {
             theme: Theme::AdwaitaDark,
             font_inter: true,
+            bg_image: None,
+            bg_dim: 0.35,
+            bg_blur: false,
+            panel_opacity: 0.72,
             accent: 1,
             zoom: 1.0,
             compact: false,
@@ -98,7 +114,7 @@ impl Default for Settings {
             mic_threshold: 0.006,
             always_transmit: false,
             echo_guard: true,
-            echo_cancel: true,
+            echo_cancel: false,
             noise: 2,
             agc: true,
             input_gain: 1.0,
@@ -107,6 +123,7 @@ impl Default for Settings {
             output_volume: 1.0,
             user_volumes: HashMap::new(),
             muted: HashSet::new(),
+            audio_rev: 2,
             stream_monitor: 0,
             stream_height: 720,
             stream_fps: 30,
@@ -124,6 +141,8 @@ pub fn load() -> Settings {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     s.zoom = s.zoom.clamp(0.75, 1.6);
+    s.bg_dim = s.bg_dim.clamp(0.0, 0.9);
+    s.panel_opacity = s.panel_opacity.clamp(0.3, 1.0);
     s.cached_channels = s.cached_channels.clamp(2, 20);
     s.messages_per_channel = s.messages_per_channel.clamp(50, 500);
     s.mic_threshold = s.mic_threshold.clamp(0.001, 0.08);
@@ -131,6 +150,11 @@ pub fn load() -> Settings {
     s.stream_fps = s.stream_fps.clamp(5, 60);
     s.stream_quality = s.stream_quality.min(2);
     s.noise = s.noise.min(2);
+    // Версия 1 включала экспериментальное эхоподавление по умолчанию — оно глушило голос.
+    if s.audio_rev < 2 {
+        s.echo_cancel = false;
+        s.audio_rev = 2;
+    }
     s.input_gain = s.input_gain.clamp(0.0, 3.0);
     s.output_volume = s.output_volume.clamp(0.0, 2.0);
     for v in s.user_volumes.values_mut() {

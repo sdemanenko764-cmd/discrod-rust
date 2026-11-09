@@ -738,6 +738,9 @@ async fn session(
     let mut last_rr = Instant::now();
     let mut stats = (0u64, 0u64, 0u64, 0u64); // пакеты, кадры, ошибки DAVE, показано
     let mut stats_logged = Instant::now();
+    let mut unknown_logged = 0u32;
+    let mut pli_received = 0u64;
+    let mut dave_dropped = 0u64;
 
     loop {
         let mut out: Vec<Out> = Vec::new();
@@ -824,7 +827,7 @@ async fn session(
                                             "video_ssrc": video_ssrc,
                                             "rtx_ssrc": rtx_ssrc,
                                             "streams": [{
-                                                "type": "video", "rid": "100", "ssrc": video_ssrc, "rtx_ssrc": rtx_ssrc,
+                                                "type": "screen", "rid": "100", "ssrc": video_ssrc, "rtx_ssrc": rtx_ssrc,
                                                 "active": true, "quality": 100, "max_bitrate": bitrate, "max_framerate": fps,
                                                 "max_resolution": { "type": "fixed", "width": w, "height": h }
                                             }]
@@ -879,7 +882,16 @@ async fn session(
                                 }
                             }
                             21 | 22 | 24 => dave.on_json(op, d, &mut out),
-                            _ => {}
+                            _ => {
+                                if unknown_logged < 30 {
+                                    unknown_logged += 1;
+                                    crate::store::log(&format!(
+                                        "трансляция {}: сервер прислал op {op}: {}",
+                                        if sending { "(отправка)" } else { "(просмотр)" },
+                                        d.to_string().chars().take(300).collect::<String>()
+                                    ));
+                                }
+                            }
                         }
                     }
                     WsMsg::Binary(data) => {
@@ -926,6 +938,12 @@ async fn session(
                             _ => ok = false,
                         }
                     }
+                    if !ok {
+                        dave_dropped += 1;
+                        if dave_dropped == 1 || dave_dropped % 100 == 0 {
+                            crate::store::log(&format!("трансляция: кадр не отправлен — DAVE не готово шифровать (всего {dave_dropped})"));
+                        }
+                    }
                     if ok {
                         let payloads = packetize(&data);
                         let last = payloads.len().saturating_sub(1);
@@ -940,7 +958,11 @@ async fn session(
                             sink.send(Event::StreamLive { key: p.key.clone() });
                         }
                         if sent_frames % 300 == 0 {
-                            crate::store::log(&format!("трансляция: отправлено кадров {sent_frames}, DAVE активно={}", dave.active()));
+                            crate::store::log(&format!(
+                                "трансляция: отправлено кадров {sent_frames}, запросов ключевого кадра {pli_received}, отброшено DAVE {dave_dropped}, DAVE v{} активно={}, ssrc видео {video_ssrc}",
+                                dave.version,
+                                dave.active()
+                            ));
                         }
                     }
                     r.timestamp = r.timestamp.wrapping_add(90_000 / fps);
@@ -986,6 +1008,7 @@ async fn session(
                         let fmt = rbuf[0] & 0x1F;
                         if fmt == 1 || fmt == 4 {
                             FORCE_KEY.store(true, Ordering::Relaxed);
+                            pli_received += 1;
                         }
                     }
                     continue;

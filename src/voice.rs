@@ -566,6 +566,7 @@ async fn session(
     let mut last_remote = Instant::now() - Duration::from_secs(10);
     let mut ticks: u64 = 0;
     let (mut sent, mut received, mut dropped) = (0u64, 0u64, 0u64);
+    let (mut decrypt_fail, mut unknown_ssrc, mut played) = (0u64, 0u64, 0u64);
     let mut frame = [0f32; 960];
     let mut stereo = vec![0f32; 1920];
     let mut opus_out = vec![0u8; 4000];
@@ -744,30 +745,34 @@ async fn session(
                 }
                 if ticks % 500 == 0 {
                     crate::store::log(&format!(
-                        "голос: отправлено {sent}, получено {received}, отброшено {dropped}; DAVE v{} активно={} шифрование={}; микрофон={}",
+                        "голос: отправлено {sent}, получено {received}, воспроизведено {played}, ошибок расшифровки {decrypt_fail}, чужих ssrc {unknown_ssrc}, отброшено {dropped}; DAVE v{} активно={} шифрование={}; микрофон={}; рация={} эхо={} шум={}",
                         dave.version,
                         dave.active(),
                         dave.session.as_ref().map_or(false, |s| s.can_encrypt()),
-                        a.has_mic
+                        a.has_mic,
+                        opts.ptt,
+                        opts.echo_cancel,
+                        opts.noise
                     ));
                 }
                 if mute || deaf || !a.has_mic {
                     a.clear_capture();
                 } else {
                     while a.take_frame(&mut frame) {
+                        // Решение «говорит / молчит» — по исходному звуку микрофона (с учётом
+                        // ручного усиления): шумо- и эхоподавление не должны глушить передачу.
+                        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / 960.0).sqrt()
+                            * opts.input_gain.max(0.01);
                         processor.process(&mut frame, a, opts.echo_cancel);
-                        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / 960.0).sqrt();
                         let echo = opts.echo_guard
                             && !opts.echo_cancel
                             && last_remote.elapsed() < Duration::from_millis(250)
                             && rms < opts.threshold * 3.0;
-                        // RNNoise сам оценивает, есть ли речь: шум клавиатуры и вентилятора не включит передачу
-                        let voice_like = processor.voice_prob > 0.35 || processor.rnnoise.is_none();
                         let ptt_down = PTT_DOWN.load(std::sync::atomic::Ordering::Relaxed);
                         let transmit = if opts.ptt {
                             ptt_down
                         } else {
-                            opts.always || (rms > opts.threshold && !echo && voice_like)
+                            opts.always || (rms > opts.threshold && !echo)
                         };
                         if transmit {
                             hangover = if opts.ptt { 3 } else { VAD_HANGOVER };
@@ -820,10 +825,14 @@ async fn session(
                                 if can {
                                     match s.decrypt(uid, davey::MediaType::AUDIO, &data) {
                                         Ok(plain) => data = plain,
-                                        Err(_) => continue,
+                                        Err(_) => {
+                                            decrypt_fail += 1;
+                                            continue;
+                                        }
                                     }
                                 }
                             } else if dave.active() && user.is_none() {
+                                unknown_ssrc += 1;
                                 continue; // не знаем, чей это звук — расшифровать нельзя
                             }
                         }
@@ -851,6 +860,7 @@ async fn session(
                                 if vol <= 0.001 {
                                     continue; // собеседник заглушён у нас
                                 }
+                                played += 1;
                                 if (vol - 1.0).abs() > 0.01 {
                                     let scaled: Vec<f32> = chunk.iter().map(|s| s * vol).collect();
                                     audio::push_playback(&a.playback, from, &scaled);

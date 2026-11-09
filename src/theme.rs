@@ -93,7 +93,36 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 }
 
 pub fn palette(s: &Settings) -> Palette {
-    palette_for(s.theme, ACCENTS[s.accent.min(ACCENTS.len() - 1)].1)
+    let pal = palette_for(s.theme, ACCENTS[s.accent.min(ACCENTS.len() - 1)].1);
+    if s.bg_image
+        .as_deref()
+        .map_or(false, |p| !p.trim().is_empty())
+    {
+        glassify(pal, s.panel_opacity)
+    } else {
+        pal
+    }
+}
+
+/// Панели становятся полупрозрачными, чтобы под ними был виден свой фон.
+fn glassify(p: Palette, opacity: f32) -> Palette {
+    let a = |c: Color32, k: f32| {
+        let [r, g, b, _] = c.to_srgba_unmultiplied();
+        Color32::from_rgba_unmultiplied(r, g, b, (255.0 * (opacity * k).clamp(0.0, 1.0)) as u8)
+    };
+    let veil = if p.light { 0 } else { 255 };
+    Palette {
+        rail: a(p.rail, 1.15),
+        side: a(p.side, 1.0),
+        main: a(p.main, 0.75),
+        header: a(p.header, 0.9),
+        hover: Color32::from_rgba_unmultiplied(veil, veil, veil, 22),
+        selected: Color32::from_rgba_unmultiplied(veil, veil, veil, 36),
+        msg_hover: Color32::from_rgba_unmultiplied(veil, veil, veil, 10),
+        elevated: a(p.elevated, 1.1),
+        border: Color32::from_rgba_unmultiplied(veil, veil, veil, 22),
+        ..p
+    }
 }
 
 /// Живой фон анимированных тем: базовый цвет и три светящихся пятна.
