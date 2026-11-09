@@ -168,6 +168,7 @@ enum Action {
     Logout,
     // --- профили, статусы, друзья, серверы ---
     OpenProfile(u64),
+    CloseProfile,
     MessageUser(u64),
     OpenStatusMenu,
     SetStatus(String),
@@ -2715,6 +2716,7 @@ impl App {
             Action::OpenSettings => self.settings_open = true,
             Action::Logout => self.logout(None, true),
             a @ (Action::OpenProfile(_)
+            | Action::CloseProfile
             | Action::MessageUser(_)
             | Action::OpenStatusMenu
             | Action::SetStatus(_)

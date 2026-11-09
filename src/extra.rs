@@ -23,6 +23,13 @@ pub struct ProfileView {
     pub roles: Vec<String>,
     pub mutual: usize,
     pub bot: bool,
+    /// Общие серверы: (id, ник на сервере).
+    pub mutual_guilds: Vec<(u64, Option<String>)>,
+    /// Общие друзья: (id, имя, аватар). None — ещё загружаются / недоступны.
+    pub mutual_friends: Option<Vec<(u64, String, Option<String>)>>,
+    pub mutual_friends_error: Option<String>,
+    /// Вкладка: 0 — профиль, 1 — общие серверы, 2 — общие друзья.
+    pub tab: u8,
 }
 
 pub struct SearchView {
@@ -30,6 +37,28 @@ pub struct SearchView {
     pub loading: bool,
     pub total: u64,
     pub results: Option<Result<Vec<Msg>, String>>,
+}
+
+/// Пользователи из массива JSON: (id, отображаемое имя, аватар).
+fn parse_users(list: &[Value]) -> Vec<(u64, String, Option<String>)> {
+    list.iter()
+        .filter_map(|u| {
+            let u = if u.get("user").is_some() {
+                &u["user"]
+            } else {
+                u
+            };
+            let id = u["id"].as_str()?.parse().ok()?;
+            let name = u["global_name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| u["username"].as_str())
+                .unwrap_or("?")
+                .to_string();
+            let avatar = u["avatar"].as_str().map(str::to_string);
+            Some((id, name, avatar))
+        })
+        .collect()
 }
 
 pub fn presence_color(pal: &Palette, status: &str) -> Option<Color32> {
@@ -600,8 +629,44 @@ impl App {
                             })
                             .unwrap_or_default();
                         p.mutual = v["mutual_guilds"].as_array().map_or(0, |a| a.len());
+                        p.mutual_guilds = v["mutual_guilds"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|g| {
+                                        let id = g["id"].as_str()?.parse().ok()?;
+                                        Some((id, s(&g["nick"])))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if p.mutual_friends.is_none() {
+                            if let Some(list) = v["mutual_friends"].as_array() {
+                                p.mutual_friends = Some(parse_users(list));
+                            }
+                        }
                         p.bot = u["bot"].as_bool().unwrap_or(false);
                         self.users.insert(uid, p.name.clone());
+                    }
+                }
+            }
+            ApiTag::MutualFriends(uid) => {
+                let Some(p) = self.profile.as_mut().filter(|p| p.user_id == uid) else {
+                    return;
+                };
+                match result {
+                    Ok(body) => {
+                        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+                        let list = parse_users(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]));
+                        for (id, name, _) in &list {
+                            self.users.insert(*id, name.clone());
+                        }
+                        p.mutual_friends = Some(list);
+                    }
+                    Err(e) => {
+                        if p.mutual_friends.is_none() {
+                            p.mutual_friends_error = Some(e);
+                        }
                     }
                 }
             }
@@ -740,19 +805,35 @@ impl App {
                     roles: Vec::new(),
                     mutual: 0,
                     bot: false,
+                    mutual_guilds: Vec::new(),
+                    mutual_friends: None,
+                    mutual_friends_error: None,
+                    tab: 0,
                 });
                 let path = if self.is_bot() {
                     format!("/users/{uid}")
                 } else {
                     match self.sel_guild {
-                        Some(g) => {
-                            format!("/users/{uid}/profile?with_mutual_guilds=true&guild_id={g}")
-                        }
-                        None => format!("/users/{uid}/profile?with_mutual_guilds=true"),
+                        Some(g) => format!(
+                            "/users/{uid}/profile?with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true&guild_id={g}"
+                        ),
+                        None => format!(
+                            "/users/{uid}/profile?with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true"
+                        ),
                     }
                 };
                 self.api("GET", path, None, ApiTag::Profile(uid));
+                if !self.is_bot() && uid != self.me_id {
+                    // Список общих друзей отдельным запросом — так он приходит всегда.
+                    self.api(
+                        "GET",
+                        format!("/users/{uid}/relationships"),
+                        None,
+                        ApiTag::MutualFriends(uid),
+                    );
+                }
             }
+            Action::CloseProfile => self.profile = None,
             Action::MessageUser(uid) => {
                 let existing = self
                     .dms
@@ -1554,6 +1635,41 @@ impl App {
         let error = p.error.clone();
         let accent = p.accent;
         let bot = p.bot;
+        let tab = p.tab;
+        let mutual_guilds: Vec<(u64, Option<String>)> = p.mutual_guilds.clone();
+        let mutual_friends = p.mutual_friends.clone();
+        let mutual_friends_error = p.mutual_friends_error.clone();
+        let mut new_tab = tab;
+        // иконки общих серверов и аватарки общих друзей
+        let guild_rows: Vec<(u64, String, Option<String>, Option<(TextureId, Vec2)>)> =
+            mutual_guilds
+                .iter()
+                .map(|(gid, nick)| {
+                    let g = self.guilds.iter().find(|g| g.id == *gid);
+                    let name = g
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| format!("Сервер {gid}"));
+                    let icon = g.and_then(|g| g.icon.clone());
+                    let tex = match (icon, self.settings.load_avatars) {
+                        (Some(h), true) => {
+                            let url = discord::guild_icon_url(*gid, &h);
+                            self.media.get(ctx, &self.cmd, &url, &url, 64, false)
+                        }
+                        _ => None,
+                    };
+                    (*gid, name, nick.clone(), tex)
+                })
+                .collect();
+        let friend_rows: Vec<(u64, String, String, Option<(TextureId, Vec2)>)> = mutual_friends
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(fid, name, av)| {
+                let tex = self.avatar_tex(ctx, *fid, av, 64);
+                let st = self.presence.get(fid).cloned().unwrap_or_default();
+                (*fid, name.clone(), st, tex)
+            })
+            .collect();
 
         egui::Window::new("profile")
             .id(egui::Id::new("profile_win"))
@@ -1670,84 +1786,185 @@ impl App {
                                     .color(pal.faint),
                             );
                         }
-                        egui::Frame::none()
-                            .fill(pal.elevated)
-                            .rounding(pal.radius)
-                            .inner_margin(Margin::same(12.0))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                if loading {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label(
-                                            RichText::new("Загрузка профиля…").color(pal.muted),
-                                        );
-                                    });
-                                }
-                                if let Some(e) = &error {
-                                    ui.label(RichText::new(e).small().color(pal.danger));
-                                }
-                                if !bio.is_empty() {
-                                    section_title(ui, &pal, "О СЕБЕ");
-                                    let mut mcx = MsgCtx {
-                                        pal,
-                                        settings: &self.settings,
-                                        media: &mut self.media,
-                                        cmd: &self.cmd,
-                                        actions: &mut inner_actions,
-                                        me_id: self.me_id,
-                                        guild_id: self.sel_guild,
-                                        channel_id: 0,
-                                        toolbar_allowed: false,
-                                        guilds: &self.guilds,
-                                        users: &self.users,
-                                    };
-                                    rich_text(ui, &mut mcx, &bio, &[]);
-                                }
-                                section_title(ui, &pal, "В DISCORD С");
-                                ui.label(RichText::new(&since).color(pal.text));
-                                if let Some(g) = &guild {
-                                    let named: Vec<(String, u32)> = roles
-                                        .iter()
-                                        .filter_map(|r| g.roles.get(r).cloned())
-                                        .collect();
-                                    if !named.is_empty() {
-                                        section_title(ui, &pal, "РОЛИ");
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                                            for (n, c) in named {
-                                                let col = role_color(c, pal.muted);
-                                                egui::Frame::none()
-                                                    .fill(pal.side)
-                                                    .rounding(6.0)
-                                                    .inner_margin(Margin::symmetric(7.0, 3.0))
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            let (d, _) = ui.allocate_exact_size(
-                                                                vec2(10.0, 10.0),
-                                                                Sense::hover(),
-                                                            );
-                                                            ui.painter().circle_filled(
-                                                                d.center(),
-                                                                5.0,
-                                                                col,
-                                                            );
-                                                            ui.label(
-                                                                RichText::new(n)
-                                                                    .small()
-                                                                    .color(pal.text),
-                                                            );
-                                                        });
-                                                    });
-                                            }
-                                        });
+                        if !me && !bot && !self.is_bot() {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let friends_n = mutual_friends
+                                    .as_ref()
+                                    .map(|f| f.len().to_string())
+                                    .unwrap_or_else(|| "…".into());
+                                for (k, label) in [
+                                    (0u8, "Профиль".to_string()),
+                                    (1, format!("Общие серверы · {}", mutual_guilds.len())),
+                                    (2, format!("Общие друзья · {friends_n}")),
+                                ] {
+                                    if profile_tab(ui, &pal, &label, tab == k).clicked() {
+                                        new_tab = k;
                                     }
                                 }
-                                if mutual > 0 && !me {
-                                    section_title(ui, &pal, "ОБЩИЕ СЕРВЕРЫ");
-                                    ui.label(RichText::new(mutual.to_string()).color(pal.text));
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if tab == 1 && !me {
+                            mutual_list_frame(ui, &pal, |ui| {
+                                if loading {
+                                    ui.spinner();
+                                } else if guild_rows.is_empty() {
+                                    ui.label(RichText::new("Нет общих серверов").color(pal.muted));
+                                }
+                                for (gid, gname, nick, tex) in &guild_rows {
+                                    let sub = nick.as_ref().map(|n| format!("ник: {n}"));
+                                    if mutual_row(
+                                        ui,
+                                        &pal,
+                                        *gid,
+                                        gname,
+                                        sub.as_deref(),
+                                        *tex,
+                                        None,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(Action::SelectGuild(Some(*gid)));
+                                        actions.push(Action::CloseProfile);
+                                    }
                                 }
                             });
+                        } else if tab == 2 && !me {
+                            mutual_list_frame(ui, &pal, |ui| {
+                                match (&mutual_friends, &mutual_friends_error) {
+                                    (None, Some(e)) => {
+                                        ui.label(
+                                            RichText::new(format!("Не удалось загрузить: {e}"))
+                                                .color(pal.danger),
+                                        );
+                                    }
+                                    (None, None) => {
+                                        ui.spinner();
+                                    }
+                                    (Some(_), _) if friend_rows.is_empty() => {
+                                        ui.label(
+                                            RichText::new("Нет общих друзей").color(pal.muted),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                for (fid, fname, st, tex) in &friend_rows {
+                                    let sub = if st.is_empty() {
+                                        None
+                                    } else {
+                                        Some(presence_text(st))
+                                    };
+                                    if mutual_row(
+                                        ui,
+                                        &pal,
+                                        *fid,
+                                        fname,
+                                        sub,
+                                        *tex,
+                                        Some(st.as_str()),
+                                        false,
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(Action::OpenProfile(*fid));
+                                    }
+                                }
+                            });
+                        } else {
+                            egui::Frame::none()
+                                .fill(pal.elevated)
+                                .rounding(pal.radius)
+                                .inner_margin(Margin::same(12.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if loading {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(
+                                                RichText::new("Загрузка профиля…").color(pal.muted),
+                                            );
+                                        });
+                                    }
+                                    if let Some(e) = &error {
+                                        ui.label(RichText::new(e).small().color(pal.danger));
+                                    }
+                                    if !bio.is_empty() {
+                                        section_title(ui, &pal, "О СЕБЕ");
+                                        let mut mcx = MsgCtx {
+                                            pal,
+                                            settings: &self.settings,
+                                            media: &mut self.media,
+                                            cmd: &self.cmd,
+                                            actions: &mut inner_actions,
+                                            me_id: self.me_id,
+                                            guild_id: self.sel_guild,
+                                            channel_id: 0,
+                                            toolbar_allowed: false,
+                                            guilds: &self.guilds,
+                                            users: &self.users,
+                                        };
+                                        rich_text(ui, &mut mcx, &bio, &[]);
+                                    }
+                                    section_title(ui, &pal, "В DISCORD С");
+                                    ui.label(RichText::new(&since).color(pal.text));
+                                    if let Some(g) = &guild {
+                                        let named: Vec<(String, u32)> = roles
+                                            .iter()
+                                            .filter_map(|r| g.roles.get(r).cloned())
+                                            .collect();
+                                        if !named.is_empty() {
+                                            section_title(ui, &pal, "РОЛИ");
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                                for (n, c) in named {
+                                                    let col = role_color(c, pal.muted);
+                                                    egui::Frame::none()
+                                                        .fill(pal.side)
+                                                        .rounding(6.0)
+                                                        .inner_margin(Margin::symmetric(7.0, 3.0))
+                                                        .show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let (d, _) = ui
+                                                                    .allocate_exact_size(
+                                                                        vec2(10.0, 10.0),
+                                                                        Sense::hover(),
+                                                                    );
+                                                                ui.painter().circle_filled(
+                                                                    d.center(),
+                                                                    5.0,
+                                                                    col,
+                                                                );
+                                                                ui.label(
+                                                                    RichText::new(n)
+                                                                        .small()
+                                                                        .color(pal.text),
+                                                                );
+                                                            });
+                                                        });
+                                                }
+                                            });
+                                        }
+                                    }
+                                    if mutual > 0 && !me {
+                                        section_title(ui, &pal, "ОБЩИЕ СЕРВЕРЫ");
+                                        let r = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{mutual} — показать список →"
+                                                ))
+                                                .color(pal.link),
+                                            )
+                                            .sense(Sense::click()),
+                                        );
+                                        if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                            new_tab = 1;
+                                        }
+                                    }
+                                });
+                        }
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             if !me {
@@ -1800,6 +2017,9 @@ impl App {
                     });
             });
         actions.extend(inner_actions);
+        if let Some(p) = self.profile.as_mut() {
+            p.tab = new_tab;
+        }
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.profile = None;
         }
@@ -2337,6 +2557,138 @@ impl App {
             self.server_dialog = Some((tab, input));
         }
     }
+}
+
+/// Вкладка в профиле: подчёркивание акцентом у выбранной.
+fn profile_tab(ui: &mut egui::Ui, pal: &Palette, text: &str, on: bool) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(13.0),
+        if on { pal.text } else { pal.muted },
+    );
+    let size = galley.size() + vec2(14.0, 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered() || on, 0.12);
+    if h > 0.01 && !on {
+        ui.painter()
+            .rect_filled(rect, 6.0, pal.hover.gamma_multiply(h));
+    }
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0 - vec2(0.0, 1.0),
+        galley,
+        pal.text,
+    );
+    if on {
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                pos2(rect.left() + 6.0, rect.bottom() - 2.5),
+                vec2(rect.width() - 12.0, 2.5),
+            ),
+            1.5,
+            pal.accent,
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn mutual_list_frame(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(pal.elevated)
+        .rounding(pal.radius)
+        .inner_margin(Margin::same(6.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .auto_shrink([false, true])
+                .show(ui, add);
+        });
+}
+
+/// Строка списка общих серверов/друзей: иконка, имя, подпись.
+#[allow(clippy::too_many_arguments)]
+fn mutual_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    id: u64,
+    name: &str,
+    sub: Option<&str>,
+    tex: Option<(TextureId, Vec2)>,
+    status: Option<&str>,
+    square: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+    if h > 0.01 {
+        ui.painter()
+            .rect_filled(rect, 8.0, pal.hover.gamma_multiply(h));
+    }
+    let ar = Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), vec2(32.0, 32.0));
+    if square {
+        match tex {
+            Some((t, _)) => {
+                egui::Image::from_texture(SizedTexture::new(t, ar.size()))
+                    .rounding(10.0)
+                    .paint_at(ui, ar);
+            }
+            None => {
+                ui.painter().rect_filled(ar, 10.0, name_color(id));
+                ui.painter().text(
+                    ar.center(),
+                    Align2::CENTER_CENTER,
+                    initials(name),
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+    } else {
+        paint_avatar(ui, ar, tex, id, name);
+        if let Some(st) = status.filter(|s| !s.is_empty()) {
+            presence_dot(
+                ui,
+                pal,
+                ar.center() + vec2(11.0, 11.0),
+                5.0,
+                st,
+                pal.elevated,
+            );
+        }
+    }
+    let x = ar.right() + 12.0;
+    let clip = Rect::from_min_max(
+        pos2(x, rect.top()),
+        pos2(rect.right() - 24.0, rect.bottom()),
+    );
+    let dy = if sub.is_some() { -8.0 } else { 0.0 };
+    ui.painter_at(clip).text(
+        pos2(x, rect.center().y + dy),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(14.5),
+        pal.text,
+    );
+    if let Some(sub) = sub {
+        ui.painter_at(clip).text(
+            pos2(x, rect.center().y + 9.0),
+            Align2::LEFT_CENTER,
+            sub,
+            FontId::proportional(12.0),
+            pal.muted,
+        );
+    }
+    ui.painter().text(
+        rect.right_center() - vec2(12.0, 0.0),
+        Align2::RIGHT_CENTER,
+        "›",
+        FontId::proportional(18.0),
+        mix(pal.faint, pal.text, h),
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn menu_frame(pal: &Palette, solid: Color32) -> egui::Frame {

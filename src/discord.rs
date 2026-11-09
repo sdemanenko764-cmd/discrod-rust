@@ -146,6 +146,8 @@ pub struct Friend {
 #[derive(Clone, Debug)]
 pub enum ApiTag {
     Profile(u64),
+    /// Общие друзья с пользователем.
+    MutualFriends(u64),
     Pins(u64),
     Search,
     Threads(u64),
