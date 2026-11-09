@@ -174,6 +174,8 @@ pub struct Dm {
     pub group: bool,
     /// Собеседники: (id, имя, хэш аватарки).
     pub recipients: Vec<(u64, String, Option<String>)>,
+    /// Запрос на переписку (ещё не принят).
+    pub request: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +335,8 @@ pub struct Msg {
     pub sending: bool,
     /// Своё сообщение не отправилось: причина.
     pub failed: Option<String>,
+    /// Сообщение о звонке: Some(пропущен ли звонок нами).
+    pub call: Option<bool>,
 }
 
 /// Один кадр картинки (у статичной — один, у GIF — много).
@@ -424,6 +428,12 @@ pub enum Cmd {
         url: String,
         filename: String,
     },
+    /// Проверить обновление (manual — пользователь нажал кнопку сам).
+    CheckUpdate {
+        manual: bool,
+    },
+    /// Скачать и установить обновление по ссылке.
+    InstallUpdate(String),
 }
 
 pub enum Event {
@@ -464,6 +474,13 @@ pub enum Event {
         id: u64,
     },
     MessageCreate(Msg),
+    /// Вышла новая версия Rustcord.
+    UpdateAvailable(crate::update::Release),
+    /// Новая версия скачана и поставлена на место — можно перезапускать.
+    UpdateReady(std::path::PathBuf),
+    UpdateFailed(String),
+    /// Сообщение пришло заново целиком (например, звонок закончился).
+    MessageReplace(Msg),
     /// Своё сообщение не отправилось (по метке nonce).
     SendFailed {
         channel_id: u64,
@@ -610,6 +627,11 @@ struct RawChannel {
     last_message_id: Option<String>,
     #[serde(default)]
     message_count: Option<u32>,
+    /// Личка от незнакомца, ещё не принятая («запрос на переписку»).
+    #[serde(default)]
+    is_message_request: Option<bool>,
+    #[serde(default)]
+    is_spam: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1104,6 +1126,41 @@ struct RawMessage {
     /// Discord присылает nonce строкой или числом.
     #[serde(default)]
     nonce: Option<serde_json::Value>,
+    /// Сведения о звонке (у сообщений типа 3).
+    #[serde(default)]
+    call: Option<RawMsgCall>,
+}
+
+#[derive(Deserialize)]
+struct RawMsgCall {
+    #[serde(default)]
+    participants: Vec<String>,
+    #[serde(default)]
+    ended_timestamp: Option<String>,
+}
+
+/// «несколько секунд», «минута», «4 минуты», «2 часа».
+fn human_duration(secs: i64) -> String {
+    let plural = |n: i64, one: &str, few: &str, many: &str| {
+        let (m10, m100) = (n % 10, n % 100);
+        let w = if m10 == 1 && m100 != 11 {
+            one
+        } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+            few
+        } else {
+            many
+        };
+        format!("{n} {w}")
+    };
+    if secs < 60 {
+        "несколько секунд".into()
+    } else if secs < 120 {
+        "минута".into()
+    } else if secs < 3600 {
+        plural(secs / 60, "минута", "минуты", "минут")
+    } else {
+        plural(secs / 3600, "час", "часа", "часов")
+    }
 }
 
 #[derive(Deserialize)]
@@ -1328,13 +1385,20 @@ fn convert_msg(m: RawMessage) -> Msg {
     };
     for s in stickers {
         let (ext, kind) = match s.format_type {
-            1 | 2 => ("png", "sticker/png"),
+            1 => ("png", "sticker/png"),
+            2 => ("png", "sticker/apng"),
             4 => ("gif", "sticker/gif"),
             _ => ("png", "sticker/lottie"),
         };
         let url = if kind == "sticker/lottie" {
             format!(
                 "https://media.discordapp.net/stickers/{}.png?size=160&passthrough=false",
+                s.id
+            )
+        } else if kind == "sticker/apng" {
+            // passthrough=true — оригинальный APNG с анимацией, а не первый кадр
+            format!(
+                "https://media.discordapp.net/stickers/{}.png?size=160&passthrough=true",
                 s.id
             )
         } else {
@@ -1363,6 +1427,38 @@ fn convert_msg(m: RawMessage) -> Msg {
             .replace('\n', " "),
     });
 
+    // Сообщение о звонке: понятный текст, как в Discord.
+    let mut call_info = None;
+    if m.kind == 3 {
+        let me = ME.load(std::sync::atomic::Ordering::Relaxed).to_string();
+        let started = chrono::DateTime::parse_from_rfc3339(&m.timestamp).ok();
+        let call = m.call.as_ref();
+        let joined = call.map_or(true, |c| c.participants.iter().any(|p| *p == me));
+        let author_me = m.author.id == me;
+        let ended = call
+            .and_then(|c| c.ended_timestamp.as_deref())
+            .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
+        let missed = !joined && !author_me;
+        content = match (ended, started) {
+            (Some(e), Some(st)) => {
+                let dur = human_duration((e - st).num_seconds());
+                if missed {
+                    format!(
+                        "Вы пропустили звонок от {}, который длился {dur}",
+                        m.author.display()
+                    )
+                } else {
+                    format!(
+                        "{} начал(а) звонок продолжительностью {dur}",
+                        m.author.display()
+                    )
+                }
+            }
+            _ => format!("{} начинает звонок", m.author.display()),
+        };
+        system = true;
+        call_info = Some(missed);
+    }
     Msg {
         id: sid(&m.id),
         channel_id: sid(&m.channel_id),
@@ -1404,6 +1500,7 @@ fn convert_msg(m: RawMessage) -> Msg {
         }),
         sending: false,
         failed: None,
+        call: call_info,
     }
 }
 
@@ -1494,6 +1591,7 @@ fn convert_dm(c: &RawChannel, users: &HashMap<String, (String, Option<String>)>)
         avatar,
         group,
         recipients: people,
+        request: c.is_message_request.unwrap_or(false) || c.is_spam.unwrap_or(false),
     }
 }
 
@@ -1882,6 +1980,38 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                     let _permit = sem.acquire_owned().await;
                     let result = fetch_image(&http, &url, max_side, animate).await;
                     sink.send(Event::Image { key, result });
+                });
+            }
+            Cmd::CheckUpdate { manual } => {
+                let (http, sink) = (http.clone(), sink.clone());
+                tokio::spawn(async move {
+                    match crate::update::check(&http).await {
+                        Ok(Some(r)) => sink.send(Event::UpdateAvailable(r)),
+                        Ok(None) if manual => {
+                            sink.send(Event::Info("У вас последняя версия Rustcord".into()))
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            crate::store::log(&format!("обновление: {e}"));
+                            if manual {
+                                sink.send(Event::Error(format!(
+                                    "Не удалось проверить обновления: {e}"
+                                )));
+                            }
+                        }
+                    }
+                });
+            }
+            Cmd::InstallUpdate(url) => {
+                let (http, sink) = (http.clone(), sink.clone());
+                tokio::spawn(async move {
+                    match crate::update::download_and_replace(&http, &url).await {
+                        Ok(exe) => sink.send(Event::UpdateReady(exe)),
+                        Err(e) => {
+                            crate::store::log(&format!("обновление: {e}"));
+                            sink.send(Event::UpdateFailed(e));
+                        }
+                    }
                 });
             }
             Cmd::Download { url, filename } => {
@@ -2332,6 +2462,7 @@ async fn fetch_image(
 ) -> Result<Vec<Frame>, String> {
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
+        crate::store::log(&format!("картинка {url}: HTTP {}", resp.status().as_u16()));
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
     if resp.content_length().unwrap_or(0) > MAX_IMAGE_DOWNLOAD {
@@ -2357,9 +2488,47 @@ fn to_color_image(img: image::DynamicImage, max_side: u32) -> egui::ColorImage {
 }
 
 /// Декодирует и сразу уменьшает: в памяти хранится только то, что видно на экране.
+fn collect_frames(frames: image::Frames<'_>, max_side: u32) -> Vec<Frame> {
+    let mut out = Vec::new();
+    for frame in frames.take(MAX_GIF_FRAMES) {
+        let Ok(frame) = frame else { break };
+        let (num, den) = frame.delay().numer_denom_ms();
+        let delay_ms = if den == 0 { 100 } else { (num / den).max(20) };
+        let img = image::DynamicImage::ImageRgba8(frame.into_buffer());
+        out.push(Frame {
+            image: to_color_image(img, max_side),
+            delay_ms,
+        });
+    }
+    out
+}
+
 fn decode_image(bytes: &[u8], max_side: u32, animate: bool) -> Result<Vec<Frame>, String> {
     use image::AnimationDecoder;
     let format = image::guess_format(bytes).map_err(|e| e.to_string())?;
+    // Анимированные PNG (APNG — так устроены многие стикеры) и WebP.
+    if animate && format == image::ImageFormat::Png {
+        if let Ok(dec) = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)) {
+            if dec.is_apng().unwrap_or(false) {
+                if let Ok(apng) = dec.apng() {
+                    let frames = collect_frames(apng.into_frames(), max_side);
+                    if !frames.is_empty() {
+                        return Ok(frames);
+                    }
+                }
+            }
+        }
+    }
+    if animate && format == image::ImageFormat::WebP {
+        if let Ok(dec) = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes)) {
+            if dec.has_animation() {
+                let frames = collect_frames(dec.into_frames(), max_side);
+                if !frames.is_empty() {
+                    return Ok(frames);
+                }
+            }
+        }
+    }
     if animate && format == image::ImageFormat::Gif {
         let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
             .map_err(|e| e.to_string())?;
@@ -2919,6 +3088,13 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
             sink.send(Event::MessageCreate(convert_msg(m)));
         }
         "MESSAGE_UPDATE" => {
+            // Звонок закончился: Discord обновляет сообщение о звонке целиком.
+            if let Ok(full) = serde_json::from_str::<RawMessage>(d) {
+                if full.kind == 3 {
+                    sink.send(Event::MessageReplace(convert_msg(full)));
+                    return Ok(());
+                }
+            }
             let m: RawMessageUpdate = serde_json::from_str(d)?;
             if let Some(content) = m.content {
                 sink.send(Event::MessageUpdate {

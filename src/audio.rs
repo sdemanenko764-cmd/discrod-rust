@@ -202,12 +202,31 @@ fn build_input(
     Ok(stream)
 }
 
+/// Сколько звука собеседника накопить перед началом воспроизведения (40 мс стерео):
+/// небольшой запас сглаживает неровный приход пакетов — звук не «трещит».
+const PRIME: usize = RATE as usize * 2 * 40 / 1000;
+
 /// Смешивает всех собеседников в один стерео-поток (n кадров).
-fn mix(playback: &Playback, frames: usize, out: &mut Vec<f32>) {
+fn mix(
+    playback: &Playback,
+    frames: usize,
+    out: &mut Vec<f32>,
+    primed: &mut std::collections::HashSet<u32>,
+) {
     out.clear();
     out.resize(frames * 2, 0.0);
     if let Ok(mut map) = playback.lock() {
-        for q in map.values_mut() {
+        for (ssrc, q) in map.iter_mut() {
+            if q.is_empty() {
+                primed.remove(ssrc);
+                continue;
+            }
+            if !primed.contains(ssrc) {
+                if q.len() < PRIME {
+                    continue; // ещё копим запас
+                }
+                primed.insert(*ssrc);
+            }
             let take = q.len().min(frames * 2);
             for (i, s) in q.drain(..take).enumerate() {
                 out[i] += s;
@@ -244,12 +263,13 @@ fn build_output(
     let mut tmp_r: Vec<f32> = Vec::new();
     let mut src_l: Vec<f32> = Vec::new();
     let mut src_r: Vec<f32> = Vec::new();
+    let mut primed = std::collections::HashSet::new();
     let err = |e| crate::store::log(&format!("динамики: {e}"));
 
     // Заполняет буфер устройства: frames кадров по channels каналов.
     let mut fill = move |frames: usize, write: &mut dyn FnMut(usize, f32)| {
         while fifo_l.len() < frames {
-            mix(&playback, 480, &mut mixed); // 10 мс
+            mix(&playback, 480, &mut mixed, &mut primed); // 10 мс
             if let Some(r) = &render {
                 if let Ok(mut q) = r.lock() {
                     q.extend(mixed.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
@@ -515,4 +535,79 @@ pub fn play_test_sound(output: Option<String>) -> Result<(), String> {
         })
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Звонок: мелодия играет по кругу, пока жив этот объект.
+pub struct Ringer {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Ringer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Один цикл мелодии звонка (стерео, 48 кГц).
+fn ring_cycle(incoming: bool) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut note = |freq: f32, secs: f32, vol: f32| {
+        let len = (RATE as f32 * secs) as usize;
+        for i in 0..len {
+            let t = i as f32 / RATE as f32;
+            let env = (t * 80.0).min(1.0) * ((secs - t) * 30.0).clamp(0.0, 1.0);
+            let v = ((t * freq * std::f32::consts::TAU).sin() * 0.8
+                + (t * freq * 2.0 * std::f32::consts::TAU).sin() * 0.2)
+                * vol
+                * env;
+            out.push(v);
+            out.push(v);
+        }
+    };
+    if incoming {
+        // входящий: звонкое арпеджио дважды, затем пауза
+        for _ in 0..2 {
+            for f in [659.25, 830.61, 987.77, 1318.5] {
+                note(f, 0.11, 0.22);
+            }
+            note(0.0, 0.18, 0.0);
+        }
+        note(0.0, 1.3, 0.0);
+    } else {
+        // исходящий: мягкий гудок «ту-у», затем пауза
+        note(440.0, 0.9, 0.10);
+        note(0.0, 2.1, 0.0);
+    }
+    out
+}
+
+/// Запускает мелодию звонка на устройстве вывода.
+pub fn start_ring(output: Option<String>, incoming: bool) -> Ringer {
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let _ = std::thread::Builder::new()
+        .name("ringer".into())
+        .spawn(move || {
+            let host = cpal::default_host();
+            let Some(device) = find_output(&host, output.as_deref()) else {
+                return;
+            };
+            let playback: Playback = Arc::new(Mutex::new(HashMap::new()));
+            let Ok(stream) = build_output(&device, playback.clone(), None) else {
+                return;
+            };
+            let _ = stream.play();
+            let cycle = ring_cycle(incoming);
+            while !st.load(Ordering::Relaxed) {
+                if let Ok(mut map) = playback.lock() {
+                    let q = map.entry(0).or_default();
+                    if q.len() < RATE as usize {
+                        q.extend(cycle.iter().copied());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            drop(stream);
+        });
+    Ringer { stop }
 }

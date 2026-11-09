@@ -391,10 +391,31 @@ fn rich_line(
                     }
                 }
                 Inline::Link { label, url, .. } => {
+                    // ссылка — той же надписью, что и текст вокруг: одинаковая линия строки
                     flush(ui, &mut job);
-                    let r = ui.hyperlink_to(RichText::new(*label).size(size).color(pal.link), *url);
-                    if label != url {
-                        r.on_hover_text(*url);
+                    let mut f = format(st, false);
+                    f.color = pal.link;
+                    let mut j = LayoutJob::default();
+                    j.append(label, 0.0, f.clone());
+                    let r = ui
+                        .add(egui::Label::new(j).sense(Sense::click()).selectable(false))
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    if r.hovered() {
+                        ui.painter().line_segment(
+                            [
+                                r.rect.left_bottom() - vec2(0.0, 2.0),
+                                r.rect.right_bottom() - vec2(0.0, 2.0),
+                            ],
+                            Stroke::new(1.0, pal.link),
+                        );
+                    }
+                    let r = if label != url {
+                        r.on_hover_text(*url)
+                    } else {
+                        r
+                    };
+                    if r.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(*url));
                     }
                 }
                 Inline::Emoji(e, _) => {
@@ -855,6 +876,16 @@ impl App {
         use discord::ApiTag;
         match action {
             Action::OpenProfile(uid) => {
+                // все меню закрываем — иначе профиль мог оказаться под ними или сразу закрыться
+                self.user_menu = None;
+                self.user_menu_invite = false;
+                self.msg_menu = None;
+                self.channel_menu = None;
+                self.stream_fullscreen = false;
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("profile_win"),
+                ));
                 let (name, avatar) = self.known_user(uid);
                 self.profile = Some(ProfileView {
                     user_id: uid,
@@ -2188,6 +2219,7 @@ impl App {
 
         egui::Window::new("profile")
             .id(egui::Id::new("profile_win"))
+            .order(egui::Order::Foreground)
             .title_bar(false)
             .open(&mut open)
             .collapsible(false)
@@ -2216,10 +2248,29 @@ impl App {
                             .paint_at(ui, banner);
                     }
                     None => {
-                        let c = accent
-                            .map(|c| role_color(c, pal.accent))
-                            .unwrap_or_else(|| name_color(uid).gamma_multiply(0.85));
-                        ui.painter().rect_filled(banner, rounding, c);
+                        // без баннера — спокойный графитовый градиент в серо-чёрных тонах
+                        let _ = accent;
+                        let top = Color32::from_rgb(58, 58, 64);
+                        let bottom = Color32::from_rgb(28, 28, 32);
+                        ui.painter().rect_filled(banner, rounding, bottom);
+                        let mut mesh = egui::Mesh::default();
+                        mesh.colored_vertex(banner.left_top() + vec2(0.0, r), top);
+                        mesh.colored_vertex(banner.right_top() + vec2(0.0, r), top);
+                        mesh.colored_vertex(banner.right_bottom(), bottom);
+                        mesh.colored_vertex(banner.left_bottom(), bottom);
+                        mesh.add_triangle(0, 1, 2);
+                        mesh.add_triangle(0, 2, 3);
+                        ui.painter().add(egui::Shape::mesh(mesh));
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(banner.min, vec2(banner.width(), r)),
+                            Rounding {
+                                nw: r,
+                                ne: r,
+                                sw: 0.0,
+                                se: 0.0,
+                            },
+                            top,
+                        );
                     }
                 }
                 // закрыть
@@ -2437,9 +2488,10 @@ impl App {
                                                 for (n, c) in named {
                                                     let col = role_color(c, pal.muted);
                                                     egui::Frame::none()
-                                                        .fill(pal.side)
-                                                        .rounding(6.0)
-                                                        .inner_margin(Margin::symmetric(7.0, 3.0))
+                                                        .fill(Color32::TRANSPARENT)
+                                                        .stroke(Stroke::new(1.0, pal.border))
+                                                        .rounding(12.0)
+                                                        .inner_margin(Margin::symmetric(9.0, 3.0))
                                                         .show(ui, |ui| {
                                                             ui.horizontal(|ui| {
                                                                 let (d, _) = ui
@@ -2488,7 +2540,7 @@ impl App {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let side = h + friend_label.map_or(0.0, |_| 132.0 + 8.0) + 8.0;
                             if !me {
-                                if accent_button(
+                                if dark_button(
                                     ui,
                                     &pal,
                                     "Написать сообщение",
@@ -3157,6 +3209,39 @@ fn skeleton_row(ui: &mut egui::Ui, pal: &Palette, k: usize) {
         .request_repaint_after(std::time::Duration::from_millis(40));
 }
 
+/// Главная кнопка профиля в серо-чёрных тонах: светло-серая на тёмной теме,
+/// почти чёрная на светлой; при наведении — чуть ярче.
+fn dark_button(ui: &mut egui::Ui, pal: &Palette, text: &str, w: f32, h: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+    let (base, hover, fg) = if pal.light {
+        (
+            Color32::from_gray(30),
+            Color32::from_gray(55),
+            Color32::WHITE,
+        )
+    } else {
+        (
+            Color32::from_gray(232),
+            Color32::WHITE,
+            Color32::from_gray(18),
+        )
+    };
+    let pressed = resp.is_pointer_button_down_on();
+    let r = rect.shrink(if pressed { 1.0 } else { 0.0 });
+    ui.painter().rect_filled(r, 10.0, mix(base, hover, t));
+    ui.painter().text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::new(14.5, egui::FontFamily::Name("bold".into())),
+        fg,
+    );
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// Второстепенная кнопка в тон теме: мягкая заливка, плавная подсветка.
 fn soft_button(
     ui: &mut egui::Ui,
@@ -3224,7 +3309,7 @@ fn profile_tab(ui: &mut egui::Ui, pal: &Palette, text: &str, on: bool) -> egui::
                 vec2(rect.width() - 12.0, 2.5),
             ),
             1.5,
-            pal.accent,
+            pal.text,
         );
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)

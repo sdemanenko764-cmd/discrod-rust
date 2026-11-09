@@ -21,6 +21,9 @@ jobs:
 
       - name: Сборка rustcord.exe
         shell: bash
+        env:
+          # номер сборки вшивается в программу — по нему работает автообновление
+          RUSTCORD_BUILD: ${{ github.run_number }}
         run: |
           set -o pipefail
           cargo build --release --color never 2>&1 | tee build.log

@@ -41,6 +41,8 @@ pub struct Settings {
     pub bg_blur: bool,
     /// Непрозрачность панелей поверх своего фона (0.3..1).
     pub panel_opacity: f32,
+    /// Проверять обновления при запуске.
+    pub auto_update: bool,
     /// Шрифт интерфейса: встроенный Inter (иначе системный Segoe UI).
     pub font_inter: bool,
     pub accent: usize,
@@ -95,6 +97,7 @@ impl Default for Settings {
         Self {
             theme: Theme::AdwaitaDark,
             font_inter: true,
+            auto_update: true,
             bg_image: None,
             bg_dim: 0.35,
             bg_blur: false,

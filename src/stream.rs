@@ -219,6 +219,20 @@ struct VideoRtp {
     seq: u16,
     timestamp: u32,
     nonce: u32,
+    /// Для отчётов отправителя (RTCP SR): сколько пакетов и байт отправлено.
+    packets: u32,
+    octets: u32,
+    last_sr: Instant,
+}
+
+/// Время в формате NTP (секунды с 1900 года, 32.32 фиксированная точка).
+fn ntp_now() -> (u32, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() + 2_208_988_800;
+    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000;
+    (secs as u32, frac as u32)
 }
 
 impl VideoRtp {
@@ -248,7 +262,30 @@ impl VideoRtp {
         pkt.extend_from_slice(&self.nonce.to_be_bytes());
         self.seq = self.seq.wrapping_add(1);
         self.nonce = self.nonce.wrapping_add(1);
+        self.packets = self.packets.wrapping_add(1);
+        self.octets = self.octets.wrapping_add(payload.len() as u32);
         Some(pkt)
+    }
+
+    /// RTCP Sender Report: время отправки, RTP-время и счётчики. Приёмник Discord
+    /// (WebRTC) по нему синхронизирует поток и без него может не начать показ видео.
+    fn sender_report(&mut self, cipher: &Aes256Gcm) -> Option<Vec<u8>> {
+        let mut h = [0u8; 8];
+        h[0] = 0x80;
+        h[1] = 200; // SR
+        h[2..4].copy_from_slice(&6u16.to_be_bytes());
+        h[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
+        let (msw, lsw) = ntp_now();
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&msw.to_be_bytes());
+        body.extend_from_slice(&lsw.to_be_bytes());
+        body.extend_from_slice(&self.timestamp.to_be_bytes());
+        body.extend_from_slice(&self.packets.to_be_bytes());
+        body.extend_from_slice(&self.octets.to_be_bytes());
+        let nonce = self.nonce;
+        self.nonce = self.nonce.wrapping_add(1); // общий счётчик с RTP — nonce не повторяется
+        self.last_sr = Instant::now();
+        rtcp_packet(cipher, &h, &body, nonce)
     }
 }
 
@@ -491,6 +528,7 @@ fn spawn_capture(
                     }
                 };
             let frame_time = Duration::from_millis(1000 / cfg.fps.max(1) as u64);
+            let mut resizer = fast_image_resize::Resizer::new();
             let preview_every = Duration::from_millis(125);
             let mut last_preview = Instant::now() - preview_every;
             let mut n: u64 = 0;
@@ -500,13 +538,18 @@ fn spawn_capture(
                 match source.capture() {
                     Ok(img) => {
                         failures = 0;
+                        // Масштабирование SIMD-ресайзером: в разы быстрее, чем image::resize,
+                        // поэтому захват успевает за выбранной частотой кадров.
                         let img = if img.width() != w || img.height() != h {
-                            image::imageops::resize(
-                                &img,
-                                w,
-                                h,
-                                image::imageops::FilterType::Triangle,
-                            )
+                            match fast_resize(&mut resizer, &img, w, h, false) {
+                                Some(x) => x,
+                                None => image::imageops::resize(
+                                    &img,
+                                    w,
+                                    h,
+                                    image::imageops::FilterType::Triangle,
+                                ),
+                            }
                         } else {
                             img
                         };
@@ -514,12 +557,15 @@ fn spawn_capture(
                             last_preview = Instant::now();
                             let pw = 480u32.min(w);
                             let ph = ((h as f64 * pw as f64 / w as f64) as u32).max(2);
-                            let small = image::imageops::resize(
-                                &img,
-                                pw,
-                                ph,
-                                image::imageops::FilterType::Nearest,
-                            );
+                            let small = fast_resize(&mut resizer, &img, pw, ph, true)
+                                .unwrap_or_else(|| {
+                                    image::imageops::resize(
+                                        &img,
+                                        pw,
+                                        ph,
+                                        image::imageops::FilterType::Nearest,
+                                    )
+                                });
                             sink.send(Event::StreamFrame {
                                 key: key.clone(),
                                 image: egui::ColorImage::from_rgba_unmultiplied(
@@ -565,6 +611,27 @@ fn spawn_capture(
         })
         .map_err(|e| e.to_string())?;
     Ok((w, h))
+}
+
+/// Быстрое масштабирование RGBA-кадра (fast_image_resize, SIMD). Экран непрозрачный,
+/// поэтому умножение на альфу не нужно.
+fn fast_resize(
+    resizer: &mut fast_image_resize::Resizer,
+    src: &image::RgbaImage,
+    w: u32,
+    h: u32,
+    nearest: bool,
+) -> Option<image::RgbaImage> {
+    use fast_image_resize::{images::Image, FilterType, PixelType, ResizeAlg, ResizeOptions};
+    let mut dst = Image::new(w, h, PixelType::U8x4);
+    let alg = if nearest {
+        ResizeAlg::Nearest
+    } else {
+        ResizeAlg::Convolution(FilterType::Bilinear)
+    };
+    let opts = ResizeOptions::new().resize_alg(alg).use_alpha(false);
+    resizer.resize(src, &mut dst, &opts).ok()?;
+    image::RgbaImage::from_raw(w, h, dst.into_vec())
 }
 
 /// Зритель попросил ключевой кадр (RTCP PLI) — следующий кадр будет ключевым.
@@ -818,8 +885,8 @@ async fn session(
                                     frame_rx = rx2;
                                     let (w, h) = spawn_capture(p.key.clone(), c, tx, stop.clone(), sink.clone())?;
                                     frame_tx = None;
-                                    rtp = Some(VideoRtp { ssrc: video_ssrc, seq: (seed() & 0xFFFF) as u16, timestamp: (seed() >> 20) as u32, nonce: 0 });
-                                    let bitrate = c.bitrate(h);
+                                    rtp = Some(VideoRtp { ssrc: video_ssrc, seq: (seed() & 0xFFFF) as u16, timestamp: (seed() >> 20) as u32, nonce: 0, packets: 0, octets: 0, last_sr: Instant::now() - Duration::from_secs(5) });
+                                    let bitrate = c.bitrate(h).max(2_500_000);
                                     out.push(Out::Json(json!({
                                         "op": 12,
                                         "d": {
@@ -827,7 +894,7 @@ async fn session(
                                             "video_ssrc": video_ssrc,
                                             "rtx_ssrc": rtx_ssrc,
                                             "streams": [{
-                                                "type": "screen", "rid": "100", "ssrc": video_ssrc, "rtx_ssrc": rtx_ssrc,
+                                                "type": "video", "rid": "100", "ssrc": video_ssrc, "rtx_ssrc": rtx_ssrc,
                                                 "active": true, "quality": 100, "max_bitrate": bitrate, "max_framerate": fps,
                                                 "max_resolution": { "type": "fixed", "width": w, "height": h }
                                             }]
@@ -950,6 +1017,11 @@ async fn session(
                         for (i, pl) in payloads.iter().enumerate() {
                             if let Some(pkt) = r.packet(c, pl, i == last) {
                                 let _ = u.send(&pkt).await;
+                            }
+                        }
+                        if r.last_sr.elapsed() >= Duration::from_secs(1) {
+                            if let Some(sr) = r.sender_report(c) {
+                                let _ = u.send(&sr).await;
                             }
                         }
                         sent_frames += 1;

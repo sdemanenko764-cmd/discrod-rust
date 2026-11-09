@@ -25,6 +25,7 @@ mod settings;
 mod store;
 mod stream;
 mod theme;
+mod update;
 mod voice;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -151,6 +152,12 @@ enum Action {
     StopStream,
     WatchStream(u64),
     StopWatching,
+    /// Открыть картинку во встроенном просмотрщике.
+    ViewImage {
+        src: String,
+        link: String,
+        animate: bool,
+    },
     /// Развернуть трансляцию на всё окно / свернуть обратно.
     ToggleStreamFullscreen,
     SelectGuild(Option<u64>),
@@ -208,6 +215,9 @@ enum Action {
     SaveNickname(u64, String),
     /// Закрыть личный диалог (убрать из списка).
     CloseDm(u64),
+    /// Принять (true) или отклонить запрос на переписку.
+    MessageRequest(u64, bool),
+    ToggleRequests,
     RenameChannel(u64, String),
     ChannelInvite(u64),
     /// Создать приглашение на сервер и отправить пользователю в личку.
@@ -278,6 +288,10 @@ struct App {
     voice_members: HashMap<u64, Vec<VoiceMember>>,
     speaking: HashSet<u64>,
     incoming_call: Option<u64>,
+    /// Играющая мелодия звонка: (входящий?, проигрыватель).
+    ringer: Option<(bool, audio::Ringer)>,
+    /// Когда начали исходящий звонок в личке (гудки — не дольше минуты).
+    ring_since: Option<Instant>,
     stage_open: bool,
     mic_level: f32,
     devices: Option<(Vec<String>, Vec<String>)>,
@@ -289,6 +303,13 @@ struct App {
     watching: Option<(String, u64)>,
     stream_tex: Option<egui::TextureHandle>,
     stream_fullscreen: bool,
+    /// Доступное обновление и идёт ли его установка.
+    update: Option<(update::Release, bool)>,
+    update_checked: bool,
+    /// Высота сцены звонка, выбранная пользователем (None — автоматически).
+    stage_height: Option<f32>,
+    /// Встроенный просмотр картинки: (адрес картинки, ссылка для браузера, анимация, масштаб, сдвиг).
+    image_view: Option<(String, String, bool, f32, Vec2)>,
     /// Свой фон (картинка или GIF).
     background: background::Background,
     stream_picker: bool,
@@ -321,6 +342,8 @@ struct App {
     channel_menu: Option<(Option<u64>, u64, egui::Pos2)>,
     /// Окно ввода текста: (что меняем: 0 — название канала, 1 — заметка, 2 — никнейм друга; id; текст).
     rename_channel: Option<(u8, u64, String)>,
+    /// Раскрыт список запросов на переписку.
+    requests_open: bool,
     /// Поле «Название новой ветки» в окне веток.
     thread_new_name: String,
     guild_menu: Option<(u64, egui::Pos2)>,
@@ -347,6 +370,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        update::cleanup_old();
         let settings = settings::load();
         fonts::install(&cc.egui_ctx, settings.font_inter);
         let pal = theme::palette(&settings);
@@ -400,6 +424,8 @@ impl App {
             voice_members: HashMap::new(),
             speaking: HashSet::new(),
             incoming_call: None,
+            ringer: None,
+            ring_since: None,
             stage_open: true,
             mic_level: 0.0,
             devices: None,
@@ -409,6 +435,10 @@ impl App {
             watching: None,
             stream_tex: None,
             stream_fullscreen: false,
+            update: None,
+            update_checked: false,
+            stage_height: None,
+            image_view: None,
             background: background::Background::default(),
             stream_picker: false,
             windows: Vec::new(),
@@ -431,6 +461,7 @@ impl App {
             channel_menu: None,
             rename_channel: None,
             thread_new_name: String::new(),
+            requests_open: false,
             guild_menu: None,
             confirm_leave: None,
             server_dialog: None,
@@ -669,6 +700,10 @@ impl App {
                     custom: self.settings.custom_status.clone(),
                 });
                 self.status = Status::Online;
+                if self.settings.auto_update && !self.update_checked {
+                    self.update_checked = true;
+                    let _ = self.cmd.send(Cmd::CheckUpdate { manual: false });
+                }
                 self.me_id = user_id;
                 self.me_name = username;
                 self.me_avatar = avatar;
@@ -871,8 +906,38 @@ impl App {
             } => {
                 if let Some(c) = self.cache.get_mut(&channel_id) {
                     if let Some(m) = c.msgs.iter_mut().rev().find(|m| m.id == id) {
-                        m.content = content;
-                        m.edited = true;
+                        if !m.system {
+                            m.content = content;
+                            m.edited = true;
+                        }
+                    }
+                }
+            }
+            Event::UpdateAvailable(r) => {
+                if self
+                    .update
+                    .as_ref()
+                    .map_or(true, |(u, _)| u.build != r.build)
+                {
+                    self.update = Some((r, false));
+                }
+            }
+            Event::UpdateReady(exe) => {
+                settings::save(&self.settings);
+                update::restart(&exe);
+            }
+            Event::UpdateFailed(e) => {
+                if let Some(u) = self.update.as_mut() {
+                    u.1 = false;
+                }
+                self.toast(format!("Обновление не установилось: {e}"), true);
+            }
+            Event::MessageReplace(m) => {
+                if let Some(c) = self.cache.get_mut(&m.channel_id) {
+                    if let Some(x) = c.msgs.iter_mut().rev().find(|x| x.id == m.id) {
+                        let reactions = std::mem::take(&mut x.reactions);
+                        *x = m;
+                        x.reactions = reactions;
                     }
                 }
             }
@@ -911,6 +976,7 @@ impl App {
                     guild_id,
                     channel_id,
                 } => {
+                    self.ring_since = Some(Instant::now());
                     self.voice = Some(VoiceConn {
                         guild_id,
                         channel_id,
@@ -1084,6 +1150,7 @@ impl App {
                         avatar: Some((m.author_id, m.author_avatar.clone())),
                         group: false,
                         recipients: vec![(m.author_id, m.author.clone(), m.author_avatar.clone())],
+                        request: false,
                     },
                 ),
                 None => {}
@@ -1915,6 +1982,28 @@ impl App {
                                         if fresp.clicked() {
                                             actions.push(Action::OpenFriends);
                                         }
+                                        let requests = self.dms.iter().filter(|d| d.request).count();
+                                        if requests > 0 {
+                                            let rresp = nav_row(
+                                                ui,
+                                                &pal,
+                                                self.requests_open,
+                                                false,
+                                                true,
+                                                Leading::Glyph("✉"),
+                                                "Запросы сообщений",
+                                                36.0,
+                                            );
+                                            extra::badge(
+                                                ui,
+                                                rresp.rect.right_center() - vec2(18.0, 0.0),
+                                                requests as u32,
+                                                pal.side,
+                                            );
+                                            if rresp.clicked() {
+                                                actions.push(Action::ToggleRequests);
+                                            }
+                                        }
                                         ui.add_space(8.0);
                                         ui.label(
                                             RichText::new("  ЛИЧНЫЕ СООБЩЕНИЯ")
@@ -1929,7 +2018,13 @@ impl App {
                                                 RichText::new("Диалогов пока нет").color(pal.muted),
                                             );
                                         }
-                                        for d in &self.dms {
+                                        let show_requests = self.requests_open;
+                                        let mut dm_order: Vec<&Dm> = Vec::new();
+                                        if show_requests {
+                                            dm_order.extend(self.dms.iter().filter(|d| d.request));
+                                        }
+                                        dm_order.extend(self.dms.iter().filter(|d| !d.request));
+                                        for d in dm_order {
                                             let tex = match (&d.avatar, load_avatars) {
                                                 (Some((uid, Some(hash))), true) => {
                                                     let url = discord::avatar_url(*uid, hash);
@@ -2309,6 +2404,47 @@ impl App {
                 });
         }
 
+        // --- запрос на переписку: принять или отклонить ---
+        if let Some(d) = self
+            .sel_channel
+            .and_then(|c| self.dms.iter().find(|d| d.id == c && d.request))
+            .cloned()
+        {
+            egui::TopBottomPanel::bottom("message_request")
+                .frame(
+                    egui::Frame::none()
+                        .fill(pal.elevated)
+                        .rounding(pal.radius + 4.0)
+                        .outer_margin(Margin { left: 0.0, right: 8.0, top: 0.0, bottom: 8.0 })
+                        .inner_margin(Margin::symmetric(16.0, 12.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("✉").size(18.0).color(pal.muted));
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} хочет начать переписку", d.name))
+                                    .strong()
+                                    .color(pal.text),
+                            );
+                            ui.label(
+                                RichText::new("Вы не друзья. Примите запрос, чтобы ответить, или отклоните его.")
+                                    .small()
+                                    .color(pal.muted),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if toggle_chip(ui, &pal, "Отклонить", false).clicked() {
+                                actions.push(Action::MessageRequest(d.id, false));
+                            }
+                            if toggle_chip(ui, &pal, "Принять", true).clicked() {
+                                actions.push(Action::MessageRequest(d.id, true));
+                            }
+                        });
+                    });
+                });
+        }
+
         // --- поле ввода ---
         if let (Some(cid), Some((icon, name))) = (self.sel_channel, &title) {
             let typing_text = typing_line(self.typing.get(&cid));
@@ -2600,10 +2736,43 @@ impl App {
                     } else {
                         0.55
                     };
-                    let h = (ui.available_height() * share).clamp(240.0, 900.0);
+                    let avail = ui.available_height();
+                    let auto_h = (avail * share).clamp(240.0, 900.0);
+                    // высоту сцены можно менять, перетаскивая «шторку» под ней
+                    let h = self
+                        .stage_height
+                        .unwrap_or(auto_h)
+                        .clamp(150.0, (avail - 120.0).max(150.0));
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
                     draw_stage(ui, &pal, rect, tiles, &stage_state, &mut actions);
+                    let (grip, gresp) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), 14.0),
+                        Sense::click_and_drag(),
+                    );
+                    let gt = ui.ctx().animate_bool_with_time(
+                        gresp.id.with("h"),
+                        gresp.hovered() || gresp.dragged(),
+                        0.12,
+                    );
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(grip.center(), vec2(46.0 + 20.0 * gt, 4.0 + gt)),
+                        3.0,
+                        mix(pal.faint.gamma_multiply(0.6), pal.text, gt),
+                    );
+                    if gresp.dragged() {
+                        self.stage_height = Some(
+                            (h + gresp.drag_delta().y).clamp(150.0, (avail - 120.0).max(150.0)),
+                        );
+                    }
+                    if gresp.double_clicked() {
+                        self.stage_height = None;
+                    }
+                    gresp
+                        .on_hover_cursor(CursorIcon::ResizeVertical)
+                        .on_hover_text(
+                            "Потяните, чтобы изменить высоту звонка · двойной клик — как было",
+                        );
                 }
                 let Some(cid) = self.sel_channel else {
                     if self.sel_guild.is_none() && stage.is_none() {
@@ -2806,6 +2975,7 @@ impl App {
                         nonce: Some(nonce.clone()),
                         sending: true,
                         failed: None,
+                        call: None,
                     };
                     if let Some(c) = self.cache.get_mut(&channel_id) {
                         c.msgs.push_back(local);
@@ -2960,6 +3130,32 @@ impl App {
                 );
                 if !nick.is_empty() {
                     self.users.insert(uid, nick);
+                }
+            }
+            Action::ToggleRequests => self.requests_open = !self.requests_open,
+            Action::MessageRequest(cid, accept) => {
+                if accept {
+                    if let Some(d) = self.dms.iter_mut().find(|d| d.id == cid) {
+                        d.request = false;
+                    }
+                    self.api(
+                        "PUT",
+                        format!("/channels/{cid}/recipients/@me"),
+                        Some(serde_json::json!({ "consent_status": 2 })),
+                        discord::ApiTag::Done("Запрос принят — теперь можно переписываться".into()),
+                    );
+                } else {
+                    self.dms.retain(|d| d.id != cid);
+                    if self.sel_channel == Some(cid) {
+                        self.sel_channel = None;
+                        self.friends_open = true;
+                    }
+                    self.api(
+                        "DELETE",
+                        format!("/channels/{cid}/recipients/@me"),
+                        None,
+                        discord::ApiTag::Done("Запрос отклонён".into()),
+                    );
                 }
             }
             Action::CloseDm(cid) => {
@@ -3200,6 +3396,9 @@ impl App {
                         let _ = self.cmd.send(Cmd::WatchStream(key));
                     }
                 }
+            }
+            Action::ViewImage { src, link, animate } => {
+                self.image_view = Some((src, link, animate, 1.0, Vec2::ZERO));
             }
             Action::ToggleStreamFullscreen => {
                 self.stream_fullscreen = !self.stream_fullscreen && self.watching.is_some();
@@ -3481,6 +3680,248 @@ impl App {
             });
         }
         Some(tiles)
+    }
+
+    /// Карточка «Доступно обновление» в правом нижнем углу.
+    fn update_ui(&mut self, ctx: &egui::Context) {
+        let Some((rel, installing)) = self.update.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let solid = self.solid();
+        let mut install = false;
+        let mut later = false;
+        egui::Area::new(egui::Id::new("update_card"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, [-20.0, -20.0])
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(solid)
+                    .rounding(14.0)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .shadow(Shadow {
+                        offset: vec2(0.0, 8.0),
+                        blur: 24.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(110),
+                    })
+                    .inner_margin(Margin::same(14.0))
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.label(
+                            RichText::new("Доступно обновление")
+                                .font(FontId::new(15.0, egui::FontFamily::Name("bold".into())))
+                                .color(pal.text),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Сборка {} · у вас {}",
+                                rel.build,
+                                update::current_label()
+                            ))
+                            .small()
+                            .color(pal.muted),
+                        );
+                        ui.add_space(8.0);
+                        if installing {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new("Скачиваю и устанавливаю…").color(pal.muted),
+                                );
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                if accent_button(ui, &pal, "Обновить и перезапустить", 196.0, 32.0)
+                                    .clicked()
+                                {
+                                    install = true;
+                                }
+                                if ui.button("Позже").clicked() {
+                                    later = true;
+                                }
+                            });
+                            if ui.link("Что нового (страница релиза)").clicked()
+                            {
+                                ctx.open_url(egui::OpenUrl::new_tab(rel.page.clone()));
+                            }
+                        }
+                    });
+            });
+        if install {
+            if let Some(u) = self.update.as_mut() {
+                u.1 = true;
+            }
+            let _ = self.cmd.send(Cmd::InstallUpdate(rel.url.clone()));
+        } else if later {
+            self.update = None;
+        }
+    }
+
+    /// Мелодия звонка: входящий — пока висит окно звонка; исходящий (личка) —
+    /// пока в звонке никого, кроме нас, но не дольше минуты.
+    fn update_ringer(&mut self, ctx: &egui::Context) {
+        let incoming = self.incoming_call.is_some() && self.my_status != "dnd";
+        let outgoing = !incoming
+            && self.voice.as_ref().map_or(false, |v| {
+                v.guild_id.is_none()
+                    && self
+                        .voice_members
+                        .get(&v.channel_id)
+                        .map_or(true, |list| list.iter().all(|m| m.user_id == self.me_id))
+            })
+            && self
+                .ring_since
+                .map_or(false, |t| t.elapsed() < Duration::from_secs(60));
+        let want = if incoming {
+            Some(true)
+        } else if outgoing {
+            Some(false)
+        } else {
+            None
+        };
+        match (want, &self.ringer) {
+            (None, Some(_)) => self.ringer = None,
+            (Some(k), Some((cur, _))) if *cur == k => {}
+            (Some(k), _) => {
+                self.ringer = Some((k, audio::start_ring(self.settings.output_device.clone(), k)))
+            }
+            (None, None) => {}
+        }
+        if want.is_some() {
+            // перепроверяем раз в полсекунды: кончилась минута гудков, кто-то ответил и т.п.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// Просмотр картинки поверх окна: колесо — масштаб, перетаскивание — сдвиг,
+    /// Esc или клик по фону — закрыть.
+    fn image_view_ui(&mut self, ctx: &egui::Context) {
+        let Some((src, link, animate, mut zoom, mut pan)) = self.image_view.clone() else {
+            return;
+        };
+        let pal = self.pal;
+        let key = format!("view|{animate}|{src}");
+        let tex = self.media.get(
+            ctx,
+            &self.cmd,
+            &key,
+            &src,
+            2048,
+            animate && self.settings.animate_gifs,
+        );
+        let failed = self.media.failed(&key);
+        let mut close = false;
+        let mut actions = Vec::new();
+        let appear = ctx.animate_bool_with_time(egui::Id::new(("img_view", &src)), true, 0.15);
+        egui::Area::new(egui::Id::new("image_view"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                let bg = ui.interact(screen, ui.id().with("bg"), Sense::click_and_drag());
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha((215.0 * appear) as u8));
+                let area = screen.shrink2(vec2(60.0, 70.0));
+                match tex {
+                    Some((id, size)) if size.x > 0.0 => {
+                        let fit_scale = (area.width() / size.x).min(area.height() / size.y).min(1.0);
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            zoom = (zoom * (1.0 + scroll * 0.0015)).clamp(0.2, 8.0);
+                        }
+                        if bg.dragged() {
+                            pan += bg.drag_delta();
+                        }
+                        let shown = size * fit_scale * zoom * (0.94 + 0.06 * appear);
+                        let rect = Rect::from_center_size(area.center() + pan, shown);
+                        ui.painter().image(
+                            id,
+                            rect,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE.gamma_multiply(appear),
+                        );
+                        if bg.clicked() && !rect.contains(bg.interact_pointer_pos().unwrap_or_default()) {
+                            close = true;
+                        }
+                        if bg.double_clicked() {
+                            zoom = if zoom > 1.01 { 1.0 } else { 2.0 };
+                            pan = Vec2::ZERO;
+                        }
+                    }
+                    _ if failed => {
+                        ui.painter().text(
+                            area.center(),
+                            Align2::CENTER_CENTER,
+                            "Не удалось загрузить картинку",
+                            FontId::proportional(16.0),
+                            Color32::WHITE,
+                        );
+                        if bg.clicked() {
+                            close = true;
+                        }
+                    }
+                    _ => {
+                        ui.put(
+                            Rect::from_center_size(area.center(), vec2(32.0, 32.0)),
+                            egui::Spinner::new().size(32.0).color(Color32::WHITE),
+                        );
+                        if bg.clicked() {
+                            close = true;
+                        }
+                    }
+                }
+                // панель действий снизу
+                let bar = Rect::from_center_size(
+                    pos2(screen.center().x, screen.bottom() - 34.0),
+                    vec2(420.0, 40.0),
+                );
+                ui.allocate_ui_at_rect(bar, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        let filename = src
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("image")
+                            .split('?')
+                            .next()
+                            .unwrap_or("image")
+                            .to_string();
+                        if ui.button("⬇  Сохранить").clicked() {
+                            actions.push(Action::Download(src.clone(), filename));
+                        }
+                        if ui.button("🔗  Открыть в браузере").clicked() {
+                            actions.push(Action::OpenUrl(link.clone()));
+                        }
+                        if ui.button("⧉  Копировать ссылку").clicked() {
+                            actions.push(Action::CopyText(link.clone()));
+                        }
+                        if ui.button("✕  Закрыть").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.painter().text(
+                    pos2(screen.center().x, screen.top() + 22.0),
+                    Align2::CENTER_CENTER,
+                    "Колесо мыши — масштаб · перетаскивание — сдвиг · двойной клик — 2× · Esc — закрыть",
+                    FontId::proportional(12.0),
+                    Color32::from_gray(170),
+                );
+            });
+        let _ = pal;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if close {
+            self.image_view = None;
+        } else if let Some(v) = self.image_view.as_mut() {
+            v.3 = zoom;
+            v.4 = pan;
+        }
+        for a in actions {
+            self.handle_action(ctx, a);
+        }
     }
 
     /// Трансляция на всё окно: Esc, двойной клик или кнопка — обратно.
@@ -4215,6 +4656,13 @@ impl App {
                             toggle_test = true;
                         }
 
+                        section(ui, &pal, "Обновления");
+                        ui.label(RichText::new(format!("Установлена {}", update::current_label())).color(pal.muted));
+                        ui.checkbox(&mut self.settings.auto_update, "Проверять обновления при запуске");
+                        if ui.button("🔄  Проверить обновления сейчас").clicked() {
+                            let _ = self.cmd.send(Cmd::CheckUpdate { manual: true });
+                        }
+
                         section(ui, &pal, "Память");
                         ui.add(
                             egui::Slider::new(&mut self.settings.cached_channels, 2..=20)
@@ -4415,6 +4863,9 @@ impl eframe::App for App {
         self.extra_ui(ctx);
         self.stream_picker_ui(ctx);
         self.stream_fullscreen_ui(ctx);
+        self.image_view_ui(ctx);
+        self.update_ringer(ctx);
+        self.update_ui(ctx);
         self.picker_ui(ctx);
         self.delete_ui(ctx);
         self.settings_ui(ctx);
@@ -4641,7 +5092,21 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                 (e.kind == "gifv" || e.kind == "image")
                     && e.url.as_deref() == Some(m.content.trim())
             });
-            if m.system {
+            if let Some(missed) = m.call {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("📞").size(15.0).color(if missed {
+                        pal.danger
+                    } else {
+                        pal.ok
+                    }));
+                    ui.label(RichText::new(&m.content).color(pal.muted));
+                    ui.label(
+                        RichText::new(m.time.get(11..).unwrap_or(""))
+                            .size(11.5)
+                            .color(pal.faint),
+                    );
+                });
+            } else if m.system {
                 ui.label(
                     RichText::new(format!("→ {} {}", m.author, m.content))
                         .italics()
@@ -4650,7 +5115,7 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             } else if !m.content.is_empty() && !hide_text {
                 text_block(ui, cx, &m.content, &m.mentions);
             }
-            if m.edited {
+            if m.edited && !m.system {
                 ui.label(RichText::new("(изменено)").small().color(pal.faint));
             }
             if m.sending {
@@ -5037,6 +5502,7 @@ fn image_box(
     animate: bool,
     badge: Option<&str>,
     click_url: &str,
+    full_src: &str,
 ) -> bool {
     let pal = cx.pal;
     let key = format!("{max_side}|{animate}|{url}");
@@ -5087,7 +5553,16 @@ fn image_box(
         }
     }
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-        cx.actions.push(Action::OpenUrl(click_url.to_string()));
+        if badge == Some("▶") {
+            // видео — в браузере
+            cx.actions.push(Action::OpenUrl(click_url.to_string()));
+        } else {
+            cx.actions.push(Action::ViewImage {
+                src: full_src.to_string(),
+                link: click_url.to_string(),
+                animate,
+            });
+        }
     }
     failed
 }
@@ -5096,7 +5571,8 @@ fn sticker_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, a: &Attachment) {
     let pal = cx.pal;
     let (rect, resp) = ui.allocate_exact_size(vec2(160.0, 160.0), Sense::hover());
     if ui.is_rect_visible(rect) {
-        let animate = a.content_type == "sticker/gif" && cx.settings.animate_gifs;
+        let animate = matches!(a.content_type.as_str(), "sticker/gif" | "sticker/apng")
+            && cx.settings.animate_gifs;
         let tex = if cx.settings.load_images {
             let (key, tex) = cx.image(ui.ctx(), &a.proxy_url, 160, animate);
             tex.ok_or(cx.media.failed(&key))
@@ -5179,6 +5655,7 @@ fn attachment_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, a: &Attachment) {
             animate,
             badge,
             &a.url,
+            &a.proxy_url,
         );
         return;
     }
@@ -5240,14 +5717,16 @@ fn embed_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, e: &Embed) {
             };
             let gif = e.gif_url.as_ref().filter(|_| cx.settings.animate_gifs);
             let failed = match gif {
-                Some(g) => image_box(ui, cx, g, known, max, 300, true, Some("GIF"), &click),
+                Some(g) => image_box(ui, cx, g, known, max, 300, true, Some("GIF"), &click, g),
                 None => false,
             };
             if gif.is_none() || failed {
                 let s = fit(media.width, media.height, max.x, max.y);
                 let url = discord::resized_url(&media.url, s.x as u32, s.y as u32);
                 let badge = if e.kind == "gifv" { Some("GIF") } else { None };
-                image_box(ui, cx, &url, known, max, 420, false, badge, &click);
+                image_box(
+                    ui, cx, &url, known, max, 420, false, badge, &click, &media.url,
+                );
             }
             return;
         }
@@ -5309,6 +5788,7 @@ fn embed_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, e: &Embed) {
                     false,
                     badge,
                     &click,
+                    &media.url,
                 );
             }
         });

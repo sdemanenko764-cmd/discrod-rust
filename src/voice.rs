@@ -392,7 +392,14 @@ impl Codec {
         let mut encoder =
             opus::Encoder::new(audio::RATE, opus::Channels::Stereo, opus::Application::Voip)
                 .map_err(|e| e.to_string())?;
-        let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
+        // Качество как у Discord Nitro-уровня для голоса: 96 кбит/с, полная полоса,
+        // защита от потерь пакетов (FEC) — при плохой сети голос не рвётся.
+        let _ = encoder.set_bitrate(opus::Bitrate::Bits(96_000));
+        let _ = encoder.set_complexity(10);
+        let _ = encoder.set_signal(opus::Signal::Voice);
+        let _ = encoder.set_max_bandwidth(opus::Bandwidth::Fullband);
+        let _ = encoder.set_inband_fec(true);
+        let _ = encoder.set_packet_loss_perc(10);
         Ok(Self {
             encoder,
             decoders: HashMap::new(),
