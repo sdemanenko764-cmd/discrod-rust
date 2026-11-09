@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::markdown::{self, Block, Inline, LineKind};
-use egui::text::{LayoutJob, TextFormat};
+use eframe::egui::text::{LayoutJob, TextFormat};
 use serde_json::Value;
 
 // ======================= состояние окон =======================
@@ -161,34 +161,22 @@ pub fn rich_text(
                 quoted,
                 text,
             } => {
-                let draw = |ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, reveal: &mut bool| match kind {
-                    LineKind::Bullet(indent) => {
-                        ui.horizontal_top(|ui| {
-                            ui.add_space(4.0 + indent as f32 * 18.0);
-                            let dot = if indent == 0 { "•" } else { "◦" };
-                            ui.label(RichText::new(dot).color(pal.muted));
-                            ui.add_space(4.0);
-                            ui.vertical(|ui| {
-                                rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal)
-                            });
-                        });
-                    }
-                    LineKind::Numbered => {
-                        ui.horizontal_top(|ui| {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(number).color(pal.muted));
-                            ui.add_space(4.0);
-                            ui.vertical(|ui| {
-                                rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal)
-                            });
-                        });
-                    }
-                    _ => rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal),
-                };
                 if quoted {
                     let r = ui.horizontal_top(|ui| {
                         ui.add_space(12.0);
-                        ui.vertical(|ui| draw(ui, cx, &mut reveal));
+                        ui.vertical(|ui| {
+                            draw_line(
+                                ui,
+                                cx,
+                                kind,
+                                number,
+                                text,
+                                mentions,
+                                jumbo,
+                                revealed,
+                                &mut reveal,
+                            )
+                        });
                     });
                     let rr = r.response.rect;
                     ui.painter().rect_filled(
@@ -197,13 +185,58 @@ pub fn rich_text(
                         pal.faint.gamma_multiply(0.7),
                     );
                 } else {
-                    draw(ui, cx, &mut reveal);
+                    draw_line(
+                        ui,
+                        cx,
+                        kind,
+                        number,
+                        text,
+                        mentions,
+                        jumbo,
+                        revealed,
+                        &mut reveal,
+                    );
                 }
             }
         }
     }
     if reveal {
         ui.data_mut(|d| d.insert_temp(spoiler_id, true));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    ui: &mut egui::Ui,
+    cx: &mut MsgCtx<'_>,
+    kind: LineKind,
+    number: &str,
+    text: &str,
+    mentions: &[(u64, String)],
+    jumbo: bool,
+    revealed: bool,
+    reveal: &mut bool,
+) {
+    let pal = cx.pal;
+    match kind {
+        LineKind::Bullet(indent) => {
+            ui.horizontal_top(|ui| {
+                ui.add_space(4.0 + indent as f32 * 18.0);
+                let dot = if indent == 0 { "•" } else { "◦" };
+                ui.label(RichText::new(dot).color(pal.muted));
+                ui.add_space(4.0);
+                ui.vertical(|ui| rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal));
+            });
+        }
+        LineKind::Numbered => {
+            ui.horizontal_top(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new(number).color(pal.muted));
+                ui.add_space(4.0);
+                ui.vertical(|ui| rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal));
+            });
+        }
+        _ => rich_line(ui, cx, text, kind, mentions, jumbo, revealed, reveal),
     }
 }
 

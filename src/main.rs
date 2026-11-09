@@ -3568,6 +3568,19 @@ impl App {
                             &mut self.settings.show_ram,
                             "Показывать потребление ОЗУ в заголовке",
                         );
+                        section(ui, &pal, "Уведомления");
+                        ui.checkbox(
+                            &mut self.settings.notifications,
+                            "Уведомления на рабочем столе о личных сообщениях и упоминаниях",
+                        );
+                        ui.label(
+                            RichText::new(
+                                "В статусе «Не беспокоить» уведомления не показываются. \
+                                 Горячие клавиши: Ctrl+K — быстрый переход, Ctrl+F — поиск.",
+                            )
+                            .small()
+                            .color(pal.faint),
+                        );
                         ui.label(
                             RichText::new(format!(
                                 "Сейчас: ОЗУ {:.0} МБ · картинок {images} (кадров {frames})",
