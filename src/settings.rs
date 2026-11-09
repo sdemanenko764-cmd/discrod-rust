@@ -39,6 +39,9 @@ pub struct Settings {
     pub stream_monitor: usize,
     pub stream_height: u32,
     pub stream_fps: u32,
+    pub notifications: bool,
+    pub status: String,
+    pub custom_status: String,
 }
 
 impl Default for Settings {
@@ -63,6 +66,9 @@ impl Default for Settings {
             stream_monitor: 0,
             stream_height: 720,
             stream_fps: 30,
+            notifications: true,
+            status: "online".into(),
+            custom_status: String::new(),
         }
     }
 }

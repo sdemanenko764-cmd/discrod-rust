@@ -74,6 +74,23 @@ pub fn install(ctx: &egui::Context) {
         }
         list.extend(fallback.iter().cloned());
     }
+    // Жирное начертание для **текста** и заголовков: Segoe UI Bold, а если его нет —
+    // обычный шрифт (семейство должно существовать всегда, иначе egui упадёт).
+    let mut bold = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for file in ["segoeuib.ttf", "seguisb.ttf"] {
+        if let Some(bytes) = map_font(&dir.join(file), 0) {
+            fonts
+                .font_data
+                .insert("segoe-bold".into(), FontData::from_static(bytes));
+            bold.insert(0, "segoe-bold".into());
+            break;
+        }
+    }
+    fonts.families.insert(FontFamily::Name("bold".into()), bold);
     if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
         list.extend(primary.iter().cloned());
         list.extend(fallback.iter().cloned());

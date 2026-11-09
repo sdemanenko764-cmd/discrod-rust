@@ -128,6 +128,32 @@ pub struct Guild {
     /// id роли -> (название, цвет)
     pub roles: HashMap<String, (String, u32)>,
     pub channels: Vec<Channel>,
+    /// Свои эмодзи сервера.
+    pub emojis: Vec<Emoji>,
+}
+
+/// Друг, заявка или заблокированный (тип: 1 — друг, 2 — блок, 3 — входящая, 4 — исходящая).
+#[derive(Clone, Debug)]
+pub struct Friend {
+    pub id: u64,
+    pub kind: u8,
+    pub name: String,
+    pub username: String,
+    pub avatar: Option<String>,
+}
+
+/// Что запросили через универсальный REST-запрос — по этому интерфейс понимает ответ.
+#[derive(Clone, Debug)]
+pub enum ApiTag {
+    Profile(u64),
+    Pins(u64),
+    Search,
+    Threads(u64),
+    OpenDm,
+    Invite,
+    /// Показать этот текст, когда запрос удался.
+    Done(String),
+    Silent,
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +312,13 @@ pub struct Msg {
     pub embeds: Vec<Embed>,
     pub reply: Option<Reply>,
     pub reactions: Vec<Reaction>,
+    /// Упомянутые пользователи: (id, имя).
+    pub mentions: Vec<(u64, String)>,
+    pub mention_everyone: bool,
+    pub mention_roles: Vec<u64>,
+    pub pinned: bool,
+    /// Ветка, созданная из сообщения: (id, название, сообщений).
+    pub thread: Option<(u64, String, u32)>,
 }
 
 /// Один кадр картинки (у статичной — один, у GIF — много).
@@ -302,6 +335,18 @@ pub enum Status {
 }
 
 pub enum Cmd {
+    /// Универсальный REST-запрос; ответ придёт как `Event::Api`.
+    Api {
+        method: &'static str,
+        path: String,
+        body: Option<serde_json::Value>,
+        tag: ApiTag,
+    },
+    /// Сменить свой статус: online / idle / dnd / invisible и свой текст.
+    SetPresence {
+        status: String,
+        custom: String,
+    },
     JoinVoice {
         guild_id: Option<u64>,
         channel_id: u64,
@@ -374,6 +419,23 @@ pub enum Event {
         avatar: Option<String>,
         guilds: Vec<Guild>,
         dms: Vec<Dm>,
+        presences: Vec<(u64, String)>,
+        friends: Vec<Friend>,
+        /// статус и свой текст из настроек аккаунта
+        status: Option<String>,
+        custom_status: Option<String>,
+    },
+    Presence {
+        user_id: u64,
+        status: String,
+    },
+    Relationship {
+        friend: Option<Friend>,
+        removed: Option<u64>,
+    },
+    Api {
+        tag: ApiTag,
+        result: Result<String, String>,
     },
     GuildCreate(Guild),
     GuildDelete(u64),
@@ -520,6 +582,8 @@ struct RawChannel {
     recipient_ids: Vec<String>,
     #[serde(default)]
     last_message_id: Option<String>,
+    #[serde(default)]
+    message_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +699,10 @@ struct RawGuild {
     properties: Option<RawGuildProps>,
     #[serde(default, deserialize_with = "lenient_vec")]
     channels: Vec<RawChannel>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    threads: Vec<RawChannel>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    emojis: Vec<RawEmoji>,
     #[serde(default)]
     unavailable: Option<bool>,
 }
@@ -648,6 +716,92 @@ struct RawReady {
     private_channels: Vec<RawChannel>,
     #[serde(default, deserialize_with = "lenient_vec")]
     users: Vec<RawUser>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    relationships: Vec<RawRelationship>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    presences: Vec<RawPresenceUpdate>,
+    #[serde(default)]
+    user_settings: Option<RawUserSettings>,
+}
+
+#[derive(Deserialize)]
+struct RawRelationship {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default)]
+    kind: u8,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    nickname: Option<String>,
+}
+
+impl RawRelationship {
+    fn convert(self, users: &HashMap<String, (String, Option<String>)>) -> Friend {
+        let (name, username, avatar) = match &self.user {
+            Some(u) => (u.display(), u.username.clone(), u.avatar.clone()),
+            None => match users.get(&self.id) {
+                Some((n, a)) => (n.clone(), n.clone(), a.clone()),
+                None => ("Неизвестный".into(), String::new(), None),
+            },
+        };
+        Friend {
+            id: sid(&self.id),
+            kind: self.kind,
+            name: self.nickname.filter(|n| !n.is_empty()).unwrap_or(name),
+            username,
+            avatar,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawIdOnly {
+    #[serde(default)]
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RawPresenceUpdate {
+    #[serde(default)]
+    user: Option<RawIdOnly>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    status: String,
+}
+
+impl RawPresenceUpdate {
+    fn convert(&self) -> Option<(u64, String)> {
+        let id = self
+            .user
+            .as_ref()
+            .map(|u| u.id.clone())
+            .or_else(|| self.user_id.clone())?;
+        Some((sid(&id), self.status.clone()))
+    }
+}
+
+#[derive(Deserialize)]
+struct RawCustomStatus {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawUserSettings {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    custom_status: Option<RawCustomStatus>,
+}
+
+#[derive(Deserialize)]
+struct RawThreadList {
+    #[serde(default)]
+    guild_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    threads: Vec<RawChannel>,
 }
 
 /// Список, в котором неподходящие элементы молча пропускаются, а не ломают весь разбор.
@@ -909,6 +1063,14 @@ struct RawMessage {
     reactions: Vec<RawReaction>,
     #[serde(rename = "type", default)]
     kind: u8,
+    #[serde(default)]
+    mention_everyone: bool,
+    #[serde(default)]
+    mention_roles: Vec<String>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    thread: Option<RawChannel>,
 }
 
 #[derive(Deserialize)]
@@ -1086,12 +1248,13 @@ fn convert_embed(e: RawEmbed) -> Embed {
 }
 
 fn convert_msg(m: RawMessage) -> Msg {
-    let names: HashMap<String, String> = m
+    let mentions: Vec<(u64, String)> = m
         .mentions
         .iter()
-        .map(|u| (u.id.clone(), u.display()))
+        .map(|u| (sid(&u.id), u.display()))
         .collect();
-    let mut content = render_markup(&m.content, &names, true);
+    // Разметку (упоминания, время, **жирный**…) рисует интерфейс — текст храним как есть.
+    let mut content = m.content.clone();
     let mut system = false;
     if content.is_empty()
         && m.attachments.is_empty()
@@ -1190,6 +1353,17 @@ fn convert_msg(m: RawMessage) -> Msg {
                 me: r.me,
             })
             .collect(),
+        mentions,
+        mention_everyone: m.mention_everyone,
+        mention_roles: m.mention_roles.iter().map(|r| sid(r)).collect(),
+        pinned: m.pinned,
+        thread: m.thread.as_ref().map(|t| {
+            (
+                sid(&t.id),
+                t.name.clone().unwrap_or_default(),
+                t.message_count.unwrap_or(0),
+            )
+        }),
     }
 }
 
@@ -1228,7 +1402,18 @@ fn convert_guild(g: RawGuild) -> Guild {
             .iter()
             .filter_map(RawVoiceState::member)
             .collect(),
-        channels: g.channels.iter().map(convert_channel).collect(),
+        channels: g
+            .channels
+            .iter()
+            .chain(g.threads.iter())
+            .map(convert_channel)
+            .collect(),
+        emojis: g
+            .emojis
+            .iter()
+            .map(RawEmoji::convert)
+            .filter(|e| e.id.is_some())
+            .collect(),
     }
 }
 
@@ -1341,6 +1526,52 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
             }
         };
         match cmd {
+            Cmd::Api {
+                method,
+                path,
+                body,
+                tag,
+            } => {
+                let Some(a) = auth.clone() else { continue };
+                let (http, sink) = (http.clone(), sink.clone());
+                tokio::spawn(async move {
+                    let result = api_call(&http, &a, method, &path, body).await;
+                    sink.send(Event::Api { tag, result });
+                });
+            }
+            Cmd::SetPresence { status, custom } => {
+                let activities = if custom.trim().is_empty() {
+                    json!([])
+                } else {
+                    json!([{ "type": 4, "name": "Custom Status", "state": custom.trim() }])
+                };
+                gw_send(
+                    &gateway_out,
+                    json!({
+                        "op": 3,
+                        "d": { "status": status, "since": 0, "activities": activities, "afk": false }
+                    }),
+                );
+                // запоминаем статус в аккаунте, чтобы он сохранился после перезапуска
+                if let Some(a) = auth.clone().filter(|a| !a.bot) {
+                    let http = http.clone();
+                    tokio::spawn(async move {
+                        let custom_status = if custom.trim().is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            json!({ "text": custom.trim() })
+                        };
+                        let _ = api_call(
+                            &http,
+                            &a,
+                            "PATCH",
+                            "/users/@me/settings",
+                            Some(json!({ "status": status, "custom_status": custom_status })),
+                        )
+                        .await;
+                    });
+                }
+            }
             Cmd::JoinVoice {
                 guild_id,
                 channel_id,
@@ -1463,7 +1694,7 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
                             Ok(r) if r.status().is_success() => sink.send(Event::MessageUpdate {
                                 id: message_id,
                                 channel_id,
-                                content: render_markup(&content, &HashMap::new(), true),
+                                content,
                             }),
                             Ok(r) => sink.send(Event::Error(format!(
                                 "Не изменено: {}",
@@ -1623,7 +1854,107 @@ async fn backend(mut rx: UnboundedReceiver<Cmd>, sink: Sink) {
 
 // ======================= REST =======================
 
-fn percent_encode(s: &str) -> String {
+/// Универсальный запрос к REST API: тело ответа строкой или понятная ошибка.
+async fn api_call(
+    http: &reqwest::Client,
+    auth: &Auth,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let url = format!("{API}{path}");
+    let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let mut req = http.request(m, url).header("Authorization", auth.header());
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let r = req
+        .send()
+        .await
+        .map_err(|e| format!("ошибка соединения: {e}"))?;
+    let status = r.status();
+    let text = r.text().await.unwrap_or_default();
+    if status.is_success() {
+        if status.as_u16() == 202 {
+            return Err("Discord ещё готовит результаты — попробуйте через пару секунд".into());
+        }
+        return Ok(text);
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if v.get("captcha_key").is_some() || v.get("captcha_sitekey").is_some() {
+        return Err(
+            "Discord требует капчу для этого действия — сделайте его один раз в официальном клиенте или браузере"
+                .into(),
+        );
+    }
+    match v.get("message").and_then(|m| m.as_str()) {
+        Some(msg) => Err(format!("{} ({msg})", http_error(status))),
+        None => Err(http_error(status)),
+    }
+}
+
+/// Сообщения из ответа REST (массив).
+pub fn parse_messages(body: &str) -> Vec<Msg> {
+    #[derive(Deserialize)]
+    struct Wrap(#[serde(deserialize_with = "lenient_vec")] Vec<RawMessage>);
+    serde_json::from_str::<Wrap>(body)
+        .map(|w| w.0.into_iter().map(convert_msg).collect())
+        .unwrap_or_default()
+}
+
+/// Результаты поиска: (всего найдено, сообщения).
+pub fn parse_search(body: &str) -> (u64, Vec<Msg>) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let total = v["total_results"].as_u64().unwrap_or(0);
+    let mut out = Vec::new();
+    if let Some(groups) = v["messages"].as_array() {
+        for g in groups {
+            let hit = g
+                .as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|m| m["hit"].as_bool() == Some(true))
+                        .or(a.first())
+                })
+                .cloned();
+            if let Some(m) = hit.and_then(|m| serde_json::from_value::<RawMessage>(m).ok()) {
+                out.push(convert_msg(m));
+            }
+        }
+    }
+    (total, out)
+}
+
+/// Ветки из ответа поиска веток: (id сервера, ветка, сообщений).
+pub fn parse_threads(body: &str) -> Vec<(u64, Channel, u32)> {
+    #[derive(Deserialize)]
+    struct Wrap {
+        #[serde(default, deserialize_with = "lenient_vec")]
+        threads: Vec<RawChannel>,
+    }
+    serde_json::from_str::<Wrap>(body)
+        .map(|w| {
+            w.threads
+                .iter()
+                .map(|t| {
+                    (
+                        t.guild_id.as_deref().map(sid).unwrap_or(0),
+                        convert_channel(t),
+                        t.message_count.unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Личный диалог из ответа REST (POST /users/@me/channels).
+pub fn parse_dm(body: &str) -> Option<Dm> {
+    let c: RawChannel = serde_json::from_str(body).ok()?;
+    Some(convert_dm(&c, &HashMap::new()))
+}
+
+pub fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
@@ -2110,12 +2441,30 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 .filter(|g| g.unavailable != Some(true) || !g.channels.is_empty())
                 .map(convert_guild)
                 .collect();
+            let presences = r
+                .presences
+                .iter()
+                .filter_map(RawPresenceUpdate::convert)
+                .collect();
+            let friends = r
+                .relationships
+                .into_iter()
+                .map(|x| x.convert(&users))
+                .collect();
+            let (status, custom_status) = match r.user_settings {
+                Some(us) => (us.status, us.custom_status.and_then(|c| c.text)),
+                None => (None, None),
+            };
             sink.send(Event::Ready {
                 user_id: sid(&r.user.id),
                 username: r.user.display(),
                 avatar: r.user.avatar.clone(),
                 guilds,
                 dms,
+                presences,
+                friends,
+                status,
+                custom_status,
             });
         }
         "GUILD_CREATE" => {
@@ -2143,7 +2492,47 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 None => {}
             }
         }
-        "CHANNEL_DELETE" => {
+        "THREAD_CREATE" | "THREAD_UPDATE" => {
+            let c: RawChannel = serde_json::from_str(d)?;
+            if let Some(g) = c.guild_id.as_deref() {
+                sink.send(Event::GuildChannel {
+                    guild_id: sid(g),
+                    channel: convert_channel(&c),
+                });
+            }
+        }
+        "THREAD_LIST_SYNC" => {
+            let l: RawThreadList = serde_json::from_str(d)?;
+            if let Some(g) = l.guild_id.as_deref().map(sid) {
+                for c in &l.threads {
+                    sink.send(Event::GuildChannel {
+                        guild_id: g,
+                        channel: convert_channel(c),
+                    });
+                }
+            }
+        }
+        "PRESENCE_UPDATE" => {
+            let p: RawPresenceUpdate = serde_json::from_str(d)?;
+            if let Some((user_id, status)) = p.convert() {
+                sink.send(Event::Presence { user_id, status });
+            }
+        }
+        "RELATIONSHIP_ADD" => {
+            let r: RawRelationship = serde_json::from_str(d)?;
+            sink.send(Event::Relationship {
+                friend: Some(r.convert(&HashMap::new())),
+                removed: None,
+            });
+        }
+        "RELATIONSHIP_REMOVE" => {
+            let r: RawRelationship = serde_json::from_str(d)?;
+            sink.send(Event::Relationship {
+                friend: None,
+                removed: Some(sid(&r.id)),
+            });
+        }
+        "CHANNEL_DELETE" | "THREAD_DELETE" => {
             let c: RawChannel = serde_json::from_str(d)?;
             sink.send(Event::ChannelDelete {
                 guild_id: c.guild_id.as_deref().map(sid),
@@ -2160,7 +2549,7 @@ fn handle_dispatch(t: &str, d: &str, sink: &Sink) -> serde_json::Result<()> {
                 sink.send(Event::MessageUpdate {
                     id: sid(&m.id),
                     channel_id: sid(&m.channel_id),
-                    content: render_markup(&content, &HashMap::new(), true),
+                    content,
                 });
             }
         }

@@ -15,7 +15,9 @@
 mod audio;
 mod discord;
 mod emoji;
+mod extra;
 mod fonts;
+mod markdown;
 mod media;
 mod net;
 mod settings;
@@ -157,6 +159,35 @@ enum Action {
     OpenUrl(String),
     OpenSettings,
     Logout,
+    // --- профили, статусы, друзья, серверы ---
+    OpenProfile(u64),
+    MessageUser(u64),
+    OpenStatusMenu,
+    SetStatus(String),
+    OpenFriends,
+    FriendAdd(String),
+    FriendAccept(u64),
+    FriendRequest(u64),
+    FriendRemove(u64),
+    FriendBlock(u64),
+    CopyId(u64),
+    GuildMenu(u64, egui::Pos2),
+    AskLeave(u64),
+    LeaveGuild(u64),
+    CopyInvite(u64),
+    OpenServerDialog,
+    JoinInvite(String),
+    CreateGuild(String),
+    // --- сообщения и каналы ---
+    MessageMenu(u64, Box<Msg>, egui::Pos2),
+    Pin(u64, u64, bool),
+    OpenPins(u64),
+    OpenSearch,
+    RunSearch(String),
+    OpenThreads(u64),
+    OpenThread(Option<u64>, Channel),
+    Jump(Option<u64>, u64),
+    OpenSwitcher,
 }
 
 struct App {
@@ -224,6 +255,34 @@ struct App {
     stream_tex: Option<egui::TextureHandle>,
     stream_picker: bool,
     monitors: Vec<(String, u32, u32)>,
+
+    // профили, статусы, друзья
+    /// имена пользователей, которых мы уже видели (для упоминаний)
+    users: HashMap<u64, String>,
+    presence: HashMap<u64, String>,
+    friends: Vec<discord::Friend>,
+    /// канал -> сколько раз нас упомянули (или личных сообщений) с последнего просмотра
+    mentions: HashMap<u64, u32>,
+    my_status: String,
+    status_menu: bool,
+    profile: Option<extra::ProfileView>,
+    friends_open: bool,
+    friends_tab: u8,
+    friend_input: String,
+    // окна
+    msg_menu: Option<(u64, Msg, egui::Pos2)>,
+    guild_menu: Option<(u64, egui::Pos2)>,
+    confirm_leave: Option<u64>,
+    server_dialog: Option<(u8, String)>,
+    pins: Option<(u64, Option<Result<Vec<Msg>, String>>)>,
+    search: Option<extra::SearchView>,
+    threads: Option<(u64, Option<Result<Vec<(u64, Channel, u32)>, String>>)>,
+    switcher: Option<(String, usize)>,
+    complete_sel: usize,
+    last_title: String,
+    window_focused: bool,
+    attention: bool,
+    menu_frame: u64,
 
     // служебное
     toast: Option<(String, Instant, bool)>,
@@ -296,6 +355,29 @@ impl App {
             stream_tex: None,
             stream_picker: false,
             monitors: Vec::new(),
+            users: HashMap::new(),
+            presence: HashMap::new(),
+            friends: Vec::new(),
+            mentions: HashMap::new(),
+            my_status: "online".into(),
+            status_menu: false,
+            profile: None,
+            friends_open: true,
+            friends_tab: 0,
+            friend_input: String::new(),
+            msg_menu: None,
+            guild_menu: None,
+            confirm_leave: None,
+            server_dialog: None,
+            pins: None,
+            search: None,
+            threads: None,
+            switcher: None,
+            complete_sel: 0,
+            last_title: String::new(),
+            window_focused: true,
+            attention: false,
+            menu_frame: 0,
             toast: None,
             mem_mb: 0.0,
             mem_checked: Instant::now() - Duration::from_secs(10),
@@ -412,6 +494,8 @@ impl App {
         }
         self.last_channel.insert(self.sel_guild, id);
         self.unread.remove(&id);
+        self.mentions.remove(&id);
+        self.friends_open = false;
         self.lru.retain(|x| *x != id);
         self.lru.push_back(id);
         while self.lru.len() > self.settings.cached_channels {
@@ -477,7 +561,32 @@ impl App {
                 avatar,
                 guilds,
                 dms,
+                presences,
+                friends,
+                status,
+                custom_status,
             } => {
+                self.presence = presences.into_iter().collect();
+                for f in &friends {
+                    self.users.insert(f.id, f.name.clone());
+                }
+                for d in &dms {
+                    for (id, name, _) in &d.recipients {
+                        self.users.insert(*id, name.clone());
+                    }
+                }
+                self.friends = friends;
+                if let Some(st) = status.filter(|s| !s.is_empty()) {
+                    self.settings.status = st;
+                }
+                if let Some(c) = custom_status {
+                    self.settings.custom_status = c;
+                }
+                self.my_status = self.settings.status.clone();
+                let _ = self.cmd.send(Cmd::SetPresence {
+                    status: self.settings.status.clone(),
+                    custom: self.settings.custom_status.clone(),
+                });
                 self.status = Status::Online;
                 self.me_id = user_id;
                 self.me_name = username;
@@ -818,6 +927,31 @@ impl App {
                     }
                 }
             }
+            Event::Presence { user_id, status } => {
+                self.presence.insert(user_id, status);
+            }
+            Event::Relationship { friend, removed } => {
+                if let Some(id) = removed {
+                    self.friends.retain(|f| f.id != id);
+                }
+                if let Some(f) = friend {
+                    let mut f = f;
+                    if f.name == "Неизвестный" {
+                        if let Some(n) = self.users.get(&f.id) {
+                            f.name = n.clone();
+                        }
+                    }
+                    if f.kind == 3 {
+                        self.toast(format!("{} хочет добавить вас в друзья", f.name), false);
+                    }
+                    self.users.insert(f.id, f.name.clone());
+                    match self.friends.iter_mut().find(|x| x.id == f.id) {
+                        Some(x) => *x = f,
+                        None => self.friends.push(f),
+                    }
+                }
+            }
+            Event::Api { tag, result } => self.on_api(ctx, tag, result),
             Event::Info(t) => self.toast(t, false),
             Event::Error(e) => self.toast(e, true),
             Event::Fatal(e) => self.logout(Some(e)),
@@ -847,9 +981,14 @@ impl App {
                 None => {}
             }
         }
+        self.users.insert(m.author_id, m.author.clone());
+        for (id, name) in &m.mentions {
+            self.users.insert(*id, name.clone());
+        }
         if m.author_id != self.me_id && self.sel_channel != Some(cid) {
             self.unread.insert(cid, m.guild_id.unwrap_or(0));
         }
+        self.notify_message(&m);
         let limit = self.settings.messages_per_channel;
         if let Some(c) = self.cache.get_mut(&cid) {
             if c.msgs.iter().rev().take(30).any(|x| x.id == m.id) {
@@ -1057,6 +1196,17 @@ impl App {
         let pal = self.pal;
         let mut actions: Vec<Action> = Vec::new();
         let unread_guilds: HashSet<u64> = self.unread.values().copied().collect();
+        // упоминания по серверам (0 — личные сообщения)
+        let mut guild_mentions: HashMap<u64, u32> = HashMap::new();
+        for (cid, n) in &self.mentions {
+            let g = self
+                .guilds
+                .iter()
+                .find(|g| g.channels.iter().any(|c| c.id == *cid))
+                .map(|g| g.id)
+                .unwrap_or(0);
+            *guild_mentions.entry(g).or_default() += n;
+        }
         let title = self.channel_title();
         let load_avatars = self.settings.load_avatars;
 
@@ -1078,6 +1228,9 @@ impl App {
                             unread_guilds.contains(&0),
                         )
                         .on_hover_text("Личные сообщения");
+                        if let Some(n) = guild_mentions.get(&0) {
+                            extra::badge(ui, home.rect.center() + vec2(18.0, 16.0), *n, pal.rail);
+                        }
                         if home.clicked() {
                             actions.push(Action::SelectGuild(None));
                         }
@@ -1105,9 +1258,44 @@ impl App {
                                 unread_guilds.contains(&g.id),
                             )
                             .on_hover_text(g.name.as_str());
+                            if let Some(n) = guild_mentions.get(&g.id) {
+                                extra::badge(
+                                    ui,
+                                    resp.rect.center() + vec2(18.0, 16.0),
+                                    *n,
+                                    pal.rail,
+                                );
+                            }
+                            if resp.secondary_clicked() {
+                                let pos =
+                                    resp.interact_pointer_pos().unwrap_or(resp.rect.right_top());
+                                actions.push(Action::GuildMenu(g.id, pos));
+                            }
                             if resp.clicked() {
                                 actions.push(Action::SelectGuild(Some(g.id)));
                             }
+                        }
+                        // добавить сервер
+                        let (rect, resp) = ui.allocate_exact_size(vec2(76.0, 54.0), Sense::click());
+                        let h = ui
+                            .ctx()
+                            .animate_bool_with_time(resp.id, resp.hovered(), 0.15);
+                        let r = 24.0 - 8.0 * h;
+                        let c = Rect::from_center_size(rect.center(), vec2(48.0, 48.0));
+                        ui.painter().rect_filled(c, r, mix(pal.elevated, pal.ok, h));
+                        ui.painter().text(
+                            c.center(),
+                            Align2::CENTER_CENTER,
+                            "+",
+                            FontId::proportional(26.0),
+                            mix(pal.ok, Color32::WHITE, h),
+                        );
+                        if resp
+                            .on_hover_text("Добавить сервер: присоединиться или создать")
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            actions.push(Action::OpenServerDialog);
                         }
                     });
             });
@@ -1153,8 +1341,15 @@ impl App {
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+                            let (rect, me_resp) =
+                                ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                            if me_resp
+                                .on_hover_text("Сменить статус")
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                actions.push(Action::OpenStatusMenu);
+                            }
                             let tex = match (&self.me_avatar, load_avatars) {
                                 (Some(h), true) => {
                                     let url = discord::avatar_url(self.me_id, h);
@@ -1163,20 +1358,27 @@ impl App {
                                 _ => None,
                             };
                             paint_avatar(ui, rect, tex, self.me_id, &self.me_name);
-                            let dot = match self.status {
-                                Status::Online => pal.ok,
-                                _ => pal.warn,
-                            };
-                            ui.painter().circle_filled(
-                                rect.right_bottom() - vec2(4.0, 4.0),
-                                6.0,
-                                pal.rail,
-                            );
-                            ui.painter().circle_filled(
-                                rect.right_bottom() - vec2(4.0, 4.0),
-                                4.5,
-                                dot,
-                            );
+                            if self.status == Status::Online {
+                                extra::presence_dot(
+                                    ui,
+                                    &pal,
+                                    rect.right_bottom() - vec2(4.0, 4.0),
+                                    4.5,
+                                    &self.my_status,
+                                    pal.rail,
+                                );
+                            } else {
+                                ui.painter().circle_filled(
+                                    rect.right_bottom() - vec2(4.0, 4.0),
+                                    6.0,
+                                    pal.rail,
+                                );
+                                ui.painter().circle_filled(
+                                    rect.right_bottom() - vec2(4.0, 4.0),
+                                    4.5,
+                                    pal.warn,
+                                );
+                            }
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.add(
@@ -1186,11 +1388,23 @@ impl App {
                                     .truncate(),
                                 );
                                 let status = match self.status {
-                                    Status::Online => "в сети",
-                                    Status::Connecting => "подключение…",
-                                    Status::Reconnecting => "переподключение…",
+                                    Status::Online if !self.settings.custom_status.is_empty() => {
+                                        self.settings.custom_status.clone()
+                                    }
+                                    Status::Online => {
+                                        extra::presence_text(&self.my_status).to_lowercase()
+                                    }
+                                    Status::Connecting => "подключение…".into(),
+                                    Status::Reconnecting => "переподключение…".into(),
                                 };
-                                ui.label(RichText::new(status).small().color(pal.muted));
+                                let sr = ui.add(
+                                    egui::Label::new(RichText::new(status).small().color(pal.muted))
+                                        .truncate()
+                                        .sense(Sense::click()),
+                                );
+                                if sr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    actions.push(Action::OpenStatusMenu);
+                                }
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if icon_button(ui, &pal, "⚙", "Настройки").clicked() {
@@ -1363,10 +1577,16 @@ impl App {
                                                         }
                                                     }
                                                     let unread = self.unread.contains_key(&c.id);
-                                                    let (glyph, enabled) = if is_text(c.kind) {
+                                                    let thread = extra::is_thread(c.kind);
+                                                    let forum = matches!(c.kind, 15 | 16);
+                                                    let (glyph, enabled) = if thread {
+                                                        ("    ↳", true)
+                                                    } else if is_text(c.kind) {
                                                         (if c.kind == 5 { "📢" } else { "#" }, true)
                                                     } else if is_voice(c.kind) {
                                                         ("🔊", true)
+                                                    } else if forum {
+                                                        ("💬", true)
                                                     } else {
                                                         ("💬", false)
                                                     };
@@ -1378,8 +1598,17 @@ impl App {
                                                         enabled,
                                                         Leading::Glyph(glyph),
                                                         &c.name,
-                                                        32.0,
+                                                        if thread { 28.0 } else { 32.0 },
                                                     );
+                                                    if let Some(n) = self.mentions.get(&c.id) {
+                                                        extra::badge(
+                                                            ui,
+                                                            resp.rect.right_center()
+                                                                - vec2(18.0, 0.0),
+                                                            *n,
+                                                            pal.side,
+                                                        );
+                                                    }
                                                     let in_this = self
                                                         .voice
                                                         .as_ref()
@@ -1443,11 +1672,13 @@ impl App {
                                                                 );
                                                             }
                                                         }
+                                                    } else if forum && resp.clicked() {
+                                                        actions.push(Action::OpenThreads(c.id));
                                                     } else if enabled && resp.clicked() {
                                                         actions.push(Action::OpenChannel(c.id));
                                                     } else if !enabled {
                                                         resp.on_hover_text(
-                                                            "Форумы пока не поддерживаются",
+                                                            "Этот тип канала пока не поддерживается",
                                                         );
                                                     }
                                                 }
@@ -1455,6 +1686,37 @@ impl App {
                                         }
                                     }
                                     None => {
+                                        let fresp = nav_row(
+                                            ui,
+                                            &pal,
+                                            self.sel_channel.is_none() && self.friends_open,
+                                            false,
+                                            true,
+                                            Leading::Glyph("👥"),
+                                            "Друзья",
+                                            40.0,
+                                        );
+                                        let pending =
+                                            self.friends.iter().filter(|f| f.kind == 3).count();
+                                        if pending > 0 {
+                                            extra::badge(
+                                                ui,
+                                                fresp.rect.right_center() - vec2(18.0, 0.0),
+                                                pending as u32,
+                                                pal.side,
+                                            );
+                                        }
+                                        if fresp.clicked() {
+                                            actions.push(Action::OpenFriends);
+                                        }
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new("  ЛИЧНЫЕ СООБЩЕНИЯ")
+                                                .size(11.5)
+                                                .strong()
+                                                .color(pal.faint),
+                                        );
+                                        ui.add_space(2.0);
                                         if self.dms.is_empty() {
                                             ui.add_space(12.0);
                                             ui.label(
@@ -1494,6 +1756,31 @@ impl App {
                                                 &d.name,
                                                 42.0,
                                             );
+                                            if let Some((uid, _)) = &d.avatar {
+                                                if let Some(st) = self.presence.get(uid) {
+                                                    if st != "offline" {
+                                                        extra::presence_dot(
+                                                            ui,
+                                                            &pal,
+                                                            pos2(
+                                                                resp.rect.left() + 36.0,
+                                                                resp.rect.center().y + 11.0,
+                                                            ),
+                                                            4.5,
+                                                            st,
+                                                            pal.side,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if let Some(n) = self.mentions.get(&d.id) {
+                                                extra::badge(
+                                                    ui,
+                                                    resp.rect.right_center() - vec2(18.0, 0.0),
+                                                    *n,
+                                                    pal.side,
+                                                );
+                                            }
                                             if resp.clicked() {
                                                 actions.push(Action::OpenChannel(d.id));
                                             }
@@ -1578,6 +1865,39 @@ impl App {
                                 actions.push(Action::ToggleMembers);
                             }
                         }
+                        if let Some(cid) = self.sel_channel {
+                            if icon_button(ui, &pal, "🔍", "Поиск (Ctrl+F)").clicked() {
+                                actions.push(Action::OpenSearch);
+                            }
+                            if icon_button(ui, &pal, "📌", "Закреплённые сообщения").clicked()
+                            {
+                                actions.push(Action::OpenPins(cid));
+                            }
+                            let kind = self
+                                .sel_guild
+                                .and_then(|g| self.guilds.iter().find(|x| x.id == g))
+                                .and_then(|g| g.channels.iter().find(|c| c.id == cid))
+                                .map(|c| (c.kind, c.parent));
+                            match kind {
+                                Some((0 | 5, _)) => {
+                                    if icon_button(ui, &pal, "🧵", "Ветки").clicked() {
+                                        actions.push(Action::OpenThreads(cid));
+                                    }
+                                }
+                                Some((10..=12, Some(parent))) => {
+                                    if icon_button(ui, &pal, "↰", "К родительскому каналу")
+                                        .clicked()
+                                    {
+                                        actions.push(Action::Jump(self.sel_guild, parent));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if self.sel_guild.is_some() {
+                            if icon_button(ui, &pal, "🔍", "Поиск (Ctrl+F)").clicked() {
+                                actions.push(Action::OpenSearch);
+                            }
+                        }
                         if self.settings.show_ram {
                             chip(ui, &pal, &format!("ОЗУ {:.0} МБ", self.mem_mb), pal.muted);
                         }
@@ -1654,8 +1974,17 @@ impl App {
                                         _ => None,
                                     };
                                     let status = if in_call.contains(id) { "online" } else { "" };
+                                    let presence = self.presence.get(id).map(String::as_str);
+                                    let status = if in_call.contains(id) {
+                                        "online"
+                                    } else {
+                                        presence.unwrap_or("")
+                                    };
                                     let resp =
                                         member_row(ui, &pal, tex, *id, name, status, None, false);
+                                    if resp.clicked() {
+                                        actions.push(Action::OpenProfile(*id));
+                                    }
                                     if in_call.contains(id) {
                                         resp.on_hover_text("В звонке");
                                     }
@@ -1743,7 +2072,10 @@ impl App {
                                             group_color,
                                             offline,
                                         );
-                                        resp.on_hover_text(name.as_str());
+                                        if resp.clicked() {
+                                            actions.push(Action::OpenProfile(*id));
+                                        }
+                                        resp.on_hover_cursor(CursorIcon::PointingHand);
                                     }
                                 }
                             }
@@ -1754,6 +2086,11 @@ impl App {
         // --- поле ввода ---
         if let (Some(cid), Some((icon, name))) = (self.sel_channel, &title) {
             let typing_text = typing_line(self.typing.get(&cid));
+            let (comp_start, comps) = self.completions(cid);
+            if self.complete_sel >= comps.len() {
+                self.complete_sel = 0;
+            }
+            let mut comp_accept: Option<usize> = None;
             egui::TopBottomPanel::bottom("composer")
                 .frame(
                     card(
@@ -1829,14 +2166,35 @@ impl App {
                                     format!("Написать {icon}{name}")
                                 };
                                 let edit_width = (ui.available_width() - 82.0).max(60.0);
+                                let mut tab = false;
+                                if !comps.is_empty() {
+                                    if ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                                    }) {
+                                        self.complete_sel = (self.complete_sel + 1) % comps.len();
+                                    }
+                                    if ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                                    }) {
+                                        self.complete_sel =
+                                            (self.complete_sel + comps.len() - 1) % comps.len();
+                                    }
+                                    tab = ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                                    });
+                                }
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.draft)
                                         .id(egui::Id::new("composer_input"))
                                         .hint_text(hint)
                                         .frame(false)
+                                        .lock_focus(true)
                                         .desired_width(edit_width)
                                         .vertical_align(Align::Center),
                                 );
+                                if tab {
+                                    comp_accept = Some(self.complete_sel);
+                                }
                                 if resp.changed()
                                     && !self.draft.is_empty()
                                     && self.editing.is_none()
@@ -1854,8 +2212,13 @@ impl App {
                                         actions.push(Action::EditLast(cid));
                                     }
                                 }
-                                let enter = resp.lost_focus()
+                                let mut enter = resp.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if enter && !comps.is_empty() {
+                                    comp_accept = Some(self.complete_sel);
+                                    enter = false;
+                                    resp.request_focus();
+                                }
                                 let emoji_btn = round_button(ui, &pal, "😊", pal.muted, pal.hover)
                                     .on_hover_text("Эмодзи");
                                 if emoji_btn.clicked() {
@@ -1884,7 +2247,48 @@ impl App {
                                 }
                             });
                         });
-                    let _ = frame;
+                    // подсказки @упоминаний, #каналов и :эмодзи: над полем ввода
+                    if !comps.is_empty() {
+                        let fr = frame.response.rect;
+                        let h = comps.len() as f32 * 32.0 + 34.0;
+                        egui::Area::new(egui::Id::new("autocomplete"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(pos2(fr.left(), fr.top() - h - 6.0))
+                            .show(ctx, |ui| {
+                                egui::Frame::none()
+                                    .fill(pal.side)
+                                    .rounding(pal.radius)
+                                    .stroke(Stroke::new(1.0, pal.border))
+                                    .inner_margin(Margin::same(6.0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(fr.width() - 12.0);
+                                        ui.label(
+                                            RichText::new("Tab или Enter — вставить, ↑↓ — выбор")
+                                                .size(11.0)
+                                                .color(pal.faint),
+                                        );
+                                        for (i, (label, _)) in comps.iter().enumerate() {
+                                            let (r, resp) = ui.allocate_exact_size(
+                                                vec2(ui.available_width(), 30.0),
+                                                Sense::click(),
+                                            );
+                                            if i == self.complete_sel || resp.hovered() {
+                                                ui.painter().rect_filled(r, 6.0, pal.hover);
+                                            }
+                                            ui.painter().text(
+                                                r.left_center() + vec2(10.0, 0.0),
+                                                Align2::LEFT_CENTER,
+                                                label,
+                                                FontId::proportional(14.0),
+                                                pal.text,
+                                            );
+                                            if resp.clicked() {
+                                                comp_accept = Some(i);
+                                            }
+                                        }
+                                    });
+                            });
+                    }
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
                     if let Some(t) = typing_text {
@@ -1898,6 +2302,25 @@ impl App {
                         ctx.request_repaint_after(Duration::from_secs(1));
                     }
                 });
+            if let Some(i) = comp_accept {
+                if let Some((_, insert)) = comps.get(i) {
+                    self.draft.truncate(comp_start);
+                    self.draft.push_str(insert);
+                    self.draft.push(' ');
+                    let id = egui::Id::new("composer_input");
+                    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                        let end = self.draft.chars().count();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(end),
+                            )));
+                        state.store(ctx, id);
+                    }
+                    ctx.memory_mut(|m| m.request_focus(id));
+                    self.complete_sel = 0;
+                }
+            }
         }
 
         // --- сцена звонка ---
@@ -1957,7 +2380,20 @@ impl App {
                     draw_stage(ui, &pal, rect, tiles, &stage_state, &mut actions);
                 }
                 let Some(cid) = self.sel_channel else {
-                    if stage.is_none() {
+                    if self.sel_guild.is_none() && stage.is_none() {
+                        extra::friends_view(
+                            ui,
+                            &pal,
+                            &self.friends,
+                            &self.presence,
+                            &mut self.friends_tab,
+                            &mut self.friend_input,
+                            &mut self.media,
+                            &self.cmd,
+                            self.settings.load_avatars,
+                            &mut actions,
+                        );
+                    } else if stage.is_none() {
                         empty_state(ui, &pal, "Выберите канал или диалог слева");
                     }
                     return;
@@ -1981,6 +2417,8 @@ impl App {
                     guild_id,
                     channel_id: cid,
                     toolbar_allowed,
+                    guilds: &self.guilds,
+                    users: &self.users,
                 };
                 let out = ui.push_id(cid, |ui| {
                     egui::ScrollArea::vertical()
@@ -2136,6 +2574,33 @@ impl App {
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::OpenSettings => self.settings_open = true,
             Action::Logout => self.logout(None),
+            a @ (Action::OpenProfile(_)
+            | Action::MessageUser(_)
+            | Action::OpenStatusMenu
+            | Action::SetStatus(_)
+            | Action::OpenFriends
+            | Action::FriendAdd(_)
+            | Action::FriendAccept(_)
+            | Action::FriendRequest(_)
+            | Action::FriendRemove(_)
+            | Action::FriendBlock(_)
+            | Action::CopyId(_)
+            | Action::GuildMenu(..)
+            | Action::AskLeave(_)
+            | Action::LeaveGuild(_)
+            | Action::CopyInvite(_)
+            | Action::OpenServerDialog
+            | Action::JoinInvite(_)
+            | Action::CreateGuild(_)
+            | Action::MessageMenu(..)
+            | Action::Pin(..)
+            | Action::OpenPins(_)
+            | Action::OpenSearch
+            | Action::RunSearch(_)
+            | Action::OpenThreads(_)
+            | Action::OpenThread(..)
+            | Action::Jump(..)
+            | Action::OpenSwitcher) => self.extra_action(ctx, a),
             Action::ToggleMembers => self.members_open = !self.members_open,
             Action::React {
                 channel_id,
@@ -3252,6 +3717,7 @@ impl eframe::App for App {
             Screen::Main => self.main_ui(ctx),
         }
         self.call_ui(ctx);
+        self.extra_ui(ctx);
         self.stream_picker_ui(ctx);
         self.picker_ui(ctx);
         self.delete_ui(ctx);
@@ -3273,6 +3739,8 @@ struct MsgCtx<'a> {
     guild_id: Option<u64>,
     channel_id: u64,
     toolbar_allowed: bool,
+    guilds: &'a [Guild],
+    users: &'a HashMap<u64, String>,
 }
 
 impl MsgCtx<'_> {
@@ -3381,7 +3849,7 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                     );
                 }
             } else {
-                let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+                let (rect, aresp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
                 let tex = match (
                     &m.author_avatar,
                     cx.settings.load_avatars && ui.is_rect_visible(rect),
@@ -3393,6 +3861,9 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                     _ => None,
                 };
                 paint_avatar(ui, rect, tex, m.author_id, &m.author);
+                if aresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    cx.actions.push(Action::OpenProfile(m.author_id));
+                }
             }
         }
         ui.vertical(|ui| {
@@ -3410,12 +3881,22 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             }
             if !grouped {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(m.author.as_str())
-                            .strong()
-                            .color(name_color(m.author_id)),
+                    let nr = ui.add(
+                        egui::Label::new(
+                            RichText::new(m.author.as_str())
+                                .font(FontId::new(15.0, egui::FontFamily::Name("bold".into())))
+                                .color(name_color(m.author_id)),
+                        )
+                        .sense(Sense::click()),
                     );
+                    if nr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        cx.actions.push(Action::OpenProfile(m.author_id));
+                    }
                     ui.label(RichText::new(m.time.as_str()).small().color(pal.faint));
+                    if m.pinned {
+                        ui.label(RichText::new("📌").small().color(pal.faint))
+                            .on_hover_text("Закреплено");
+                    }
                 });
             }
             let hide_text = m.embeds.iter().any(|e| {
@@ -3429,7 +3910,7 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
                         .color(pal.muted),
                 );
             } else if !m.content.is_empty() && !hide_text {
-                text_block(ui, cx, &m.content);
+                text_block(ui, cx, &m.content, &m.mentions);
             }
             if m.edited {
                 ui.label(RichText::new("(изменено)").small().color(pal.faint));
@@ -3451,6 +3932,40 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
             if !m.reactions.is_empty() {
                 reactions_ui(ui, cx, m);
             }
+            if let Some((tid, tname, count)) = &m.thread {
+                let r = egui::Frame::none()
+                    .fill(pal.elevated)
+                    .rounding(8.0)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🧵").color(pal.muted));
+                            ui.label(RichText::new(tname.as_str()).strong().color(pal.text));
+                            if *count > 0 {
+                                ui.label(
+                                    RichText::new(format!("· {count} сообщ."))
+                                        .small()
+                                        .color(pal.link),
+                                );
+                            }
+                        });
+                    })
+                    .response
+                    .interact(Sense::click());
+                if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    cx.actions.push(Action::OpenThread(
+                        cx.guild_id,
+                        Channel {
+                            id: *tid,
+                            name: tname.clone(),
+                            kind: 11,
+                            position: 0,
+                            parent: Some(m.channel_id),
+                        },
+                    ));
+                }
+            }
         });
     });
 
@@ -3459,9 +3974,28 @@ fn message_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg, grouped: bool) {
         pos2(ui.max_rect().right(), row.response.rect.bottom() + 2.0),
     );
     let hovered = ui.rect_contains_pointer(rect.expand2(vec2(0.0, 6.0)));
-    if hovered {
+    let mentioned = m.author_id != cx.me_id
+        && (m.mention_everyone || m.mentions.iter().any(|(id, _)| *id == cx.me_id));
+    if mentioned {
+        let tint = if hovered { 0.16 } else { 0.10 };
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(rect, 0.0, pal.warn.gamma_multiply(tint)),
+        );
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.left_top(), vec2(2.5, rect.height())),
+            0.0,
+            pal.warn,
+        );
+    } else if hovered {
         ui.painter()
             .set(bg, egui::Shape::rect_filled(rect, 0.0, pal.msg_hover));
+    }
+    if hovered && !m.system && ui.input(|i| i.pointer.secondary_clicked()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            cx.actions
+                .push(Action::MessageMenu(m.channel_id, Box::new(m.clone()), pos));
+        }
     }
     if hovered && cx.toolbar_allowed && !m.system {
         message_toolbar(ui, cx, m, rect);
@@ -3559,76 +4093,9 @@ fn reactions_ui(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, m: &Msg) {
     });
 }
 
-/// Текст сообщения: блоки кода ```, кликабельные ссылки, цветные и кастомные эмодзи.
-fn text_block(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, content: &str) {
-    let pal = cx.pal;
-    let jumbo = emoji::is_jumbo(content);
-    for (i, part) in content.split("```").enumerate() {
-        if i % 2 == 1 {
-            let code = part
-                .split_once('\n')
-                .map(|(lang, rest)| {
-                    if lang.trim().contains(' ') {
-                        part
-                    } else {
-                        rest
-                    }
-                })
-                .unwrap_or(part);
-            egui::Frame::none()
-                .fill(pal.elevated)
-                .rounding(6.0)
-                .stroke(Stroke::new(1.0, pal.border))
-                .inner_margin(Margin::same(10.0))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(code.trim_end_matches('\n'))
-                            .monospace()
-                            .color(pal.text),
-                    );
-                });
-            continue;
-        }
-        let part = part.trim_matches('\n');
-        if part.is_empty() {
-            continue;
-        }
-        for line in part.split('\n') {
-            if line.trim().is_empty() {
-                ui.add_space(4.0);
-                continue;
-            }
-            if !emoji::needs_rich(line) {
-                ui.label(RichText::new(line).color(pal.text));
-                continue;
-            }
-            let size = if jumbo { 44.0 } else { 20.0 };
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for seg in emoji::segment(line) {
-                    match seg {
-                        emoji::Seg::Text(t) => {
-                            ui.label(RichText::new(t).color(pal.text));
-                        }
-                        emoji::Seg::Link(u) => {
-                            ui.hyperlink_to(RichText::new(u).color(pal.link), u);
-                        }
-                        emoji::Seg::Emoji(e) => {
-                            emoji_image(ui, cx, &Emoji::unicode(e), size);
-                        }
-                        emoji::Seg::Custom { name, id, animated } => {
-                            let em = Emoji {
-                                id: Some(id),
-                                name: name.to_string(),
-                                animated,
-                            };
-                            emoji_image(ui, cx, &em, size);
-                        }
-                    }
-                }
-            });
-        }
-    }
+/// Текст сообщения с разметкой Discord (см. `markdown.rs` и `extra::rich_text`).
+fn text_block(ui: &mut egui::Ui, cx: &mut MsgCtx<'_>, content: &str, mentions: &[(u64, String)]) {
+    extra::rich_text(ui, cx, content, mentions);
 }
 
 fn fit(w: u32, h: u32, max_w: f32, max_h: f32) -> Vec2 {
@@ -4372,7 +4839,7 @@ fn day(time: &str) -> &str {
 }
 
 fn is_text(kind: u8) -> bool {
-    matches!(kind, 0 | 1 | 3 | 5)
+    matches!(kind, 0 | 1 | 3 | 5 | 10 | 11 | 12)
 }
 
 fn is_voice(kind: u8) -> bool {
@@ -4444,10 +4911,22 @@ fn children(g: &Guild, parent: Option<u64>) -> Vec<&Channel> {
     let mut v: Vec<&Channel> = g
         .channels
         .iter()
-        .filter(|c| c.kind != 4 && c.parent == parent)
+        .filter(|c| c.kind != 4 && !extra::is_thread(c.kind) && c.parent == parent)
         .collect();
     v.sort_by_key(|c| (is_voice(c.kind), c.position, c.id));
-    v
+    // активные ветки — сразу под своим каналом
+    let mut out = Vec::with_capacity(v.len());
+    for c in v {
+        out.push(c);
+        let mut threads: Vec<&Channel> = g
+            .channels
+            .iter()
+            .filter(|t| extra::is_thread(t.kind) && t.parent == Some(c.id))
+            .collect();
+        threads.sort_by_key(|t| std::cmp::Reverse(t.id));
+        out.extend(threads.into_iter().take(5));
+    }
+    out
 }
 
 /// Каналы сервера в порядке Discord: сначала без категории, затем по категориям.
@@ -4496,7 +4975,7 @@ fn member_row(
     color: Option<Color32>,
     offline: bool,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
     }
