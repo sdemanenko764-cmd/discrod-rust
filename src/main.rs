@@ -3871,36 +3871,7 @@ impl App {
                         }
                     }
                 }
-                // панель действий снизу
-                let bar = Rect::from_center_size(
-                    pos2(screen.center().x, screen.bottom() - 34.0),
-                    vec2(420.0, 40.0),
-                );
-                ui.allocate_ui_at_rect(bar, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        let filename = src
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("image")
-                            .split('?')
-                            .next()
-                            .unwrap_or("image")
-                            .to_string();
-                        if ui.button("⬇  Сохранить").clicked() {
-                            actions.push(Action::Download(src.clone(), filename));
-                        }
-                        if ui.button("🔗  Открыть в браузере").clicked() {
-                            actions.push(Action::OpenUrl(link.clone()));
-                        }
-                        if ui.button("⧉  Копировать ссылку").clicked() {
-                            actions.push(Action::CopyText(link.clone()));
-                        }
-                        if ui.button("✕  Закрыть").clicked() {
-                            close = true;
-                        }
-                    });
-                });
+                let _ = &link;
                 ui.painter().text(
                     pos2(screen.center().x, screen.top() + 22.0),
                     Align2::CENTER_CENTER,
@@ -3908,6 +3879,42 @@ impl App {
                     FontId::proportional(12.0),
                     Color32::from_gray(170),
                 );
+            });
+        // панель действий — отдельной областью, привязанной к центру низа окна:
+        // ширина считается по кнопкам, поэтому панель всегда ровно посередине
+        egui::Area::new(egui::Id::new("image_view_bar"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_BOTTOM, [0.0, -16.0])
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(Color32::from_black_alpha(160))
+                    .rounding(12.0)
+                    .inner_margin(Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let filename = src
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("image")
+                                .split('?')
+                                .next()
+                                .unwrap_or("image")
+                                .to_string();
+                            if ui.button("⬇  Сохранить").clicked() {
+                                actions.push(Action::Download(src.clone(), filename));
+                            }
+                            if ui.button("🔗  Открыть в браузере").clicked() {
+                                actions.push(Action::OpenUrl(link.clone()));
+                            }
+                            if ui.button("⧉  Копировать ссылку").clicked() {
+                                actions.push(Action::CopyText(link.clone()));
+                            }
+                            if ui.button("✕  Закрыть").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
             });
         let _ = pal;
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

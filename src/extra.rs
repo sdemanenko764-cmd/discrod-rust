@@ -507,17 +507,28 @@ fn rich_line(
 }
 
 fn mention_pill(ui: &mut egui::Ui, text: &str, fg: Color32, size: f32) -> egui::Response {
-    let r = ui.add(
-        egui::Label::new(
-            RichText::new(text)
-                .size(size)
-                .color(fg)
-                .background_color(fg.gamma_multiply(0.22)),
-        )
-        .sense(Sense::click())
-        .selectable(false),
+    // Тот же шрифт и та же высота строки, что у текста вокруг, — упоминание стоит
+    // ровно на одной линии; скруглённая подложка рисуется отдельно, без лишней высоты.
+    let mut job = LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: FontId::new(size, egui::FontFamily::Proportional),
+            color: fg,
+            ..Default::default()
+        },
     );
-    r.on_hover_cursor(CursorIcon::PointingHand)
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let pad = 4.0;
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(pad * 2.0, 0.0), Sense::click());
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
+    ui.painter()
+        .rect_filled(rect, 4.0, fg.gamma_multiply(0.20 + 0.15 * h));
+    ui.painter().galley(rect.min + vec2(pad, 0.0), galley, fg);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 // ======================= окна =======================
