@@ -46,7 +46,13 @@ fn map_font(path: &Path, index: u32) -> Option<&'static [u8]> {
     Some(&leaked[..])
 }
 
-pub fn install(ctx: &egui::Context) {
+/// Inter — современный шрифт интерфейса с полной кириллицей (SIL OFL 1.1,
+/// лицензия в assets/fonts/Inter-LICENSE.txt). Встроен в программу.
+static INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+static INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
+
+/// `inter` — использовать встроенный Inter (иначе системный Segoe UI).
+pub fn install(ctx: &egui::Context, inter: bool) {
     let mut fonts = FontDefinitions::default();
     let dir = fonts_dir();
     let mut primary: Vec<String> = Vec::new();
@@ -68,6 +74,16 @@ pub fn install(ctx: &egui::Context) {
         }
     }
 
+    if inter {
+        fonts
+            .font_data
+            .insert("inter".into(), FontData::from_static(INTER_REGULAR));
+        fonts.font_data.insert(
+            "inter-semibold".into(),
+            FontData::from_static(INTER_SEMIBOLD),
+        );
+        primary.insert(0, "inter".into());
+    }
     if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
         for (i, name) in primary.iter().enumerate() {
             list.insert(i, name.clone());
@@ -81,18 +97,23 @@ pub fn install(ctx: &egui::Context) {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    for file in ["segoeuib.ttf", "seguisb.ttf"] {
-        if let Some(bytes) = map_font(&dir.join(file), 0) {
-            fonts
-                .font_data
-                .insert("segoe-bold".into(), FontData::from_static(bytes));
-            bold.insert(0, "segoe-bold".into());
-            break;
+    if inter {
+        bold.insert(0, "inter-semibold".into());
+    } else {
+        for file in ["seguisb.ttf", "segoeuib.ttf"] {
+            if let Some(bytes) = map_font(&dir.join(file), 0) {
+                fonts
+                    .font_data
+                    .insert("segoe-bold".into(), FontData::from_static(bytes));
+                bold.insert(0, "segoe-bold".into());
+                break;
+            }
         }
     }
     fonts.families.insert(FontFamily::Name("bold".into()), bold);
     if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
-        list.extend(primary.iter().cloned());
+        // Inter в моноширинном семействе не нужен — только запасные глифы
+        list.extend(primary.iter().filter(|n| *n != "inter").cloned());
         list.extend(fallback.iter().cloned());
     }
     ctx.set_fonts(fonts);

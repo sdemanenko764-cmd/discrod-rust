@@ -33,6 +33,8 @@ pub enum Theme {
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
+    /// Шрифт интерфейса: встроенный Inter (иначе системный Segoe UI).
+    pub font_inter: bool,
     pub accent: usize,
     pub zoom: f32,
     pub compact: bool,
@@ -80,6 +82,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::AdwaitaDark,
+            font_inter: true,
             accent: 1,
             zoom: 1.0,
             compact: false,

@@ -2759,12 +2759,30 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(window_frame(ctx, &pal, solid))
             .show(ctx, |ui| {
-                ui.set_width(420.0);
+                ui.set_width(440.0);
+                // создание новой ветки
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.thread_new_name)
+                            .hint_text("Название новой ветки")
+                            .desired_width(300.0),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let can = !self.thread_new_name.trim().is_empty();
+                    if (accent_button(ui, &pal, "＋ Создать", 110.0, 32.0).clicked() || enter)
+                        && can
+                    {
+                        actions.push(Action::CreateStandaloneThread(
+                            parent,
+                            std::mem::take(&mut self.thread_new_name),
+                        ));
+                    }
+                });
+                ui.add_space(8.0);
                 if loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Загрузка веток…").color(pal.muted));
-                    });
+                    for k in 0..3 {
+                        skeleton_row(ui, &pal, k);
+                    }
                 }
                 if let Some(e) = &error {
                     ui.label(RichText::new(e).small().color(pal.danger));
@@ -2776,42 +2794,10 @@ impl App {
                     .max_height(480.0)
                     .show(ui, |ui| {
                         for (c, n) in &list {
-                            let (rect, resp) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), 46.0),
-                                Sense::click(),
-                            );
-                            let h = ui
-                                .ctx()
-                                .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                            ui.painter()
-                                .rect_filled(rect, 10.0, mix(pal.elevated, pal.hover, h));
-                            ui.painter().text(
-                                rect.left_center() + vec2(14.0, 0.0),
-                                Align2::LEFT_CENTER,
-                                "🧵",
-                                FontId::proportional(16.0),
-                                pal.muted,
-                            );
-                            ui.painter().text(
-                                rect.left_center() + vec2(42.0, if *n > 0 { -8.0 } else { 0.0 }),
-                                Align2::LEFT_CENTER,
-                                &c.name,
-                                FontId::proportional(14.5),
-                                pal.text,
-                            );
-                            if *n > 0 {
-                                ui.painter().text(
-                                    rect.left_center() + vec2(42.0, 10.0),
-                                    Align2::LEFT_CENTER,
-                                    format!("{n} сообщений"),
-                                    FontId::proportional(11.5),
-                                    pal.muted,
-                                );
-                            }
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            if thread_card(ui, &pal, c, *n).clicked() {
                                 actions.push(Action::OpenThread(gid, c.clone()));
                             }
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                         }
                     });
             });
@@ -3040,6 +3026,111 @@ impl App {
             self.server_dialog = Some((tab, input));
         }
     }
+}
+
+/// Карточка ветки: цветная полоса, иконка, название, число сообщений и дата создания.
+fn thread_card(ui: &mut egui::Ui, pal: &Palette, c: &Channel, count: u32) -> egui::Response {
+    let (slot, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+    if !ui.is_rect_visible(slot) {
+        return resp;
+    }
+    let h = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.14);
+    let rect = slot.translate(vec2(0.0, -1.5 * h));
+    ui.painter().add(
+        egui::epaint::Shadow {
+            offset: vec2(0.0, 2.0 + 3.0 * h),
+            blur: 6.0 + 10.0 * h,
+            spread: 0.0,
+            color: Color32::from_black_alpha((20.0 + 40.0 * h) as u8),
+        }
+        .as_shape(rect, 12.0),
+    );
+    ui.painter()
+        .rect_filled(rect, 12.0, mix(pal.elevated, pal.hover, h));
+    let color = name_color(c.id);
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.min, vec2(4.0, rect.height())),
+        Rounding {
+            nw: 12.0,
+            sw: 12.0,
+            ne: 0.0,
+            se: 0.0,
+        },
+        color,
+    );
+    let ic = rect.left_center() + vec2(30.0, 0.0);
+    ui.painter()
+        .circle_filled(ic, 16.0, color.gamma_multiply(0.22));
+    ui.painter().text(
+        ic,
+        Align2::CENTER_CENTER,
+        "🧵",
+        FontId::proportional(15.0),
+        color,
+    );
+    let x = rect.left() + 56.0;
+    let clip = Rect::from_min_max(
+        pos2(x, rect.top()),
+        pos2(rect.right() - 80.0, rect.bottom()),
+    );
+    ui.painter_at(clip).text(
+        pos2(x, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        &c.name,
+        FontId::new(14.5, egui::FontFamily::Name("bold".into())),
+        pal.text,
+    );
+    let created = markdown::format_time((snowflake_ms(c.id) / 1000) as i64, 'd');
+    ui.painter_at(clip).text(
+        pos2(x, rect.center().y + 10.0),
+        Align2::LEFT_CENTER,
+        format!("создана {created}"),
+        FontId::proportional(12.0),
+        pal.muted,
+    );
+    // число сообщений — «таблеткой» справа
+    let label = if count > 0 {
+        format!("💬 {count}")
+    } else {
+        "новая".to_string()
+    };
+    let g = ui
+        .painter()
+        .layout_no_wrap(label, FontId::proportional(12.0), pal.text);
+    let pill = Rect::from_min_size(
+        pos2(rect.right() - g.size().x - 26.0, rect.center().y - 11.0),
+        vec2(g.size().x + 16.0, 22.0),
+    );
+    ui.painter().rect_filled(pill, 11.0, pal.side);
+    ui.painter()
+        .galley(pill.min + vec2(8.0, 11.0 - g.size().y / 2.0), g, pal.text);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// «Скелетон» строки списка, пока данные загружаются.
+fn skeleton_row(ui: &mut egui::Ui, pal: &Palette, k: usize) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::hover());
+    let t = ui.input(|i| i.time) as f32;
+    let shimmer = 0.5 + 0.5 * (t * 3.0 - k as f32 * 0.6).sin();
+    let base = mix(pal.elevated, pal.hover, shimmer * 0.6);
+    ui.painter().rect_filled(rect, 12.0, pal.elevated);
+    ui.painter()
+        .circle_filled(rect.left_center() + vec2(30.0, 0.0), 16.0, base);
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.left_center() + vec2(56.0, -14.0), vec2(160.0, 10.0)),
+        5.0,
+        base,
+    );
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.left_center() + vec2(56.0, 5.0), vec2(100.0, 8.0)),
+        4.0,
+        base,
+    );
+    ui.add_space(6.0);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(40));
 }
 
 /// Вкладка в профиле: подчёркивание акцентом у выбранной.

@@ -198,6 +198,8 @@ enum Action {
     MarkRead(u64),
     MarkUnread(u64, Option<u64>),
     CreateThread(u64, u64, String),
+    /// Новая ветка без исходного сообщения: (канал, название).
+    CreateStandaloneThread(u64, String),
     AskRename(u64),
     RenameChannel(u64, String),
     ChannelInvite(u64),
@@ -309,6 +311,8 @@ struct App {
     user_menu_invite: bool,
     channel_menu: Option<(Option<u64>, u64, egui::Pos2)>,
     rename_channel: Option<(u64, String)>,
+    /// Поле «Название новой ветки» в окне веток.
+    thread_new_name: String,
     guild_menu: Option<(u64, egui::Pos2)>,
     confirm_leave: Option<u64>,
     server_dialog: Option<(u8, String)>,
@@ -333,8 +337,8 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        fonts::install(&cc.egui_ctx);
         let settings = settings::load();
+        fonts::install(&cc.egui_ctx, settings.font_inter);
         let pal = theme::palette(&settings);
         theme::apply(&cc.egui_ctx, &pal, settings.theme);
         cc.egui_ctx.set_zoom_factor(settings.zoom);
@@ -415,6 +419,7 @@ impl App {
             user_menu_invite: false,
             channel_menu: None,
             rename_channel: None,
+            thread_new_name: String::new(),
             guild_menu: None,
             confirm_leave: None,
             server_dialog: None,
@@ -1139,6 +1144,9 @@ impl App {
     }
 
     fn apply_settings(&mut self, ctx: &egui::Context, before: &Settings) {
+        if before.font_inter != self.settings.font_inter {
+            fonts::install(ctx, self.settings.font_inter);
+        }
         if before.theme != self.settings.theme || before.accent != self.settings.accent {
             self.pal = theme::palette(&self.settings);
             theme::apply(ctx, &self.pal, self.settings.theme);
@@ -1183,21 +1191,43 @@ impl App {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(48.0);
+                        // карточка плавно «выезжает» при открытии экрана
+                        let appear = ui.ctx().animate_bool_with_time(egui::Id::new("login_appear"), true, 0.35);
+                        ui.add_space(48.0 + 16.0 * (1.0 - appear));
+                        ui.multiply_opacity(appear.max(0.05));
                         egui::Frame::none()
                             .fill(pal.side)
-                            .rounding(18.0)
-                            .stroke(Stroke::new(1.0, pal.border))
-                            .inner_margin(Margin::same(28.0))
+                            .rounding(22.0)
+                            .stroke(Stroke::new(1.0, mix(pal.border, pal.accent, 0.25)))
+                            .shadow(Shadow {
+                                offset: vec2(0.0, 18.0),
+                                blur: 48.0,
+                                spread: 0.0,
+                                color: Color32::from_black_alpha(if pal.light { 40 } else { 120 }),
+                            })
+                            .inner_margin(Margin::same(30.0))
                             .show(ui, |ui| {
                                 ui.set_width(380.0);
                                 ui.vertical_centered(|ui| {
-                                    logo(ui, &pal, 64.0);
-                                    ui.add_space(8.0);
-                                    ui.label(RichText::new("Rustcord").size(28.0).strong().color(pal.text));
+                                    logo(ui, &pal, 68.0);
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        RichText::new("Rustcord")
+                                            .font(FontId::new(30.0, egui::FontFamily::Name("bold".into())))
+                                            .color(pal.text),
+                                    );
                                     ui.label(RichText::new("Лёгкий клиент Discord на Rust").color(pal.muted));
                                 });
-                                ui.add_space(20.0);
+                                ui.add_space(22.0);
+                                ui.horizontal(|ui| {
+                                    if toggle_chip(ui, &pal, "👤 Аккаунт", !self.bot_input).clicked() {
+                                        self.bot_input = false;
+                                    }
+                                    if toggle_chip(ui, &pal, "🤖 Бот (разрешено Discord)", self.bot_input).clicked() {
+                                        self.bot_input = true;
+                                    }
+                                });
+                                ui.add_space(10.0);
 
                                 field_label(ui, &pal, "ТОКЕН");
                                 let resp = ui.add(
@@ -1210,7 +1240,6 @@ impl App {
                                     submit = true;
                                 }
                                 ui.add_space(4.0);
-                                ui.checkbox(&mut self.bot_input, "Это токен бота");
                                 ui.checkbox(&mut self.remember, "Запомнить на этом компьютере");
 
                                 ui.add_space(10.0);
@@ -1264,12 +1293,18 @@ impl App {
 
                                 if let Some(e) = &self.login_error {
                                     ui.add_space(10.0);
+                                    let warn = self.logging_in;
+                                    let c = if warn { pal.warn } else { pal.danger };
                                     egui::Frame::none()
-                                        .fill(pal.danger.gamma_multiply(0.15))
-                                        .rounding(8.0)
-                                        .inner_margin(Margin::same(10.0))
+                                        .fill(c.gamma_multiply(0.12))
+                                        .stroke(Stroke::new(1.0, c.gamma_multiply(0.5)))
+                                        .rounding(10.0)
+                                        .inner_margin(Margin::same(12.0))
                                         .show(ui, |ui| {
-                                            ui.label(RichText::new(e).color(pal.text));
+                                            ui.horizontal_top(|ui| {
+                                                ui.label(RichText::new(if warn { "⏳" } else { "⚠" }).size(16.0).color(c));
+                                                ui.label(RichText::new(e).color(pal.text));
+                                            });
                                         });
                                 }
 
@@ -1283,6 +1318,25 @@ impl App {
                                          добавьте бота на свой сервер.\n\
                                          5. Вставьте токен и отметьте «Это токен бота».",
                                     );
+                                });
+                                egui::CollapsingHeader::new("Почему нет входа через браузер или QR-код").show(ui, |ui| {
+                                    ui.label(
+                                        "У Discord нет официального способа войти в сторонний клиент как в \
+                                         полноценный аккаунт. Вход через браузер (OAuth2) даёт приложению \
+                                         только ограниченный доступ — читать и писать сообщения с ним нельзя. \
+                                         Вход по QR-коду — закрытый протокол официального приложения; им же \
+                                         часто пользуются мошенники для угона аккаунтов. Поэтому Rustcord его \
+                                         не подделывает. Разрешённые способы — токен бота или токен своего \
+                                         аккаунта (на свой риск).",
+                                    );
+                                    if ui.link("Открыть Discord в браузере").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab("https://discord.com/app"));
+                                    }
+                                    if ui.link("Создать бота в Developer Portal").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                            "https://discord.com/developers/applications",
+                                        ));
+                                    }
                                 });
                                 egui::CollapsingHeader::new("Где взять токен своего аккаунта").show(ui, |ui| {
                                     ui.label(
@@ -2850,6 +2904,21 @@ impl App {
                     discord::ApiTag::Done(format!("Ветка «{name}» создана")),
                 );
             }
+            Action::CreateStandaloneThread(parent, name) => {
+                let name: String = name.trim().chars().take(90).collect();
+                if !name.is_empty() {
+                    self.api(
+                        "POST",
+                        format!("/channels/{parent}/threads"),
+                        Some(serde_json::json!({
+                            "name": name,
+                            "type": 11,
+                            "auto_archive_duration": 1440
+                        })),
+                        discord::ApiTag::Done(format!("Ветка «{name}» создана")),
+                    );
+                }
+            }
             Action::AskRename(cid) => {
                 let name = self
                     .guilds
@@ -3837,6 +3906,15 @@ impl App {
                             }
                         });
                         ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Шрифт:").color(pal.muted));
+                            if toggle_chip(ui, &pal, "Inter", self.settings.font_inter).clicked() {
+                                self.settings.font_inter = true;
+                            }
+                            if toggle_chip(ui, &pal, "Системный (Segoe UI)", !self.settings.font_inter).clicked() {
+                                self.settings.font_inter = false;
+                            }
+                        });
                         let zoom = ui.add(
                             egui::Slider::new(&mut self.pending_zoom, 0.75..=1.6)
                                 .step_by(0.05)
@@ -5523,14 +5601,39 @@ fn paint_avatar(ui: &egui::Ui, rect: Rect, tex: Option<(TextureId, Vec2)>, id: u
 
 fn logo(ui: &mut egui::Ui, pal: &Palette, size: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-    ui.painter().rect_filled(rect, size * 0.3, pal.accent);
-    ui.painter().text(
+    let t = ui.input(|i| i.time) as f32;
+    // мягкое «дыхание» свечения вокруг логотипа
+    let pulse = 0.5 + 0.5 * (t * 1.6).sin();
+    glow(
+        ui.painter(),
         rect.center(),
+        size * (0.95 + 0.12 * pulse),
+        pal.accent.gamma_multiply(0.35 + 0.15 * pulse),
+    );
+    let r = size * 0.3;
+    ui.painter().rect_filled(rect, r, pal.accent);
+    // вертикальный градиент: светлее сверху, темнее снизу
+    let top = Rect::from_min_size(rect.min, vec2(rect.width(), rect.height() * 0.5));
+    ui.painter().rect_filled(
+        top,
+        Rounding {
+            nw: r,
+            ne: r,
+            sw: 0.0,
+            se: 0.0,
+        },
+        Color32::from_white_alpha(28),
+    );
+    ui.painter()
+        .rect_stroke(rect, r, Stroke::new(1.0, Color32::from_white_alpha(40)));
+    ui.painter().text(
+        rect.center() + vec2(0.0, 1.0),
         Align2::CENTER_CENTER,
         "R",
-        FontId::proportional(size * 0.55),
+        FontId::new(size * 0.56, egui::FontFamily::Name("bold".into())),
         Color32::WHITE,
     );
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
 }
 
 fn field_label(ui: &mut egui::Ui, pal: &Palette, text: &str) {
